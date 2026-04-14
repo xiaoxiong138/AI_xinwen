@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - {{ date }}</title>
+    <style>
+        :root {
+            --bg: #eef4f3;
+            --shell: rgba(255, 255, 255, 0.95);
+            --text: #16212f;
+            --muted: #687280;
+            --line: #d6dfdc;
+            --primary: #0d5f5a;
+            --primary-soft: #e8f3f1;
+            --accent: #c65d1f;
+            --accent-soft: #fff4ec;
+            --alert-soft: #fff1f0;
+            --shadow: 0 22px 54px rgba(15, 23, 42, 0.08);
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 24px;
+            background:
+                radial-gradient(circle at top left, #dff3ef 0%, transparent 28%),
+                radial-gradient(circle at top right, #fff1e5 0%, transparent 25%),
+                linear-gradient(180deg, #f3f7f6 0%, #eef2f7 100%);
+            color: var(--text);
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            line-height: 1.7;
+        }
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+            background: var(--shell);
+            border: 1px solid rgba(214, 223, 220, 0.95);
+            border-radius: 28px;
+            padding: 34px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(10px);
+        }
+        .header { margin-bottom: 28px; }
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: var(--primary-soft);
+            color: var(--primary);
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        h1 {
+            margin: 14px 0 10px;
+            font-size: 34px;
+            line-height: 1.15;
+            letter-spacing: -0.02em;
+        }
+        h2 {
+            margin: 0;
+            font-size: 22px;
+            color: var(--primary);
+            letter-spacing: -0.01em;
+        }
+        .hero-copy {
+            max-width: 820px;
+            margin: 0 0 14px;
+            color: #314155;
+            font-size: 15px;
+            line-height: 1.75;
+        }
+        .hero-tags,
+        .tag-row,
+        .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .hero-tag,
+        .impact-tag,
+        .hint-chip,
+        .badge,
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .hero-tag,
+        .hint-chip,
+        .badge {
+            background: rgba(13, 95, 90, 0.08);
+            color: var(--primary);
+        }
+        .tag,
+        .impact-tag {
+            background: #f5ecdf;
+            color: #8b4e12;
+        }
+        .sub {
+            margin-top: 14px;
+            color: var(--muted);
+            font-size: 14px;
+        }
+        .stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 18px;
+        }
+        .stat {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 10px 14px;
+            min-width: 124px;
+        }
+        .stat-label { color: var(--muted); font-size: 12px; }
+        .stat-value { font-size: 22px; font-weight: 800; margin-top: 2px; }
+        .section { margin-top: 32px; }
+        .section-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .section-note { color: var(--muted); font-size: 13px; }
+        .panel {
+            background: linear-gradient(135deg, #f6fbfa 0%, #fffaf5 100%);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            padding: 22px;
+        }
+        .panel.alert {
+            background: linear-gradient(180deg, #fff8f7 0%, var(--alert-soft) 100%);
+            border-color: rgba(180, 35, 24, 0.18);
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+        }
+        .summary-item,
+        .trend-item {
+            background: rgba(255, 255, 255, 0.86);
+            border: 1px solid rgba(214, 223, 220, 0.8);
+            border-radius: 18px;
+            padding: 16px;
+        }
+        .summary-item.wide { grid-column: span 3; }
+        .summary-label {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 8px;
+        }
+        .bullet-list {
+            margin: 10px 0 0;
+            padding-left: 18px;
+            color: #314155;
+        }
+        .bullet-list li { margin-top: 8px; }
+        .highlight-grid,
+        .trend-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+        }
+        .highlight-card,
+        .trend-item {
+            display: block;
+            padding: 16px;
+            border-radius: 18px;
+            border: 1px solid rgba(214, 223, 220, 0.9);
+            background: rgba(255, 255, 255, 0.88);
+            text-decoration: none;
+            color: inherit;
+        }
+        .highlight-rank {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 10px;
+            background: var(--primary-soft);
+            color: var(--primary);
+            font-size: 13px;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+        .highlight-title,
+        .trend-title {
+            font-size: 17px;
+            font-weight: 800;
+            line-height: 1.45;
+            margin-bottom: 8px;
+        }
+        .highlight-preview,
+        .trend-summary {
+            color: #445161;
+            font-size: 14px;
+            line-height: 1.6;
+            margin-bottom: 12px;
+        }
+        .highlight-angle {
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border-radius: 14px;
+            background: rgba(13, 95, 90, 0.08);
+            color: #204541;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .feed {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .card {
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            background: rgba(255, 255, 255, 0.97);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.04);
+            overflow: hidden;
+        }
+        .card[open] {
+            border-color: rgba(13, 95, 90, 0.3);
+            box-shadow: 0 18px 40px rgba(13, 95, 90, 0.08);
+        }
+        .card-summary {
+            list-style: none;
+            display: block;
+            cursor: pointer;
+            padding: 18px 20px 16px;
+        }
+        .card-summary::-webkit-details-marker { display: none; }
+        .card-summary::marker { display: none; }
+        .card-head {
+            display: grid;
+            grid-template-columns: 36px 1fr auto;
+            gap: 12px;
+            align-items: start;
+        }
+        .order-pill {
+            width: 36px;
+            height: 36px;
+            border-radius: 12px;
+            background: var(--primary-soft);
+            color: var(--primary);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 14px;
+        }
+        .title-line {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .title {
+            color: var(--text);
+            font-size: 19px;
+            font-weight: 800;
+            line-height: 1.35;
+            margin: 0;
+        }
+        .caret {
+            color: var(--primary);
+            font-size: 14px;
+            transition: transform 0.2s ease;
+        }
+        .card[open] .caret { transform: rotate(90deg); }
+        .title-hint {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .title-subline {
+            margin-top: 8px;
+            color: #445161;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .title-quickreason {
+            margin-top: 8px;
+            padding: 8px 10px;
+            border-radius: 12px;
+            background: rgba(13, 95, 90, 0.08);
+            color: #204541;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .source-link {
+            width: 34px;
+            height: 34px;
+            border-radius: 11px;
+            border: 1px solid var(--line);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--primary);
+            text-decoration: none;
+            background: #fff;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .meta {
+            margin: 12px 0 0 48px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+        .card-detail {
+            padding: 0 20px 20px 68px;
+            border-top: 1px solid rgba(214, 223, 220, 0.7);
+            background: linear-gradient(180deg, #fbfcfc 0%, #f7fafc 100%);
+        }
+        .card-detail-inner { padding-top: 16px; }
+        .detail-label {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 6px;
+        }
+        .why-box {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: var(--accent-soft);
+            color: #6e3a12;
+        }
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 14px;
+        }
+        .analysis-item {
+            border: 1px solid rgba(214, 223, 220, 0.9);
+            border-radius: 14px;
+            background: #ffffff;
+            padding: 12px;
+        }
+        .detail-actions {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-top: 14px;
+        }
+        .primary-link,
+        .secondary-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+            border-radius: 999px;
+            padding: 10px 14px;
+            font-weight: 700;
+        }
+        .primary-link {
+            color: #fff;
+            background: var(--primary);
+        }
+        .secondary-link {
+            color: var(--primary);
+            background: rgba(13, 95, 90, 0.08);
+        }
+        .footer {
+            margin-top: 36px;
+            padding-top: 22px;
+            border-top: 1px solid var(--line);
+            color: var(--muted);
+            font-size: 13px;
+            text-align: center;
+        }
+        @media (max-width: 860px) {
+            body { padding: 14px; }
+            .container { padding: 20px; }
+            .summary-grid,
+            .highlight-grid,
+            .analysis-grid,
+            .trend-grid {
+                grid-template-columns: 1fr;
+            }
+            .summary-item.wide { grid-column: span 1; }
+            .card-head { grid-template-columns: 32px 1fr; }
+            .source-link {
+                grid-column: 2;
+                justify-self: start;
+                margin-top: 6px;
+            }
+            .meta { margin-left: 0; }
+            .card-detail { padding: 0 16px 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="eyebrow">AI Frontier Briefing</div>
+            <h1>{{ title }}</h1>
+            {% if hero_description %}
+            <div class="hero-copy">{{ hero_description }}</div>
+            {% endif %}
+            {% if hero_scope %}
+            <div class="hero-tags">
+                {% for item in hero_scope %}
+                <span class="hero-tag">{{ item }}</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+            <div class="sub">生成时间：{{ generated_at }}</div>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-label">论文</div>
+                    <div class="stat-value">{{ paper_count }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">全网动态</div>
+                    <div class="stat-value">{{ update_count }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">日期</div>
+                    <div class="stat-value">{{ date }}</div>
+                </div>
+            </div>
+        </div>
+
+        {% if alert_summary.needs_alert %}
+        <div class="section">
+            <div class="section-head">
+                <h2>异常提醒</h2>
+                <div class="section-note">只有会明显影响日报质量的异常才会在这里提示。</div>
+            </div>
+            <div class="panel alert">
+                <ul class="bullet-list">
+                    {% for issue in alert_summary.issues %}
+                    <li>{{ issue }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if top_highlights %}
+        <div class="section">
+            <div class="section-head">
+                <h2>今日最重要 5 条</h2>
+                <div class="section-note">顶部只保留重点摘要，正文会自动跳过这些条目，避免重复阅读。</div>
+            </div>
+            <div class="panel">
+                <div class="highlight-grid">
+                    {% for article in top_highlights %}
+                    <a href="{{ article.url }}" target="_blank" class="highlight-card">
+                        <div class="highlight-rank">{{ loop.index }}</div>
+                        <div class="highlight-title">{{ article.title_cn }}</div>
+                        {% if article.summary_preview %}
+                        <div class="highlight-preview">{{ article.summary_preview }}</div>
+                        {% endif %}
+                        {% if article.highlight_reason %}
+                        <div class="highlight-angle">先看理由：{{ article.highlight_reason }}</div>
+                        {% endif %}
+                        <div class="meta" style="margin: 0;">
+                            <span class="badge">{{ article.content_kind }}</span>
+                            <span class="badge">{{ article.display_topic }}</span>
+                            <span class="impact-tag">{{ article.impact_tag }}</span>
+                            <span class="badge">Score {{ article.score }}</span>
+                        </div>
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="section">
+            <div class="section-head">
+                <h2>今日总览</h2>
+                <div class="section-note">顶部先给判断，再进入正文混排后的完整分析。</div>
+            </div>
+            <div class="panel">
+                <div class="summary-grid">
+                    <div class="summary-item">
+                        <div class="summary-label">总体判断</div>
+                        <div>{{ report_summary.lead_summary }}</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-label">论文趋势</div>
+                        <div>{{ report_summary.paper_summary }}</div>
+                    </div>
+                    <div class="summary-item">
+                        <div class="summary-label">全网动态趋势</div>
+                        <div>{{ report_summary.update_summary }}</div>
+                    </div>
+                    {% if report_summary.hot_topics %}
+                    <div class="summary-item wide">
+                        <div class="summary-label">热点标签</div>
+                        <div class="tag-row">
+                            {% for topic in report_summary.hot_topics %}
+                            <span class="tag">{{ topic }}</span>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+                    {% if report_summary.key_takeaways %}
+                    <div class="summary-item">
+                        <div class="summary-label">关键结论</div>
+                        <ul class="bullet-list">
+                            {% for item in report_summary.key_takeaways %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    {% if report_summary.watchlist %}
+                    <div class="summary-item wide">
+                        <div class="summary-label">后续观察</div>
+                        <ul class="bullet-list">
+                            {% for item in report_summary.watchlist %}
+                            <li>{{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        {% if trend_summary["items"] %}
+        <div class="section">
+            <div class="section-head">
+                <h2>趋势追踪</h2>
+                <div class="section-note">这里只保留连续几天被不同来源反复验证的趋势。</div>
+            </div>
+            <div class="panel">
+                <div class="trend-grid">
+                    {% for item in trend_summary["items"] %}
+                    <div class="trend-item">
+                        <div class="trend-title">{{ item.label }}</div>
+                        <div class="trend-summary">{{ item.summary }}</div>
+                        <div class="meta" style="margin: 0;">
+                            <span class="badge">{{ item.count }} 次提及</span>
+                            {% if item.day_count %}
+                            <span class="badge">{{ item.day_count }} 天持续出现</span>
+                            {% endif %}
+                            {% if item.source_count %}
+                            <span class="badge">{{ item.source_count }} 个来源验证</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="section">
+            <div class="section-head">
+                <h2>混排情报流</h2>
+                <div class="section-note">顶部重点已单独摘要，正文去掉重复条目后再按重要性混排展示。</div>
+            </div>
+            <div class="feed">
+                {% for article in card_items %}
+                <details class="card" id="{{ article.anchor_id }}">
+                    <summary class="card-summary">
+                        <div class="card-head">
+                            <div class="order-pill">{{ article.order }}</div>
+                            <div>
+                                <div class="title-line">
+                                    <span class="caret">&#9656;</span>
+                                    <h3 class="title">{{ article.title_cn }}</h3>
+                                    <span class="impact-tag">{{ article.impact_tag }}</span>
+                                </div>
+                                {% if article.summary_preview %}
+                                <div class="title-subline">{{ article.summary_preview }}</div>
+                                {% endif %}
+                                {% if article.quick_reason %}
+                                <div class="title-quickreason">先看判断：{{ article.quick_reason }}</div>
+                                {% endif %}
+                                <div class="title-hint">
+                                    <span class="hint-chip">点击展开详细分析</span>
+                                </div>
+                            </div>
+                            <a href="{{ article.url }}" target="_blank" class="source-link" title="查看原文">&#8599;</a>
+                        </div>
+                        <div class="meta">
+                            <span class="badge">{{ article.content_kind }}</span>
+                            <span class="badge">{{ article.display_topic }}</span>
+                            <span class="badge">Score {{ article.score }}</span>
+                            <span>{{ article.publish_date[:16] if article.publish_date else "" }}</span>
+                        </div>
+                    </summary>
+                    <div class="card-detail">
+                        <div class="card-detail-inner">
+                            <div class="detail-label">摘要</div>
+                            <div>{{ article.summary }}</div>
+                            <div class="why-box">
+                                <div class="detail-label">为什么值得看</div>
+                                <div>{{ article.why_it_matters }}</div>
+                            </div>
+                            <div class="analysis-grid">
+                                <div class="analysis-item">
+                                    <div class="detail-label">为什么这么做</div>
+                                    <div>{{ article.why_now }}</div>
+                                </div>
+                                <div class="analysis-item">
+                                    <div class="detail-label">会带来什么效果</div>
+                                    <div>{{ article.expected_effect }}</div>
+                                </div>
+                                <div class="analysis-item">
+                                    <div class="detail-label">未来影响</div>
+                                    <div>{{ article.future_impact }}</div>
+                                </div>
+                            </div>
+                            <div class="detail-actions">
+                                <a href="{{ article.url }}" target="_blank" class="primary-link">查看原文 &#8599;</a>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                {% endfor %}
+            </div>
+        </div>
+
+        {% if archive_summary.entries %}
+        <div class="section">
+            <div class="section-head">
+                <h2>历史归档</h2>
+                <div class="section-note">支持按日期、主题关键词和来源摘要回看历史报告。</div>
+            </div>
+            <div class="panel">
+                <ul class="bullet-list">
+                    {% for entry in archive_summary.entries[:10] %}
+                    <li>
+                        {{ entry.label }}
+                        {% if entry.topics %}
+                        <span class="badge">{{ entry.topics|join(" / ") }}</span>
+                        {% endif %}
+                        {% if entry.sources %}
+                        <span class="badge">{{ entry.sources|join(" / ") }}</span>
+                        {% endif %}
+                        {% if entry.html_path %}
+                        <a href="{{ entry.html_path }}" class="secondary-link" style="margin-left: 8px;">HTML</a>
+                        {% endif %}
+                        {% if entry.markdown_path %}
+                        <a href="{{ entry.markdown_path }}" class="secondary-link" style="margin-left: 8px;">Markdown</a>
+                        {% endif %}
+                    </li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="footer">Generated by AI News Agent at {{ generated_at }}</div>
+    </div>
+</body>
+</html>

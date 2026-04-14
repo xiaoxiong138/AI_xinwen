@@ -1,0 +1,35 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime logs and scratch outputs
+logs/
+*.log
+tmp_reports_index.html
+tmp_reports_index.md
+alert_*.html
+
+# Generated reports and archive indexes
+report_*.html
+report_*.md
+reports_index.html
+reports_index.md
+reports_manifest.json
+
+# Virtual environments
+.venv/
+venv/
+env/

@@ -1,0 +1,11 @@
+arxiv
+feedparser
+beautifulsoup4
+requests
+openai
+pydantic
+jinja2
+python-dotenv
+tenacity
+httpx
+pyyaml
