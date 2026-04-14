@@ -21,6 +21,7 @@ logs/
 tmp_reports_index.html
 tmp_reports_index.md
 alert_*.html
+Web_Agent_Agent_Feasibility_Report.md
 
 # Generated reports and archive indexes
 report_*.html
