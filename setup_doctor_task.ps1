@@ -48,21 +48,6 @@ function New-PasswordTask {
     schtasks /Create /TN $Name /SC DAILY /ST $Time /TR $TaskCommand /RU $UserName /RP $Password /F | Out-Null
 }
 
-function New-S4UTask {
-    param(
-        [string]$Name,
-        [datetime]$Time,
-        [string]$PythonPath,
-        [string]$RunnerPath,
-        [string]$UserName
-    )
-    $action = New-ScheduledTaskAction -Execute $PythonPath -Argument ('"' + $RunnerPath + '" --doctor --record')
-    $trigger = New-ScheduledTaskTrigger -Daily -At $Time
-    $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType S4U
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-}
-
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Resolve-PythonExe -Candidate $PythonExe
 $runner = Join-Path $root "scheduler_runner.py"
@@ -76,15 +61,9 @@ if ($RunAsPassword) {
     New-PasswordTask -Name $TaskName -Time $At -TaskCommand $taskCommand -UserName $currentUser -Password $RunAsPassword
     $createdMode = "password"
 } else {
-    try {
-        New-S4UTask -Name $TaskName -Time ([datetime]::Parse($At)) -PythonPath $python -RunnerPath $runner -UserName $currentUser
-        $createdMode = "s4u"
-    } catch {
-        Write-Warning "Non-interactive doctor task creation was blocked. Falling back to interactive mode. To force offline/background execution, rerun this script in an elevated PowerShell or provide -RunAsPassword."
-        Remove-TaskIfExists -Name $TaskName
-        New-InteractiveTask -Name $TaskName -Time $At -TaskCommand $taskCommand
-        $createdMode = "interactive"
-    }
+    Write-Warning "Creating interactive doctor task because S4U/background mode breaks network access for this project. To enable true offline/background execution, rerun this script with -RunAsPassword."
+    New-InteractiveTask -Name $TaskName -Time $At -TaskCommand $taskCommand
+    $createdMode = "interactive"
 }
 
 Write-Host "Created doctor task using mode: $createdMode"

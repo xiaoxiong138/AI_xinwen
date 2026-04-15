@@ -50,21 +50,6 @@ function New-PasswordTask {
     schtasks /Create /TN $TaskName /SC DAILY /ST $At /TR $TaskCommand /RU $UserName /RP $Password /F | Out-Null
 }
 
-function New-S4UTask {
-    param(
-        [string]$TaskName,
-        [datetime]$At,
-        [string]$PythonPath,
-        [string]$RunnerPath,
-        [string]$UserName
-    )
-    $action = New-ScheduledTaskAction -Execute $PythonPath -Argument ('"' + $RunnerPath + '"')
-    $trigger = New-ScheduledTaskTrigger -Daily -At $At
-    $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType S4U
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-}
-
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Resolve-PythonExe -Candidate $PythonExe
 $runner = Join-Path $root "scheduler_runner.py"
@@ -80,18 +65,10 @@ if ($RunAsPassword) {
     New-PasswordTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand -UserName $currentUser -Password $RunAsPassword
     $createdMode = "password"
 } else {
-    try {
-        New-S4UTask -TaskName $TaskNameNoon -At ([datetime]::Parse($NoonTime)) -PythonPath $python -RunnerPath $runner -UserName $currentUser
-        New-S4UTask -TaskName $TaskNameEvening -At ([datetime]::Parse($EveningTime)) -PythonPath $python -RunnerPath $runner -UserName $currentUser
-        $createdMode = "s4u"
-    } catch {
-        Write-Warning "Non-interactive task creation was blocked. Falling back to interactive tasks. To force offline/background execution, rerun this script in an elevated PowerShell or provide -RunAsPassword."
-        Remove-TaskIfExists -TaskName $TaskNameNoon
-        Remove-TaskIfExists -TaskName $TaskNameEvening
-        New-InteractiveTask -TaskName $TaskNameNoon -At $NoonTime -TaskCommand $taskCommand
-        New-InteractiveTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand
-        $createdMode = "interactive"
-    }
+    Write-Warning "Creating interactive tasks because S4U/background mode breaks network access for this project. To enable true offline/background sending, rerun this script with -RunAsPassword."
+    New-InteractiveTask -TaskName $TaskNameNoon -At $NoonTime -TaskCommand $taskCommand
+    New-InteractiveTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand
+    $createdMode = "interactive"
 }
 
 Write-Host "Created tasks using mode: $createdMode"
