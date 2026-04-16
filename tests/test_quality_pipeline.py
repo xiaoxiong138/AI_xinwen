@@ -10,6 +10,7 @@ from main import (
     build_alert_summary_v2,
     build_archive_summary,
     build_archive_summary_v2,
+    diversify_report_titles,
     build_trend_summary_v2,
     filter_updates_for_report,
     hydrate_paper_cache,
@@ -601,6 +602,61 @@ class QualityPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["title_cn"]), 10)
         self.assertNotEqual(result["summary_preview"], "")
         self.assertNotIn("新动作", result["title_cn"])
+
+    def test_diversify_report_titles_rewrites_repeated_templates(self):
+        processor = LLMProcessor({"api_key_env": "THIS_KEY_SHOULD_NOT_EXIST"})
+        items = [
+            {
+                "url": "https://example.com/1",
+                "title": "OpenAI launches workflow agent for enterprise task execution",
+                "title_cn": "OpenAI把AI能力推进到真实工作流",
+                "summary_preview": "企业任务链开始被模型接管更多执行环节。",
+                "summary": "OpenAI is moving new agent capabilities into enterprise workflow execution. The real point is reducing manual switching across a longer task chain.",
+                "display_topic": "产品发布",
+                "source_detail": "OpenAI Blog",
+                "platform": "Blog",
+                "keywords": ["企业工作流", "任务执行"],
+            },
+            {
+                "url": "https://example.com/2",
+                "title": "Anthropic expands agent workflow support for enterprise apps",
+                "title_cn": "Anthropic把AI能力推进到真实工作流",
+                "summary_preview": "重点开始落到企业应用里的多工具协同执行。",
+                "summary": "Anthropic is extending agent support into enterprise applications. The more important signal is multi-tool execution inside real software workflows.",
+                "display_topic": "产品发布",
+                "source_detail": "Anthropic",
+                "platform": "Blog",
+                "keywords": ["企业应用", "多工具协同"],
+            },
+        ]
+        diversified = diversify_report_titles(items, processor)
+        self.assertEqual(diversified[0]["title_cn"], "OpenAI把AI能力推进到真实工作流")
+        self.assertNotEqual(diversified[1]["title_cn"], "Anthropic把AI能力推进到真实工作流")
+        self.assertIn("企业应用", diversified[1]["title_cn"] + diversified[1].get("summary_preview", ""))
+
+    def test_diversify_report_titles_keeps_distinct_titles(self):
+        processor = LLMProcessor({"api_key_env": "THIS_KEY_SHOULD_NOT_EXIST"})
+        items = [
+            {
+                "url": "https://example.com/p1",
+                "title_cn": "世界模型研究尝试降低试错成本",
+                "summary_preview": "核心看点是先预测再行动的规划效率。",
+                "summary": "This work focuses on lowering rollout cost for planning.",
+                "display_topic": "世界模型",
+                "keywords": ["规划效率"],
+            },
+            {
+                "url": "https://example.com/p2",
+                "title_cn": "机器人研究尝试走向更稳定实机",
+                "summary_preview": "核心看点是实机任务成功率更稳定。",
+                "summary": "This work focuses on real-world robot execution stability.",
+                "display_topic": "机器人",
+                "keywords": ["实机稳定性"],
+            },
+        ]
+        diversified = diversify_report_titles(items, processor)
+        self.assertEqual(diversified[0]["title_cn"], "世界模型研究尝试降低试错成本")
+        self.assertEqual(diversified[1]["title_cn"], "机器人研究尝试走向更稳定实机")
 
 
     def test_product_release_analysis_focuses_on_workflow_execution(self):

@@ -930,6 +930,127 @@ def prepare_report_items(
     return prepared
 
 
+def clean_title_candidate(text: str, max_len: int = 36) -> str:
+    cleaned = re.sub(r"[。！？.!?]+$", "", str(text or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip("，、；：:; ")
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 1].rstrip("，、；：:; ") + "…"
+
+
+def title_template_fingerprint(title: str) -> str:
+    cleaned = clean_title_candidate(title, max_len=48)
+    if not cleaned:
+        return ""
+    generic_prefixes = (
+        "AI产品",
+        "AI合作",
+        "AI应用",
+        "AI行业",
+        "AI讨论热点",
+        "视频热点背后",
+        "世界模型研究",
+        "具身智能研究",
+        "机器人研究",
+        "模型能力和效率路线",
+    )
+    subject_pattern = (
+        r"^[\u4e00-\u9fffA-Za-z0-9·\-\s]{2,18}"
+        r"(?=(把|借|继续|开始|正在|尝试|试图|推进|切入|争夺|补齐|放大|折射出|反映出|"
+        r"验证|解决|提升|构建|降低|押向))"
+    )
+    normalized = re.sub(subject_pattern, "<subject>", cleaned)
+    for prefix in generic_prefixes:
+        if normalized.startswith(prefix):
+            normalized = "<generic>" + normalized[len(prefix) :]
+            break
+    return normalize_text(normalized)
+
+
+def title_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, normalize_text(left), normalize_text(right)).ratio()
+
+
+def build_distinct_title_candidate(item: Dict[str, Any], llm_processor: LLMProcessor) -> List[str]:
+    current_title = clean_title_candidate(item.get("title_cn") or item.get("title") or "")
+    preview = clean_title_candidate(item.get("summary_preview") or "", max_len=34)
+    summary_sentences = llm_processor._split_sentences(item.get("summary", ""))
+    summary_title = ""
+    if summary_sentences:
+        summary_title = llm_processor._refine_title_text(summary_sentences[0], 16, 36) or ""
+    subject = llm_processor._extract_subject(item)
+    topic = clean_title_candidate(item.get("display_topic") or item.get("topic_cn") or item.get("category") or "", max_len=18)
+    source = clean_title_candidate(item.get("source_detail") or item.get("source") or item.get("platform") or "", max_len=16)
+    keywords = item.get("keywords") or []
+    if isinstance(keywords, str):
+        keywords = [part.strip() for part in keywords.split(",") if part.strip()]
+    else:
+        keywords = [str(part).strip() for part in keywords if str(part).strip()]
+    focus = clean_title_candidate(next((keyword for keyword in keywords if keyword and keyword not in current_title), ""), max_len=14)
+
+    candidates: List[str] = []
+    for candidate in (preview, summary_title):
+        if candidate:
+            candidates.append(candidate)
+    if focus and subject and subject != "相关机构":
+        candidates.append(clean_title_candidate(f"{subject}这次更想解决{focus}", max_len=34))
+    if focus and topic:
+        candidates.append(clean_title_candidate(f"{topic}这次更值得看{focus}", max_len=34))
+    if topic and source:
+        candidates.append(clean_title_candidate(f"{source}这次动作落在{topic}", max_len=34))
+    if topic and preview:
+        candidates.append(clean_title_candidate(f"{topic}：{preview}", max_len=34))
+
+    unique_candidates: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = normalize_text(candidate)
+        if key in seen or key == normalize_text(current_title):
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def diversify_report_titles(items: List[Dict[str, Any]], llm_processor: LLMProcessor) -> List[Dict[str, Any]]:
+    fingerprint_counts = Counter(
+        title_template_fingerprint(item.get("title_cn") or item.get("title") or "")
+        for item in items
+        if title_template_fingerprint(item.get("title_cn") or item.get("title") or "")
+    )
+    used_titles: List[str] = []
+    seen_fingerprints: Counter[str] = Counter()
+    diversified: List[Dict[str, Any]] = []
+
+    for item in items:
+        candidate = dict(item)
+        title = clean_title_candidate(candidate.get("title_cn") or candidate.get("title") or "")
+        fingerprint = title_template_fingerprint(title)
+        seen_fingerprints[fingerprint] += 1
+        needs_rewrite = bool(
+            title
+            and (
+                any(title_similarity(title, used) >= 0.82 for used in used_titles)
+                or (fingerprint and fingerprint_counts.get(fingerprint, 0) > 1 and seen_fingerprints[fingerprint] > 1)
+            )
+        )
+        if needs_rewrite:
+            for rewritten in build_distinct_title_candidate(candidate, llm_processor):
+                if any(title_similarity(rewritten, used) >= 0.82 for used in used_titles):
+                    continue
+                if fingerprint and title_template_fingerprint(rewritten) == fingerprint:
+                    continue
+                candidate["title_cn"] = rewritten
+                title = rewritten
+                break
+        if title:
+            used_titles.append(title)
+        diversified.append(candidate)
+    return diversified
+
+
 def parse_datetime(value: str) -> datetime:
     if not value:
         return datetime.min
@@ -1419,6 +1540,8 @@ def main() -> Dict[str, Any]:
         source_preferences=source_preferences,
         preference_config=preference_config,
     )
+    papers = diversify_report_titles(papers, llm_processor)
+    updates = diversify_report_titles(updates, llm_processor)
     print(f"Dedupe reduced dynamic items from {len([item for item in prepared_items if item.get('content_type') != 'paper'])} to {len(deduped_updates)} candidates.")
     if len(updates) < min_web_items:
         print(f"Warning: only {len(updates)} web updates available after dedupe, below target {min_web_items}.")
