@@ -1,6 +1,6 @@
 param(
-    [string]$TaskNameNoon = "Web_Agent_Send_1200",
-    [string]$TaskNameEvening = "Web_Agent_Send_2100",
+    [string]$TaskNameNoon = "Web_Agent_Send_1200_v2",
+    [string]$TaskNameEvening = "Web_Agent_Send_2100_v2",
     [string]$NoonTime = "12:00",
     [string]$EveningTime = "21:00",
     [string]$PythonExe = "",
@@ -36,7 +36,7 @@ function New-InteractiveTask {
         [string]$At,
         [string]$TaskCommand
     )
-    schtasks /Create /TN $TaskName /SC DAILY /ST $At /TR $TaskCommand /F | Out-Null
+    schtasks /Create /TN $TaskName /SC DAILY /ST $At /TR $TaskCommand /RL LIMITED /IT /F | Out-Null
 }
 
 function New-PasswordTask {
@@ -65,7 +65,7 @@ if ($RunAsPassword) {
     New-PasswordTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand -UserName $currentUser -Password $RunAsPassword
     $createdMode = "password"
 } else {
-    Write-Warning "Creating interactive tasks because S4U/background mode breaks network access for this project. To enable true offline/background sending, rerun this script with -RunAsPassword."
+    Write-Warning "Creating InteractiveToken tasks because S4U/background mode breaks network access for this project. To enable true offline/background sending, rerun this script with -RunAsPassword."
     New-InteractiveTask -TaskName $TaskNameNoon -At $NoonTime -TaskCommand $taskCommand
     New-InteractiveTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand
     $createdMode = "interactive"

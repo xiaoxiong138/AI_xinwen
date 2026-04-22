@@ -54,7 +54,7 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_status_file": "logs/doctor_latest.json",
     "doctor_history_file": "logs/doctor_history.json",
     "task_setup_script": "setup_scheduled_tasks.ps1",
-    "task_names": ["Web_Agent_Send_1200", "Web_Agent_Send_2100"],
+    "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
     "max_run_seconds": 2700,
     "validation_max_run_seconds": 900,
     "validation_report_retention_days": 7,

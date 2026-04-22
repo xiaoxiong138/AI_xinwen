@@ -34,7 +34,7 @@ function New-InteractiveTask {
         [string]$Time,
         [string]$TaskCommand
     )
-    schtasks /Create /TN $Name /SC DAILY /ST $Time /TR $TaskCommand /F | Out-Null
+    schtasks /Create /TN $Name /SC DAILY /ST $Time /TR $TaskCommand /RL LIMITED /IT /F | Out-Null
 }
 
 function New-PasswordTask {
@@ -61,7 +61,7 @@ if ($RunAsPassword) {
     New-PasswordTask -Name $TaskName -Time $At -TaskCommand $taskCommand -UserName $currentUser -Password $RunAsPassword
     $createdMode = "password"
 } else {
-    Write-Warning "Creating interactive doctor task because S4U/background mode breaks network access for this project. To enable true offline/background execution, rerun this script with -RunAsPassword."
+    Write-Warning "Creating InteractiveToken doctor task because S4U/background mode breaks network access for this project. To enable true offline/background execution, rerun this script with -RunAsPassword."
     New-InteractiveTask -Name $TaskName -Time $At -TaskCommand $taskCommand
     $createdMode = "interactive"
 }

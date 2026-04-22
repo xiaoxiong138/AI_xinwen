@@ -269,6 +269,9 @@ scheduler:
   doctor_status_file: logs/doctor_latest.json
   doctor_history_file: logs/doctor_history.json
   task_setup_script: setup_scheduled_tasks.ps1
+  task_names:
+    - Web_Agent_Send_1200_v2
+    - Web_Agent_Send_2100_v2
   doctor_task_setup_script: setup_doctor_task.ps1
   doctor_task_name: Web_Agent_Doctor_0900
   doctor_task_time: "09:00"
