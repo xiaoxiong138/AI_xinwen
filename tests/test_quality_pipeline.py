@@ -7,8 +7,10 @@ from pathlib import Path
 
 from main import (
     apply_runtime_profile,
+    apply_source_health_adjustments,
     build_quality_diagnostics,
     build_source_health_summary,
+    build_source_health_weights,
     build_suppressed_alert_summary,
     build_alert_summary_v2,
     build_archive_summary,
@@ -480,6 +482,29 @@ class QualityPipelineTests(unittest.TestCase):
         self.assertEqual(summary["risky_source_count"], 1)
         self.assertEqual(row["consecutive_failures"], 1)
         self.assertNotEqual(row["last_success_at"], "")
+
+    def test_source_health_weights_penalize_unhealthy_sources(self):
+        source_health = {
+            "rows": [
+                {"label": "RSSCollector[Bad Feed]", "consecutive_failures": 2, "recent_empty_success_count": 1, "recent_success_count": 0},
+                {"label": "RSSCollector[Good Feed]", "consecutive_failures": 0, "recent_empty_success_count": 0, "recent_success_count": 4},
+            ]
+        }
+
+        weights = build_source_health_weights(source_health, {"enabled": True, "penalty_per_consecutive_failure": -0.5, "bonus_recent_success": 0.2})
+
+        self.assertLess(weights["RSSCollector[Bad Feed]"], 0)
+        self.assertGreater(weights["RSSCollector[Good Feed]"], 0)
+
+    def test_apply_source_health_adjustments_merges_dynamic_weights(self):
+        adjusted, summary = apply_source_health_adjustments(
+            {"source_weights": {"RSSCollector[Bad Feed]": -0.25}},
+            {"rows": [{"label": "RSSCollector[Bad Feed]", "consecutive_failures": 2, "recent_empty_success_count": 0, "recent_success_count": 0}]},
+            {"enabled": True, "penalty_per_consecutive_failure": -0.5},
+        )
+
+        self.assertEqual(summary["weights"]["RSSCollector[Bad Feed]"], -1.0)
+        self.assertEqual(adjusted["source_weights"]["RSSCollector[Bad Feed]"], -1.25)
 
     def test_should_skip_rss_feed_after_repeated_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:

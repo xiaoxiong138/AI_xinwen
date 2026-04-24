@@ -540,6 +540,38 @@ def build_doctor_payload() -> Dict[str, Any]:
     else:
         checks.append(_doctor_item("last_success", "warn", "No successful email snapshot has been recorded yet."))
 
+    observability_config = dict(config.get("observability") or {})
+    if observability_config.get("require_production_diagnostics", False) and last_success:
+        if last_success.get("quality_diagnostics") and last_success.get("source_health"):
+            checks.append(_doctor_item("production_diagnostics", "ok", "Last successful production send includes diagnostics."))
+        else:
+            checks.append(
+                _doctor_item(
+                    "production_diagnostics",
+                    "warn",
+                    "Last successful production send does not include quality/source diagnostics yet. The next real send will populate them.",
+                    {
+                        "last_success_finished_at": last_success.get("finished_at", ""),
+                        "html_report_path": last_success.get("html_report_path", ""),
+                    },
+                )
+            )
+
+    arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
+    if arrival_config.get("enabled", False) and last_success:
+        verification = dict(last_success.get("delivery_verification") or {})
+        if verification.get("verified", False):
+            checks.append(_doctor_item("delivery_arrival", "ok", "Mailbox arrival was verified for the last successful send.", verification))
+        else:
+            checks.append(
+                _doctor_item(
+                    "delivery_arrival",
+                    "warn",
+                    f"Mailbox arrival is enabled but not verified yet: {verification.get('status', 'missing_verification')}",
+                    verification,
+                )
+            )
+
     quality_diagnostics = dict(last_run.get("quality_diagnostics") or last_success.get("quality_diagnostics") or {})
     quality_warnings = list(quality_diagnostics.get("warnings") or [])
     if quality_diagnostics:
@@ -698,22 +730,34 @@ def build_doctor_alert_html(payload: Dict[str, Any], history: Dict[str, Any]) ->
         item for item in payload.get("checks", [])
         if str(item.get("level", "")) != "ok"
     ]
+    status_payload = dict(payload.get("status") or {})
+    last_success = dict(status_payload.get("last_success") or {})
+    top_issues = non_ok_items[:5]
     issues_html = "".join(
         f"<li><strong>{item.get('name', 'unknown')}</strong>: {item.get('detail', '')}</li>"
-        for item in non_ok_items
+        for item in top_issues
     ) or "<li>No specific non-ok checks were recorded.</li>"
+    extra_count = max(0, len(non_ok_items) - len(top_issues))
+    extra_html = f"<p>另有 {extra_count} 项非 OK，请查看 doctor_latest.json。</p>" if extra_count else ""
+    recent_success_html = (
+        f"<li>最近成功：{last_success.get('finished_at', 'N/A')} | {last_success.get('html_report_path', 'N/A')}</li>"
+        if last_success
+        else "<li>最近成功：未记录</li>"
+    )
     return f"""
     <html lang="zh-CN">
     <body style="font-family:Segoe UI,Microsoft YaHei,sans-serif;color:#16212f;">
-        <h2>AI 日报健康检查告警</h2>
-        <p>本次健康检查结果为 <strong>{payload.get("overall", "unknown")}</strong>。</p>
+        <h2>AI 日报需要处理：{payload.get("overall", "unknown")}</h2>
         <ul>
             <li>检查时间：{payload.get("current_time", "")}</li>
-            <li>告警阈值内连续 warn 次数：{history.get("warn_streak", 0)}</li>
             <li>ok / warn / fail：{payload.get("counts", {}).get("ok", 0)} / {payload.get("counts", {}).get("warn", 0)} / {payload.get("counts", {}).get("fail", 0)}</li>
+            <li>连续 warn：{history.get("warn_streak", 0)}</li>
+            {recent_success_html}
         </ul>
-        <p>本次需要关注的项：</p>
+        <p><strong>优先处理：</strong></p>
         <ul>{issues_html}</ul>
+        {extra_html}
+        <p>建议动作：先运行 <code>python D:\\Web_Agent\\scheduler_runner.py --doctor --self-heal</code>；如果是离线模式告警，请执行 <code>setup_offline_tasks.ps1</code> 并输入 Windows 密码。</p>
     </body>
     </html>
     """
@@ -1057,6 +1101,8 @@ def build_last_success_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
         "new_articles_count": status.get("new_articles_count", 0),
         "quality_diagnostics": status.get("quality_diagnostics", {}),
         "source_health": status.get("source_health", {}),
+        "source_weight_adjustments": status.get("source_weight_adjustments", {}),
+        "delivery_verification": status.get("delivery_verification", {}),
         "log_file": status.get("log_file", ""),
     }
 

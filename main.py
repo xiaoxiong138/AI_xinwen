@@ -22,7 +22,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.collectors import ArxivCollector, HuggingFaceCollector, RSSCollector, WebSearchCollector
 from src.database import Database
 from src.generator import ReportGenerator
-from src.notifier import EmailNotifier
+from src.notifier import EmailNotifier, verify_email_arrival
 from src.processors import LLMProcessor
 from src.relevance import infer_impact_tag, is_low_signal_update, normalize_text, score_preference_boost, score_update_quality
 
@@ -441,6 +441,48 @@ def filter_updates_for_report(
         preferred = ranked
 
     return preferred[:target_count]
+
+
+def build_source_health_weights(source_health: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    config = config or {}
+    if not config.get("enabled", True):
+        return {}
+    penalty_per_failure = float(config.get("penalty_per_consecutive_failure", -0.6))
+    empty_success_penalty = float(config.get("empty_success_penalty", -0.15))
+    max_penalty = abs(float(config.get("max_penalty", 2.0)))
+    bonus_recent_success = float(config.get("bonus_recent_success", 0.15))
+    weights: Dict[str, float] = {}
+    for row in source_health.get("rows", []) or []:
+        label = str(row.get("label", "") or "")
+        if not label:
+            continue
+        consecutive_failures = int(row.get("consecutive_failures", 0) or 0)
+        empty_success_count = int(row.get("recent_empty_success_count", 0) or 0)
+        success_count = int(row.get("recent_success_count", 0) or 0)
+        weight = consecutive_failures * penalty_per_failure
+        weight += min(empty_success_count, 5) * empty_success_penalty
+        if success_count >= 3 and consecutive_failures == 0:
+            weight += bonus_recent_success
+        weight = max(-max_penalty, min(max_penalty, weight))
+        if abs(weight) >= 0.01:
+            weights[label] = round(weight, 2)
+    return weights
+
+
+def apply_source_health_adjustments(
+    source_preferences: Dict[str, Any],
+    source_health: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    adjusted = copy.deepcopy(source_preferences or {})
+    dynamic_weights = build_source_health_weights(source_health, config)
+    if not dynamic_weights:
+        return adjusted, {"enabled": bool((config or {}).get("enabled", True)), "weights": {}}
+    source_weights = dict(adjusted.get("source_weights") or {})
+    for label, weight in dynamic_weights.items():
+        source_weights[label] = round(float(source_weights.get(label, 0) or 0) + weight, 2)
+    adjusted["source_weights"] = source_weights
+    return adjusted, {"enabled": True, "weights": dynamic_weights}
 
 
 def limit_papers_by_topic(papers: List[Dict[str, Any]], topic_limits: Dict[str, Any], total_limit: int) -> List[Dict[str, Any]]:
@@ -1364,6 +1406,8 @@ def main() -> Dict[str, Any]:
         "update_count": 0,
         "collector_summary": {},
         "alert_summary": {},
+        "delivery_verification": {},
+        "source_weight_adjustments": {},
         "runtime_profile": runtime_profile or "default",
     }
 
@@ -1580,6 +1624,12 @@ def main() -> Dict[str, Any]:
     print("\n=== Step 3: Generating Report ===")
     report_items = db.get_articles_for_run(run_id=run_id, processed_only=True)
     source_preferences = config.get("source_preferences", {})
+    source_preferences, source_weight_adjustments = apply_source_health_adjustments(
+        source_preferences,
+        source_health,
+        observability_config.get("source_health_weighting", {}),
+    )
+    run_result["source_weight_adjustments"] = source_weight_adjustments
     preference_config = config.get("preferences", {})
     alert_config = config.get("alerts", {})
     trend_config = config.get("trends", {})
@@ -1886,6 +1936,19 @@ def main() -> Dict[str, Any]:
         if success:
             print("Notification sent successfully.")
             notification_sent = True
+            arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
+            if arrival_config.get("enabled", False):
+                run_result["delivery_verification"] = verify_email_arrival(
+                    imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
+                    imap_port=int(os.getenv("EMAIL_IMAP_PORT", str(arrival_config.get("imap_port", 993)))),
+                    username=os.getenv("EMAIL_IMAP_USERNAME", os.getenv("EMAIL_SENDER", "")),
+                    password=os.getenv("EMAIL_IMAP_PASSWORD", os.getenv("EMAIL_PASSWORD", "")),
+                    subject_contains=subject,
+                    since_minutes=int(arrival_config.get("since_minutes", 30)),
+                    mailbox=str(arrival_config.get("mailbox", "INBOX")),
+                    timeout_seconds=int(arrival_config.get("timeout_seconds", config.get("network", {}).get("timeout_seconds", 25))),
+                )
+                print(f"Arrival verification status: {run_result['delivery_verification'].get('status')}")
             if alert_config.get("enabled", True) and alert_config.get("send_separate_alert", True) and alert_summary.get("needs_alert"):
                 alert_subject = f"[异常提醒] {datetime.now().strftime('%Y-%m-%d %H:%M')} {report_title}"
                 alert_html = render_alert_email_html(report_title, run_id, alert_summary.get("issues", []))

@@ -613,9 +613,10 @@ class SchedulerRunnerTests(unittest.TestCase):
         }
         history = {"warn_streak": 2}
         html = build_doctor_alert_html(payload, history)
-        self.assertIn("AI 日报健康检查告警", html)
+        self.assertIn("AI 日报需要处理", html)
         self.assertIn("email_env", html)
         self.assertIn("Task result unknown", html)
+        self.assertIn("setup_offline_tasks.ps1", html)
 
     def test_collect_task_self_heal_candidates_uses_unavailable_and_unknown_tasks(self):
         payload = {
