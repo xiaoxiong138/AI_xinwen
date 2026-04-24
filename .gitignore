@@ -24,6 +24,7 @@ alert_*.html
 Web_Agent_Agent_Feasibility_Report.md
 
 # Generated reports and archive indexes
+archive/
 report_*.html
 report_*.md
 reports_index.html

@@ -8,7 +8,7 @@ import socket
 import sys
 import copy
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -250,9 +250,10 @@ def build_collector_summary(collector_runs: List[Dict[str, Any]]) -> Dict[str, A
     fresh_items = sum(int(item.get("inserted_count", 0)) for item in collector_runs)
     timeout_count = sum(1 for item in collector_runs if item.get("status") == "timeout")
     failed_count = sum(1 for item in collector_runs if item.get("status") == "error")
+    skipped_count = sum(1 for item in collector_runs if item.get("status") == "skipped")
     status_text = (
         f"本轮共运行 {len(collector_runs)} 个采集单元，成功 {len(success)} 个，"
-        f"超时 {timeout_count} 个，失败 {failed_count} 个，新入库 {fresh_items} 条。"
+        f"超时 {timeout_count} 个，失败 {failed_count} 个，跳过 {skipped_count} 个，新入库 {fresh_items} 条。"
     )
     return {
         "status_text": status_text,
@@ -260,6 +261,7 @@ def build_collector_summary(collector_runs: List[Dict[str, Any]]) -> Dict[str, A
         "success_count": len(success),
         "timeout_count": timeout_count,
         "failed_count": failed_count,
+        "skipped_count": skipped_count,
         "rows": collector_runs,
     }
 
@@ -460,13 +462,34 @@ def should_skip_rss_feed(
 
     failure_threshold = int(degradation_config.get("failure_threshold", 2))
     lookback_runs = int(degradation_config.get("lookback_runs", 6))
+    recovery_interval_hours = int(degradation_config.get("recovery_interval_hours", 12))
     recent_runs = db.get_recent_collector_runs(f"RSSCollector[{feed_name}]", limit=lookback_runs)
+    actual_runs = [row for row in recent_runs if row.get("status") != "skipped"]
+    if not actual_runs:
+        return False
+
     consecutive_failures = 0
-    for row in recent_runs:
+    for row in actual_runs:
         if row.get("status") == "success":
             break
         consecutive_failures += 1
-    return consecutive_failures >= failure_threshold
+    if consecutive_failures < failure_threshold:
+        return False
+
+    if recovery_interval_hours <= 0:
+        return True
+
+    latest_actual_run = actual_runs[0]
+    created_at = str(latest_actual_run.get("created_at", "") or "").strip()
+    try:
+        latest_seen = datetime.fromisoformat(created_at)
+    except ValueError:
+        try:
+            latest_seen = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return True
+    current_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    return current_utc - latest_seen < timedelta(hours=recovery_interval_hours)
 
 
 def hydrate_paper_cache(
@@ -1230,6 +1253,7 @@ def main() -> Dict[str, Any]:
 
     print("\n=== Step 1: Collecting Data ===")
     collectors = []
+    collector_runs: List[Dict[str, Any]] = []
     arxiv_config = config["sources"].get("arxiv", {})
     if arxiv_config.get("enabled", False):
         topic_limits = arxiv_config.get("topic_limits", {})
@@ -1255,7 +1279,18 @@ def main() -> Dict[str, Any]:
     if rss_config.get("enabled", False):
         for feed in rss_config.get("feeds", []):
             if should_skip_rss_feed(db, str(feed.get("name", "feed")), rss_config.get("degradation", {})):
-                print(f"Skipping degraded RSS feed: {feed.get('name', 'feed')}")
+                feed_name = str(feed.get("name", "feed"))
+                print(f"Skipping degraded RSS feed: {feed_name}")
+                collector_runs.append(
+                    {
+                        "label": f"RSSCollector[{feed_name}]",
+                        "status": "skipped",
+                        "inserted_count": 0,
+                        "collected_count": 0,
+                        "duration_seconds": 0,
+                        "error": "degraded feed cooldown active; recovery probe will retry after cooldown",
+                    }
+                )
                 continue
             collector = RSSCollector(feeds=[feed], days_back=int(rss_config.get("days_back", 2)))
             collector.label = f"RSSCollector[{feed.get('name', 'feed')}]"
@@ -1276,7 +1311,6 @@ def main() -> Dict[str, Any]:
             collectors.append(collector)
 
     new_articles_count = 0
-    collector_runs: List[Dict[str, Any]] = []
     original_socket_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(network_timeout)
     try:

@@ -171,6 +171,29 @@ class SchedulerRunnerTests(unittest.TestCase):
             should_skip, _ = should_skip_for_idempotency(status_path, window_minutes=90)
             self.assertFalse(should_skip)
 
+    def test_should_skip_for_idempotency_chains_previous_success_after_skip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "last_run.json"
+            write_json(
+                status_path,
+                {
+                    "success": True,
+                    "status": "skipped_recent_success",
+                    "delivery_status": "skipped",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "previous_success": {
+                        "finished_at": (datetime.now() - timedelta(minutes=30)).isoformat(timespec="seconds"),
+                        "html_report_path": "archive/report_recent.html",
+                    },
+                },
+            )
+
+            should_skip, last_status = should_skip_for_idempotency(status_path, window_minutes=240)
+
+            self.assertTrue(should_skip)
+            self.assertEqual(last_status["delivery_status"], "sent")
+            self.assertEqual(last_status["html_report_path"], "archive/report_recent.html")
+
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
 任务名:                             \\Web_Agent_Send_1200

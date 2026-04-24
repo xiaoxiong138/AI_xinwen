@@ -30,6 +30,7 @@
       enabled: true
       failure_threshold: 2
       lookback_runs: 6
+      recovery_interval_hours: 12
     feeds:
       - name: OpenAI Blog
         url: https://openai.com/news/rss.xml
@@ -276,7 +277,7 @@ scheduler:
   doctor_task_name: Web_Agent_Doctor_0900
   doctor_task_time: "09:00"
   log_retention_days: 30
-  idempotency_window_minutes: 90
+  idempotency_window_minutes: 240
   max_run_seconds: 2700
   validation_max_run_seconds: 900
   validation_report_dir: archive/validation

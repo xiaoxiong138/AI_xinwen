@@ -891,12 +891,22 @@ def should_skip_for_idempotency(status_path: Path, window_minutes: int) -> Tuple
     last_status = read_json(status_path)
     if not last_status:
         return False, {}
-    if not last_status.get("success", False):
+    effective_status = last_status
+    if str(last_status.get("status", "")) == "skipped_recent_success":
+        previous_success = last_status.get("previous_success") or {}
+        if previous_success.get("finished_at"):
+            effective_status = {
+                **previous_success,
+                "success": True,
+                "delivery_status": "sent",
+            }
+
+    if not effective_status.get("success", False):
         return False, last_status
-    if str(last_status.get("delivery_status", "")) != "sent":
+    if str(effective_status.get("delivery_status", "")) != "sent":
         return False, last_status
 
-    finished_at = str(last_status.get("finished_at", "") or "")
+    finished_at = str(effective_status.get("finished_at", "") or "")
     if not finished_at:
         return False, last_status
     try:
@@ -905,7 +915,7 @@ def should_skip_for_idempotency(status_path: Path, window_minutes: int) -> Tuple
         return False, last_status
 
     if datetime.now() - finished_dt <= timedelta(minutes=window_minutes):
-        return True, last_status
+        return True, effective_status
     return False, last_status
 
 

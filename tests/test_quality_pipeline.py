@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from main import (
@@ -370,6 +371,64 @@ class QualityPipelineTests(unittest.TestCase):
                     db,
                     "Test Feed",
                     {"enabled": True, "failure_threshold": 2, "lookback_runs": 6},
+                )
+            )
+
+    def test_should_skip_rss_feed_allows_recovery_probe_after_cooldown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(str(Path(temp_dir) / "test.db"))
+            db.record_collector_runs(
+                "run1",
+                [{"label": "RSSCollector[Test Feed]", "status": "error", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "boom"}],
+            )
+            db.record_collector_runs(
+                "run2",
+                [{"label": "RSSCollector[Test Feed]", "status": "timeout", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "timeout"}],
+            )
+            old_timestamp = (datetime.now(timezone.utc) - timedelta(hours=13)).strftime("%Y-%m-%d %H:%M:%S")
+            conn = db._get_conn()
+            try:
+                conn.execute("UPDATE collector_runs SET created_at = ?", (old_timestamp,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            self.assertFalse(
+                should_skip_rss_feed(
+                    db,
+                    "Test Feed",
+                    {"enabled": True, "failure_threshold": 2, "lookback_runs": 6, "recovery_interval_hours": 12},
+                )
+            )
+
+    def test_should_skip_rss_feed_ignores_skipped_rows_for_recovery_clock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(str(Path(temp_dir) / "test.db"))
+            db.record_collector_runs(
+                "run1",
+                [{"label": "RSSCollector[Test Feed]", "status": "error", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "boom"}],
+            )
+            db.record_collector_runs(
+                "run2",
+                [{"label": "RSSCollector[Test Feed]", "status": "timeout", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "timeout"}],
+            )
+            old_timestamp = (datetime.now(timezone.utc) - timedelta(hours=13)).strftime("%Y-%m-%d %H:%M:%S")
+            conn = db._get_conn()
+            try:
+                conn.execute("UPDATE collector_runs SET created_at = ?", (old_timestamp,))
+                conn.commit()
+            finally:
+                conn.close()
+            db.record_collector_runs(
+                "run3",
+                [{"label": "RSSCollector[Test Feed]", "status": "skipped", "inserted_count": 0, "collected_count": 0, "duration_seconds": 0, "error": "cooldown"}],
+            )
+
+            self.assertFalse(
+                should_skip_rss_feed(
+                    db,
+                    "Test Feed",
+                    {"enabled": True, "failure_threshold": 2, "lookback_runs": 6, "recovery_interval_hours": 12},
                 )
             )
 
