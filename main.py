@@ -336,6 +336,7 @@ def build_quality_diagnostics(
     selected_paper_count: int,
     selected_update_count: int,
     paper_limit: int,
+    min_paper_count: int,
     web_limit: int,
     min_web_items: int,
     paper_backfill_hours_used: List[int],
@@ -343,8 +344,8 @@ def build_quality_diagnostics(
     collector_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
     warnings: List[str] = []
-    if selected_paper_count < paper_limit:
-        warnings.append(f"selected_papers_below_target:{selected_paper_count}/{paper_limit}")
+    if selected_paper_count < min_paper_count:
+        warnings.append(f"selected_papers_below_minimum:{selected_paper_count}/{min_paper_count}")
     if selected_update_count < min_web_items:
         warnings.append(f"selected_updates_below_minimum:{selected_update_count}/{min_web_items}")
     if update_candidate_count and deduped_update_count < update_candidate_count:
@@ -356,6 +357,7 @@ def build_quality_diagnostics(
     return {
         "targets": {
             "paper_limit": paper_limit,
+            "min_paper_count": min_paper_count,
             "web_limit": web_limit,
             "min_web_items": min_web_items,
         },
@@ -1774,6 +1776,7 @@ def main() -> Dict[str, Any]:
             selected_paper_count=0,
             selected_update_count=0,
             paper_limit=paper_limit,
+            min_paper_count=int(alert_config.get("min_paper_count", min(10, paper_limit))),
             web_limit=web_limit,
             min_web_items=min_web_items,
             paper_backfill_hours_used=paper_backfill_hours_used,
@@ -1816,6 +1819,7 @@ def main() -> Dict[str, Any]:
         selected_paper_count=len(papers),
         selected_update_count=len(updates),
         paper_limit=paper_limit,
+        min_paper_count=int(alert_config.get("min_paper_count", min(10, paper_limit))),
         web_limit=web_limit,
         min_web_items=min_web_items,
         paper_backfill_hours_used=paper_backfill_hours_used,
@@ -1949,7 +1953,7 @@ def main() -> Dict[str, Any]:
                     timeout_seconds=int(arrival_config.get("timeout_seconds", config.get("network", {}).get("timeout_seconds", 25))),
                 )
                 print(f"Arrival verification status: {run_result['delivery_verification'].get('status')}")
-            if alert_config.get("enabled", True) and alert_config.get("send_separate_alert", True) and alert_summary.get("needs_alert"):
+            if alert_config.get("enabled", True) and alert_config.get("send_separate_alert", False) and alert_summary.get("needs_alert"):
                 alert_subject = f"[异常提醒] {datetime.now().strftime('%Y-%m-%d %H:%M')} {report_title}"
                 alert_html = render_alert_email_html(report_title, run_id, alert_summary.get("issues", []))
                 alert_sent = notifier.send_email(recipient_email=recipient, subject=alert_subject, html_content=alert_html)

@@ -257,9 +257,9 @@ alerts:
   recipients_env: EMAIL_RECIPIENT
   arxiv_failure_threshold: 1
   min_update_count: 20
-  min_paper_count: 12
+  min_paper_count: 10
   duplicate_ratio_threshold: 0.8
-  send_separate_alert: true
+  send_separate_alert: false
 trends:
   enabled: true
   lookback_days: 3
@@ -308,8 +308,8 @@ scheduler:
   max_attempts: 2
   retry_delay_seconds: 60
   stale_lock_seconds: 10800
-  send_failure_email: true
-  send_doctor_alert_email: true
+  send_failure_email: false
+  send_doctor_alert_email: false
   doctor_warn_streak_threshold: 2
   failure_email_subject_prefix: "[AI日报调度失败]"
   doctor_alert_subject_prefix: "[AI日报健康检查告警]"

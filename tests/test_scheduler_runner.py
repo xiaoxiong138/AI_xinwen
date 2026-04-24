@@ -585,6 +585,7 @@ class SchedulerRunnerTests(unittest.TestCase):
     def test_should_send_doctor_alert_respects_warn_threshold_and_dedup(self):
         scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
         scheduler_config["doctor_warn_streak_threshold"] = 2
+        scheduler_config["send_doctor_alert_email"] = True
 
         payload = {
             "overall": "warn",

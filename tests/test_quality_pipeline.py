@@ -447,7 +447,8 @@ class QualityPipelineTests(unittest.TestCase):
             deduped_update_count=16,
             selected_paper_count=10,
             selected_update_count=16,
-            paper_limit=12,
+            paper_limit=15,
+            min_paper_count=12,
             web_limit=20,
             min_web_items=20,
             paper_backfill_hours_used=[168],
@@ -455,10 +456,33 @@ class QualityPipelineTests(unittest.TestCase):
             collector_summary={"fresh_items": 5, "success_count": 8, "failed_count": 0, "timeout_count": 0, "skipped_count": 1},
         )
 
-        self.assertEqual(diagnostics["targets"]["paper_limit"], 12)
+        self.assertEqual(diagnostics["targets"]["paper_limit"], 15)
+        self.assertEqual(diagnostics["targets"]["min_paper_count"], 12)
         self.assertEqual(diagnostics["selection"]["update_candidates_after_dedupe"], 16)
-        self.assertIn("selected_papers_below_target:10/12", diagnostics["warnings"])
+        self.assertIn("selected_papers_below_minimum:10/12", diagnostics["warnings"])
         self.assertIn("dedupe_removed_updates:14", diagnostics["warnings"])
+
+    def test_build_quality_diagnostics_accepts_papers_inside_configured_range(self):
+        diagnostics = build_quality_diagnostics(
+            current_papers_count=0,
+            current_updates_count=20,
+            report_items_count=40,
+            prepared_items_count=40,
+            paper_candidate_count=11,
+            update_candidate_count=29,
+            deduped_update_count=29,
+            selected_paper_count=11,
+            selected_update_count=20,
+            paper_limit=15,
+            min_paper_count=10,
+            web_limit=20,
+            min_web_items=20,
+            paper_backfill_hours_used=[72],
+            web_backfill_hours_used=[],
+            collector_summary={"fresh_items": 20, "success_count": 22, "failed_count": 0, "timeout_count": 0, "skipped_count": 0},
+        )
+
+        self.assertNotIn("selected_papers_below_minimum:11/10", diagnostics["warnings"])
 
     def test_build_source_health_summary_tracks_failures_and_last_success(self):
         with tempfile.TemporaryDirectory() as temp_dir:

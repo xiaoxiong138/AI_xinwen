@@ -66,9 +66,9 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "max_attempts": 2,
     "retry_delay_seconds": 60,
     "stale_lock_seconds": 10800,
-    "send_failure_email": True,
+    "send_failure_email": False,
     "failure_email_subject_prefix": "[AI日报调度失败]",
-    "send_doctor_alert_email": True,
+    "send_doctor_alert_email": False,
     "doctor_warn_streak_threshold": 2,
     "doctor_alert_subject_prefix": "[AI日报健康检查告警]",
 }
