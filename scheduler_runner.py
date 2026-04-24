@@ -868,6 +868,27 @@ def print_doctor_report(
 ) -> int:
     payload = build_doctor_payload()
     config, scheduler_config = load_runtime_config()
+
+    self_heal_result: Dict[str, Any] = {
+        "attempted": False,
+        "dry_run": dry_run,
+        "candidates": [],
+        "success": False,
+        "message": "Task self-heal not requested.",
+    }
+    if self_heal:
+        candidates = collect_task_self_heal_candidates(payload)
+        self_heal_result = run_task_self_heal(scheduler_config, candidates, dry_run=dry_run)
+        if self_heal_result.get("attempted", False) and self_heal_result.get("success", False) and not dry_run:
+            pre_heal_summary = {
+                "overall": payload.get("overall", "unknown"),
+                "counts": payload.get("counts", {}),
+                "candidates": candidates,
+            }
+            payload = build_doctor_payload()
+            payload["pre_heal_summary"] = pre_heal_summary
+        payload["self_heal"] = self_heal_result
+
     snapshot_path = write_doctor_snapshot(payload, scheduler_config)
     history_path = Path(str(scheduler_config["doctor_history_file"]))
     history = (
@@ -898,19 +919,6 @@ def print_doctor_report(
                 "recorded": persist_history,
             }
             write_doctor_snapshot(payload, scheduler_config)
-
-    self_heal_result: Dict[str, Any] = {
-        "attempted": False,
-        "dry_run": dry_run,
-        "candidates": [],
-        "success": False,
-        "message": "Task self-heal not requested.",
-    }
-    if self_heal:
-        candidates = collect_task_self_heal_candidates(payload)
-        self_heal_result = run_task_self_heal(scheduler_config, candidates, dry_run=dry_run)
-        payload["self_heal"] = self_heal_result
-        write_doctor_snapshot(payload, scheduler_config)
 
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))

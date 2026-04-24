@@ -51,7 +51,7 @@ function New-PasswordTask {
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Resolve-PythonExe -Candidate $PythonExe
 $runner = Join-Path $root "scheduler_runner.py"
-$taskCommand = '"' + $python + '" "' + $runner + '" --doctor --record'
+$taskCommand = '"' + $python + '" "' + $runner + '" --doctor --record --self-heal'
 $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
 
 Remove-TaskIfExists -Name $TaskName

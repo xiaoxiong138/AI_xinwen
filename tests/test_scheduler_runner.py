@@ -714,6 +714,47 @@ class SchedulerRunnerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
 
+    def test_print_doctor_report_rebuilds_payload_after_successful_self_heal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "doctor_latest.json"
+            history_path = Path(temp_dir) / "doctor_history.json"
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config["doctor_status_file"] = str(snapshot_path)
+            scheduler_config["doctor_history_file"] = str(history_path)
+            before_payload = {
+                "overall": "warn",
+                "counts": {"ok": 1, "warn": 1, "fail": 0},
+                "checks": [{"name": "task", "level": "warn", "detail": "needs repair"}],
+                "status": {"tasks": [{"task_name": "\\Web_Agent_Send_2100", "available": False, "error": "query failed"}]},
+            }
+            after_payload = {
+                "overall": "ok",
+                "counts": {"ok": 2, "warn": 0, "fail": 0},
+                "checks": [{"name": "task", "level": "ok", "detail": "repaired"}],
+                "status": {"tasks": [{"task_name": "\\Web_Agent_Send_2100", "available": True, "last_result_hint": "success"}]},
+            }
+
+            with patch("scheduler_runner.build_doctor_payload", side_effect=[before_payload, after_payload]):
+                with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                    with patch("scheduler_runner.send_doctor_alert_email", return_value=False):
+                        with patch(
+                            "scheduler_runner.run_task_self_heal",
+                            return_value={"attempted": True, "success": True, "message": "repaired"},
+                        ):
+                            with patch("sys.stdout.write"):
+                                exit_code = print_doctor_report(
+                                    as_json=False,
+                                    self_heal=True,
+                                    dry_run=False,
+                                    persist_history=True,
+                                )
+
+            self.assertEqual(exit_code, 0)
+            persisted = json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(persisted["overall"], "ok")
+            self.assertEqual(persisted["pre_heal_summary"]["overall"], "warn")
+            self.assertTrue(persisted["self_heal"]["success"])
+
     def test_print_doctor_report_default_mode_does_not_write_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "doctor_latest.json"
