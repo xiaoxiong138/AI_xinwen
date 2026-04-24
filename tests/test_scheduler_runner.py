@@ -194,6 +194,37 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertEqual(last_status["delivery_status"], "sent")
             self.assertEqual(last_status["html_report_path"], "archive/report_recent.html")
 
+    def test_should_skip_for_idempotency_prefers_last_success_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "last_run.json"
+            success_path = Path(temp_dir) / "last_success.json"
+            write_json(
+                status_path,
+                {
+                    "success": False,
+                    "status": "notification_failed",
+                    "delivery_status": "failed",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+            write_json(
+                success_path,
+                {
+                    "finished_at": (datetime.now() - timedelta(minutes=20)).isoformat(timespec="seconds"),
+                    "html_report_path": "archive/report_success.html",
+                },
+            )
+
+            should_skip, last_status = should_skip_for_idempotency(
+                status_path,
+                window_minutes=240,
+                last_success_path=success_path,
+            )
+
+            self.assertTrue(should_skip)
+            self.assertEqual(last_status["delivery_status"], "sent")
+            self.assertEqual(last_status["html_report_path"], "archive/report_success.html")
+
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
 任务名:                             \\Web_Agent_Send_1200
@@ -322,6 +353,14 @@ class SchedulerRunnerTests(unittest.TestCase):
                 "status": "success",
                 "delivery_status": "sent",
                 "finished_at": "2026-04-12T03:05:00",
+                "log_file": "D:/Web_Agent/logs/scheduler_run_ok.log",
+            },
+            "last_success": {
+                "success": True,
+                "status": "success",
+                "delivery_status": "sent",
+                "finished_at": "2026-04-12T03:05:00",
+                "html_report_path": "archive/report_ok.html",
                 "log_file": "D:/Web_Agent/logs/scheduler_run_ok.log",
             },
             "lock": {"state": "idle", "pid": "", "acquired_at": ""},
@@ -619,6 +658,7 @@ class SchedulerRunnerTests(unittest.TestCase):
             temp_root = Path(temp_dir)
             log_dir = temp_root / "logs"
             status_path = log_dir / "last_run.json"
+            last_success_path = log_dir / "last_success.json"
             lock_path = log_dir / "scheduler.lock"
             log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -638,6 +678,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                 {
                     "log_dir": str(log_dir),
                     "status_file": str(status_path),
+                    "last_success_file": str(last_success_path),
                     "lock_file": str(lock_path),
                     "log_retention_days": 30,
                     "idempotency_window_minutes": 90,
@@ -653,11 +694,57 @@ class SchedulerRunnerTests(unittest.TestCase):
             latest = json.loads(status_path.read_text(encoding="utf-8-sig"))
             self.assertEqual(latest["status"], "skipped_recent_success")
 
+    def test_main_records_last_success_snapshot_after_sent_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            log_dir = temp_root / "logs"
+            status_path = log_dir / "last_run.json"
+            last_success_path = log_dir / "last_success.json"
+            lock_path = log_dir / "scheduler.lock"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "log_dir": str(log_dir),
+                    "status_file": str(status_path),
+                    "last_success_file": str(last_success_path),
+                    "lock_file": str(lock_path),
+                    "log_retention_days": 30,
+                    "idempotency_window_minutes": 90,
+                    "task_names": [],
+                    "max_attempts": 1,
+                }
+            )
+            attempt_result = {
+                "success": True,
+                "status": "success",
+                "retryable": False,
+                "delivery_status": "sent",
+                "started_at": "2026-04-24T12:00:00",
+                "finished_at": "2026-04-24T12:05:00",
+                "run_id": "20260424_120000",
+                "html_report_path": "archive/report_20260424_1205.html",
+                "markdown_report_path": "archive/report_20260424_1205.md",
+                "paper_count": 12,
+                "update_count": 20,
+            }
+
+            with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                with patch("scheduler_runner.run_main_once", return_value=dict(attempt_result)):
+                    exit_code = scheduler_main()
+
+            self.assertEqual(exit_code, 0)
+            persisted = json.loads(last_success_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(persisted["delivery_status"], "sent")
+            self.assertEqual(persisted["html_report_path"], "archive/report_20260424_1205.html")
+
     def test_validate_run_uses_separate_status_file_and_bypasses_idempotency(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             log_dir = temp_root / "logs"
             status_path = log_dir / "last_run.json"
+            last_success_path = log_dir / "last_success.json"
             validation_status_path = log_dir / "last_validation_run.json"
             lock_path = log_dir / "scheduler.lock"
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -677,6 +764,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                 {
                     "log_dir": str(log_dir),
                     "status_file": str(status_path),
+                    "last_success_file": str(last_success_path),
                     "validation_status_file": str(validation_status_path),
                     "lock_file": str(lock_path),
                     "log_retention_days": 30,

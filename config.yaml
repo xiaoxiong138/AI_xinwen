@@ -265,6 +265,7 @@ archive:
 scheduler:
   log_dir: logs
   status_file: logs/last_run.json
+  last_success_file: logs/last_success.json
   validation_status_file: logs/last_validation_run.json
   lock_file: logs/scheduler.lock
   doctor_status_file: logs/doctor_latest.json

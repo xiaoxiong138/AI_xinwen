@@ -48,6 +48,7 @@ DOCTOR_PASSING_HINTS = {"success", "ready", "running", "never_ran"}
 DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "log_dir": "logs",
     "status_file": "logs/last_run.json",
+    "last_success_file": "logs/last_success.json",
     "validation_status_file": "logs/last_validation_run.json",
     "lock_file": "logs/scheduler.lock",
     "validation_report_dir": "archive/validation",
@@ -97,6 +98,7 @@ def load_runtime_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     for key in (
         "log_dir",
         "status_file",
+        "last_success_file",
         "validation_status_file",
         "lock_file",
         "validation_report_dir",
@@ -221,6 +223,7 @@ def build_status_text(
     task_infos: list[Dict[str, Any]],
     lock_info: Dict[str, Any],
     validation_status: Optional[Dict[str, Any]] = None,
+    last_success: Optional[Dict[str, Any]] = None,
 ) -> str:
     lines = [
         f"Current time: {datetime.now().isoformat(timespec='seconds')}",
@@ -233,6 +236,11 @@ def build_status_text(
     if last_status.get("html_report_path") or last_status.get("markdown_report_path"):
         lines.append(f"HTML report: {last_status.get('html_report_path', '') or 'N/A'}")
         lines.append(f"Markdown report: {last_status.get('markdown_report_path', '') or 'N/A'}")
+
+    last_success = dict(last_success or {})
+    if last_success:
+        lines.append(f"Last successful send: {last_success.get('finished_at', '') or 'N/A'}")
+        lines.append(f"Last success HTML: {last_success.get('html_report_path', '') or 'N/A'}")
 
     previous_success = dict(last_status.get("previous_success") or {})
     if previous_success:
@@ -285,9 +293,11 @@ def build_status_text(
 def build_scheduler_status_payload() -> Dict[str, Any]:
     _, scheduler_config = load_runtime_config()
     status_path = Path(scheduler_config["status_file"])
+    last_success_path = Path(scheduler_config["last_success_file"])
     validation_status_path = Path(scheduler_config["validation_status_file"])
     lock_path = Path(scheduler_config["lock_file"])
     last_status = read_json(status_path)
+    last_success = read_json(last_success_path)
     validation_status = read_json(validation_status_path)
     lock_info = read_json(lock_path) if lock_path.exists() else {}
     lock_pid = int(lock_info.get("pid", 0) or 0) if lock_info else 0
@@ -303,6 +313,7 @@ def build_scheduler_status_payload() -> Dict[str, Any]:
     return {
         "current_time": datetime.now().isoformat(timespec="seconds"),
         "last_run": last_status,
+        "last_success": last_success,
         "last_validation_run": validation_status,
         "lock": lock_summary,
         "tasks": task_infos,
@@ -316,6 +327,7 @@ def print_scheduler_status(as_json: bool = False) -> int:
         return 0
 
     last_status = dict(payload.get("last_run") or {})
+    last_success = dict(payload.get("last_success") or {})
     validation_status = dict(payload.get("last_validation_run") or {})
     lock_summary = dict(payload.get("lock") or {})
     task_infos = list(payload.get("tasks") or [])
@@ -326,7 +338,15 @@ def print_scheduler_status(as_json: bool = False) -> int:
             "pid": lock_summary.get("pid", ""),
             "acquired_at": lock_summary.get("acquired_at", ""),
         }
-    print(build_status_text(last_status, task_infos, lock_info, validation_status=validation_status))
+    print(
+        build_status_text(
+            last_status,
+            task_infos,
+            lock_info,
+            validation_status=validation_status,
+            last_success=last_success,
+        )
+    )
     return 0
 
 
@@ -450,6 +470,7 @@ def build_doctor_payload() -> Dict[str, Any]:
         checks.append(_doctor_item("lock", "ok", "Scheduler lock is idle.", lock_summary))
 
     last_run = dict(status_payload.get("last_run") or {})
+    last_success = dict(status_payload.get("last_success") or {})
     if not last_run:
         checks.append(_doctor_item("last_run", "warn", "No previous run status file found yet."))
     else:
@@ -479,6 +500,22 @@ def build_doctor_payload() -> Dict[str, Any]:
                     },
                 )
             )
+
+    if last_success:
+        checks.append(
+            _doctor_item(
+                "last_success",
+                "ok",
+                f"Last successful email finished at {last_success.get('finished_at', '') or 'unknown'}.",
+                {
+                    "html_report_path": last_success.get("html_report_path", ""),
+                    "markdown_report_path": last_success.get("markdown_report_path", ""),
+                    "log_file": last_success.get("log_file", ""),
+                },
+            )
+        )
+    else:
+        checks.append(_doctor_item("last_success", "warn", "No successful email snapshot has been recorded yet."))
 
     task_infos = list(status_payload.get("tasks") or [])
     for task in task_infos:
@@ -884,15 +921,26 @@ def cleanup_validation_reports(validation_dir: Path, retention_days: int) -> lis
     return removed
 
 
-def should_skip_for_idempotency(status_path: Path, window_minutes: int) -> Tuple[bool, Dict[str, Any]]:
+def should_skip_for_idempotency(
+    status_path: Path,
+    window_minutes: int,
+    last_success_path: Optional[Path] = None,
+) -> Tuple[bool, Dict[str, Any]]:
     if window_minutes <= 0:
         return False, {}
 
     last_status = read_json(status_path)
+    last_success = read_json(last_success_path) if last_success_path else {}
+    if last_success:
+        last_success["success"] = True
+        last_success["delivery_status"] = "sent"
+        last_status = last_status or last_success
+        effective_status = last_success
+    else:
+        effective_status = last_status
     if not last_status:
         return False, {}
-    effective_status = last_status
-    if str(last_status.get("status", "")) == "skipped_recent_success":
+    if not last_success and str(last_status.get("status", "")) == "skipped_recent_success":
         previous_success = last_status.get("previous_success") or {}
         if previous_success.get("finished_at"):
             effective_status = {
@@ -917,6 +965,24 @@ def should_skip_for_idempotency(status_path: Path, window_minutes: int) -> Tuple
     if datetime.now() - finished_dt <= timedelta(minutes=window_minutes):
         return True, effective_status
     return False, last_status
+
+
+def build_last_success_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "status": status.get("status", "success"),
+        "delivery_status": "sent",
+        "finished_at": status.get("finished_at", ""),
+        "started_at": status.get("started_at", ""),
+        "run_id": status.get("run_id", ""),
+        "run_mode": status.get("run_mode", "scheduler"),
+        "html_report_path": status.get("html_report_path", ""),
+        "markdown_report_path": status.get("markdown_report_path", ""),
+        "paper_count": status.get("paper_count", 0),
+        "update_count": status.get("update_count", 0),
+        "new_articles_count": status.get("new_articles_count", 0),
+        "log_file": status.get("log_file", ""),
+    }
 
 
 def is_pid_running(pid: int) -> bool:
@@ -1172,6 +1238,7 @@ def main(validate_run: bool = False) -> int:
     status_path = Path(
         scheduler_config["validation_status_file"] if validate_run else scheduler_config["status_file"]
     )
+    last_success_path = Path(scheduler_config["last_success_file"])
     lock_path = Path(scheduler_config["lock_file"])
     log_dir.mkdir(parents=True, exist_ok=True)
     run_label = "validation" if validate_run else "scheduler"
@@ -1223,6 +1290,7 @@ def main(validate_run: bool = False) -> int:
                     skip_for_window, last_status = should_skip_for_idempotency(
                         status_path,
                         int(scheduler_config.get("idempotency_window_minutes", 90)),
+                        last_success_path,
                     )
                 if skip_for_window:
                     status = {
@@ -1299,6 +1367,12 @@ def main(validate_run: bool = False) -> int:
                     "removed_validation_reports": removed_validation_reports,
                 }
                 write_json(status_path, build_status_snapshot(final_status))
+                if (
+                    not validate_run
+                    and final_status.get("success", False)
+                    and final_status.get("delivery_status") == "sent"
+                ):
+                    write_json(last_success_path, build_last_success_snapshot(final_status))
                 print(
                     f"[{datetime.now().isoformat(timespec='seconds')}] "
                     f"{run_label.capitalize()} runner finished with status {final_status.get('status')}."
