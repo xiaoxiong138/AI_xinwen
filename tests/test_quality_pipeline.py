@@ -7,6 +7,8 @@ from pathlib import Path
 
 from main import (
     apply_runtime_profile,
+    build_quality_diagnostics,
+    build_source_health_summary,
     build_suppressed_alert_summary,
     build_alert_summary_v2,
     build_archive_summary,
@@ -246,6 +248,83 @@ class QualityPipelineTests(unittest.TestCase):
                 streak = 1
             self.assertLessEqual(streak, 2)
 
+    def test_report_content_regression_sample_keeps_editorial_structure(self):
+        generator = ReportGenerator()
+        papers = [
+            {
+                "url": "https://paper.example/world-model",
+                "title_cn": "世界模型把预测能力推向低试错规划",
+                "summary_preview": "核心看点是先预测再行动的规划效率。",
+                "summary": "摘要",
+                "why_it_matters": "它决定世界模型能否进入真实控制任务。",
+                "expected_effect": "减少长链路试错成本。",
+                "future_impact": "可能成为机器人规划中间层。",
+                "content_type": "paper",
+                "display_topic": "世界模型",
+                "score": 9.4,
+            },
+            {
+                "url": "https://paper.example/robotics",
+                "title_cn": "机器人策略学习开始重视真实环境闭环",
+                "summary_preview": "重点是把论文效果带到真实任务。",
+                "summary": "摘要",
+                "why_it_matters": "真实闭环决定部署价值。",
+                "expected_effect": "提高实机成功率。",
+                "future_impact": "推动具身智能落地。",
+                "content_type": "paper",
+                "display_topic": "机器人",
+                "score": 9.1,
+            },
+        ]
+        updates = [
+            {
+                "url": "https://news.example/agent",
+                "title_cn": "企业 Agent 从聊天入口走向流程执行",
+                "summary_preview": "重点不是问答，而是接管多工具任务链。",
+                "summary": "摘要",
+                "why_it_matters": "产品正在进入真实工作流。",
+                "expected_effect": "减少人工切换。",
+                "future_impact": "竞争转向执行入口。",
+                "content_type": "news",
+                "display_topic": "产品发布",
+                "score": 9.7,
+            },
+            {
+                "url": "https://news.example/infrastructure",
+                "title_cn": "推理基础设施继续压低企业部署门槛",
+                "summary_preview": "成本和延迟仍是落地核心变量。",
+                "summary": "摘要",
+                "why_it_matters": "基础设施决定应用扩张速度。",
+                "expected_effect": "降低上线成本。",
+                "future_impact": "改变供应关系。",
+                "content_type": "news",
+                "display_topic": "基础设施",
+                "score": 9.3,
+            },
+        ]
+
+        mixed = generator.build_mixed_items(papers, updates)
+        html = generator.generate_html(
+            papers=papers,
+            updates=updates,
+            mixed_items=mixed,
+            report_summary={
+                "lead_summary": "今天的重点是 Agent 执行入口、世界模型和推理基础设施。",
+                "paper_summary": "论文继续围绕低试错规划和实机闭环推进。",
+                "update_summary": "产业动态集中在企业流程和部署成本。",
+                "hot_topics": ["Agent", "世界模型"],
+                "key_takeaways": ["执行入口正在变重要"],
+                "watchlist": ["关注晚间发布"],
+            },
+            trend_summary={"items": []},
+            alert_summary={"needs_alert": False, "issues": []},
+            archive_summary={"entries": []},
+        )
+
+        self.assertIn("今日最重要 5 条", html)
+        self.assertIn("先看理由", html)
+        self.assertIn("企业 Agent 从聊天入口走向流程执行", html)
+
     def test_html_report_excludes_highlight_duplicates_from_body(self):
         generator = ReportGenerator()
         papers = [
@@ -354,6 +433,53 @@ class QualityPipelineTests(unittest.TestCase):
             self.assertIn("Arxiv", joined)
             self.assertIn("去重后全网动态仅保留 16 条", joined)
             self.assertIn("最终论文仅保留 10 篇", joined)
+
+    def test_build_quality_diagnostics_explains_selection_shortfall(self):
+        diagnostics = build_quality_diagnostics(
+            current_papers_count=3,
+            current_updates_count=8,
+            report_items_count=18,
+            prepared_items_count=18,
+            paper_candidate_count=8,
+            update_candidate_count=30,
+            deduped_update_count=16,
+            selected_paper_count=10,
+            selected_update_count=16,
+            paper_limit=12,
+            web_limit=20,
+            min_web_items=20,
+            paper_backfill_hours_used=[168],
+            web_backfill_hours_used=[24, 48],
+            collector_summary={"fresh_items": 5, "success_count": 8, "failed_count": 0, "timeout_count": 0, "skipped_count": 1},
+        )
+
+        self.assertEqual(diagnostics["targets"]["paper_limit"], 12)
+        self.assertEqual(diagnostics["selection"]["update_candidates_after_dedupe"], 16)
+        self.assertIn("selected_papers_below_target:10/12", diagnostics["warnings"])
+        self.assertIn("dedupe_removed_updates:14", diagnostics["warnings"])
+
+    def test_build_source_health_summary_tracks_failures_and_last_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(str(Path(temp_dir) / "test.db"))
+            db.record_collector_runs(
+                "run1",
+                [{"label": "RSSCollector[Test Feed]", "status": "success", "inserted_count": 1, "collected_count": 2, "duration_seconds": 1.0, "error": ""}],
+            )
+            db.record_collector_runs(
+                "run2",
+                [{"label": "RSSCollector[Test Feed]", "status": "timeout", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "timeout"}],
+            )
+
+            summary = build_source_health_summary(
+                [{"label": "RSSCollector[Test Feed]", "status": "timeout", "inserted_count": 0, "collected_count": 0, "duration_seconds": 1.0, "error": "timeout"}],
+                db,
+                history_limit=20,
+            )
+
+        row = summary["rows"][0]
+        self.assertEqual(summary["risky_source_count"], 1)
+        self.assertEqual(row["consecutive_failures"], 1)
+        self.assertNotEqual(row["last_success_at"], "")
 
     def test_should_skip_rss_feed_after_repeated_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -257,6 +257,8 @@ trends:
   lookback_days: 3
   max_items: 5
   min_occurrences: 2
+observability:
+  source_health_history_limit: 160
 archive:
   enabled: true
   report_dir: archive
@@ -274,9 +276,14 @@ scheduler:
   task_names:
     - Web_Agent_Send_1200_v2
     - Web_Agent_Send_2100_v2
+  monitor_auxiliary_tasks: true
+  require_offline_tasks: false
   doctor_task_setup_script: setup_doctor_task.ps1
   doctor_task_name: Web_Agent_Doctor_0900
   doctor_task_time: "09:00"
+  preflight_task_setup_script: setup_preflight_task.ps1
+  preflight_task_name: Web_Agent_Preflight_2030
+  preflight_task_time: "20:30"
   log_retention_days: 30
   idempotency_window_minutes: 240
   max_run_seconds: 2700

@@ -12,6 +12,7 @@ from scheduler_runner import (
     acquire_run_lock,
     build_doctor_payload,
     build_doctor_alert_html,
+    build_monitored_task_names,
     build_scheduler_status_payload,
     build_status_snapshot,
     build_status_text,
@@ -20,6 +21,7 @@ from scheduler_runner import (
     cleanup_validation_reports,
     collect_task_self_heal_candidates,
     describe_task_result,
+    is_interactive_task,
     parse_worker_result_line,
     parse_schtasks_list_output,
     print_doctor_report,
@@ -302,6 +304,33 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(result["hint"], "unknown")
         self.assertEqual(result["message"], "操作员或系统管理员拒绝了请求。")
 
+    def test_is_interactive_task_detects_chinese_and_english_logon_modes(self):
+        self.assertTrue(is_interactive_task({"logon_mode": "只使用交互方式"}))
+        self.assertTrue(is_interactive_task({"logon_mode": "Interactive only"}))
+        self.assertFalse(is_interactive_task({"logon_mode": "Password"}))
+
+    def test_build_monitored_task_names_includes_auxiliary_tasks_once(self):
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+        scheduler_config.update(
+            {
+                "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
+                "doctor_task_name": "Web_Agent_Doctor_0900",
+                "preflight_task_name": "Web_Agent_Preflight_2030",
+            }
+        )
+
+        names = build_monitored_task_names(scheduler_config)
+
+        self.assertEqual(
+            names,
+            [
+                "Web_Agent_Send_1200_v2",
+                "Web_Agent_Send_2100_v2",
+                "Web_Agent_Doctor_0900",
+                "Web_Agent_Preflight_2030",
+            ],
+        )
+
     def test_build_scheduler_status_payload_summarizes_last_run_lock_and_tasks(self):
         mocked_tasks = [
             {
@@ -332,6 +361,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "validation_status_file": str(validation_status_path),
                     "lock_file": str(lock_path),
                     "task_names": ["Web_Agent_Send_1200"],
+                    "monitor_auxiliary_tasks": False,
                 }
             )
 
@@ -460,6 +490,61 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(payload["overall"], "fail")
         failed = [item for item in payload["checks"] if item["level"] == "fail"]
         self.assertTrue(any(item["name"] == "email_env" for item in failed))
+
+    def test_build_doctor_payload_warns_when_offline_tasks_are_required_but_interactive(self):
+        mocked_status = {
+            "current_time": "2026-04-12T03:10:00",
+            "last_run": {"success": True, "status": "success", "delivery_status": "sent"},
+            "last_success": {"finished_at": "2026-04-12T03:05:00", "html_report_path": "archive/report.html"},
+            "lock": {"state": "idle", "pid": "", "acquired_at": ""},
+            "tasks": [
+                {
+                    "task_name": "\\Web_Agent_Send_1200_v2",
+                    "available": True,
+                    "status": "就绪",
+                    "next_run_time": "2026/4/12 12:00:00",
+                    "logon_mode": "只使用交互方式",
+                    "last_result": "0",
+                    "last_result_hint": "success",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            (temp_root / "logs").mkdir()
+            (temp_root / "archive").mkdir()
+            (temp_root / "reports_manifest.json").write_text("{}", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "log_dir": str(temp_root / "logs"),
+                    "status_file": str(temp_root / "logs" / "last_run.json"),
+                    "last_success_file": str(temp_root / "logs" / "last_success.json"),
+                    "lock_file": str(temp_root / "logs" / "scheduler.lock"),
+                    "task_names": ["Web_Agent_Send_1200_v2"],
+                    "monitor_auxiliary_tasks": False,
+                    "require_offline_tasks": True,
+                }
+            )
+            config = {"archive": {"report_dir": str(temp_root / "archive")}}
+
+            with patch("scheduler_runner.ROOT", temp_root):
+                with patch("scheduler_runner.load_runtime_config", return_value=(config, scheduler_config)):
+                    with patch("scheduler_runner.build_scheduler_status_payload", return_value=mocked_status):
+                        with patch.dict(
+                            os.environ,
+                            {
+                                "EMAIL_RECIPIENT": "user@example.com",
+                                "EMAIL_SENDER": "bot@example.com",
+                                "EMAIL_PASSWORD": "secret",
+                            },
+                            clear=False,
+                        ):
+                            payload = build_doctor_payload()
+
+        self.assertEqual(payload["overall"], "warn")
+        warned = [item for item in payload["checks"] if item["level"] == "warn"]
+        self.assertTrue(any("Offline mode required" in item["detail"] for item in warned))
 
     def test_write_doctor_snapshot_persists_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:

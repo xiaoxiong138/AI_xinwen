@@ -266,6 +266,125 @@ def build_collector_summary(collector_runs: List[Dict[str, Any]]) -> Dict[str, A
     }
 
 
+def build_source_health_summary(
+    collector_runs: List[Dict[str, Any]],
+    db: Database,
+    history_limit: int = 160,
+) -> Dict[str, Any]:
+    recent_rows = db.get_recent_collector_runs(limit=history_limit)
+    labels = sorted({str(row.get("label", "")) for row in recent_rows + collector_runs if row.get("label")})
+    current_by_label = {str(row.get("label", "")): row for row in collector_runs}
+    rows: List[Dict[str, Any]] = []
+
+    for label in labels:
+        history = [row for row in recent_rows if str(row.get("label", "")) == label]
+        actual_history = [row for row in history if row.get("status") != "skipped"]
+        consecutive_failures = 0
+        for row in actual_history:
+            if row.get("status") == "success":
+                break
+            consecutive_failures += 1
+
+        success_rows = [row for row in actual_history if row.get("status") == "success"]
+        failure_rows = [row for row in actual_history if row.get("status") not in {"success", "skipped"}]
+        empty_success_rows = [
+            row
+            for row in success_rows
+            if int(row.get("collected_count", 0) or 0) == 0 and int(row.get("inserted_count", 0) or 0) == 0
+        ]
+        current = current_by_label.get(label, {})
+        rows.append(
+            {
+                "label": label,
+                "current_status": current.get("status", ""),
+                "current_inserted_count": int(current.get("inserted_count", 0) or 0),
+                "current_collected_count": int(current.get("collected_count", 0) or 0),
+                "recent_runs": len(history),
+                "recent_success_count": len(success_rows),
+                "recent_failure_count": len(failure_rows),
+                "recent_empty_success_count": len(empty_success_rows),
+                "consecutive_failures": consecutive_failures,
+                "last_success_at": str(success_rows[0].get("created_at", "")) if success_rows else "",
+                "last_status": str(history[0].get("status", "")) if history else current.get("status", ""),
+                "last_error": str(history[0].get("error", "")) if history else current.get("error", ""),
+            }
+        )
+
+    risky_rows = [
+        row
+        for row in rows
+        if row["consecutive_failures"] > 0 or row["current_status"] in {"error", "timeout", "skipped"}
+    ]
+    return {
+        "history_limit": history_limit,
+        "source_count": len(rows),
+        "risky_source_count": len(risky_rows),
+        "rows": rows,
+        "risky_rows": risky_rows[:10],
+    }
+
+
+def build_quality_diagnostics(
+    *,
+    current_papers_count: int,
+    current_updates_count: int,
+    report_items_count: int,
+    prepared_items_count: int,
+    paper_candidate_count: int,
+    update_candidate_count: int,
+    deduped_update_count: int,
+    selected_paper_count: int,
+    selected_update_count: int,
+    paper_limit: int,
+    web_limit: int,
+    min_web_items: int,
+    paper_backfill_hours_used: List[int],
+    web_backfill_hours_used: List[int],
+    collector_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    if selected_paper_count < paper_limit:
+        warnings.append(f"selected_papers_below_target:{selected_paper_count}/{paper_limit}")
+    if selected_update_count < min_web_items:
+        warnings.append(f"selected_updates_below_minimum:{selected_update_count}/{min_web_items}")
+    if update_candidate_count and deduped_update_count < update_candidate_count:
+        dropped = update_candidate_count - deduped_update_count
+        warnings.append(f"dedupe_removed_updates:{dropped}")
+    if int(collector_summary.get("failed_count", 0) or 0) or int(collector_summary.get("timeout_count", 0) or 0):
+        warnings.append("collector_failures_present")
+
+    return {
+        "targets": {
+            "paper_limit": paper_limit,
+            "web_limit": web_limit,
+            "min_web_items": min_web_items,
+        },
+        "collection": {
+            "current_papers": current_papers_count,
+            "current_updates": current_updates_count,
+            "fresh_items": int(collector_summary.get("fresh_items", 0) or 0),
+            "collector_success_count": int(collector_summary.get("success_count", 0) or 0),
+            "collector_failed_count": int(collector_summary.get("failed_count", 0) or 0),
+            "collector_timeout_count": int(collector_summary.get("timeout_count", 0) or 0),
+            "collector_skipped_count": int(collector_summary.get("skipped_count", 0) or 0),
+        },
+        "selection": {
+            "report_items": report_items_count,
+            "prepared_items": prepared_items_count,
+            "paper_candidates": paper_candidate_count,
+            "update_candidates_before_dedupe": update_candidate_count,
+            "update_candidates_after_dedupe": deduped_update_count,
+            "selected_papers": selected_paper_count,
+            "selected_updates": selected_update_count,
+        },
+        "backfill": {
+            "paper_hours_used": paper_backfill_hours_used,
+            "web_hours_used": web_backfill_hours_used,
+        },
+        "warnings": warnings,
+    }
+
+
 def filter_updates_for_report(
     updates: List[Dict[str, Any]],
     target_count: int,
@@ -1371,9 +1490,16 @@ def main() -> Dict[str, Any]:
     print(f"Collection complete. Added {new_articles_count} new items.")
     db.record_collector_runs(run_id, collector_runs)
     collector_summary = build_collector_summary(collector_runs)
+    observability_config = dict(config.get("observability", {}) or {})
+    source_health = build_source_health_summary(
+        collector_runs,
+        db,
+        history_limit=int(observability_config.get("source_health_history_limit", 160)),
+    )
     print("Collector health: " + collector_summary["status_text"])
     run_result["new_articles_count"] = new_articles_count
     run_result["collector_summary"] = collector_summary
+    run_result["source_health"] = source_health
 
     print("\n=== Step 2: Processing Data ===")
     run_unprocessed = db.get_unprocessed_articles(run_id=run_id)
@@ -1475,9 +1601,12 @@ def main() -> Dict[str, Any]:
 
     current_papers = [item for item in report_items if item.get("content_type") == "paper"]
     current_updates = [item for item in report_items if item.get("content_type") != "paper"]
+    paper_backfill_hours_used: List[int] = []
+    web_backfill_hours_used: List[int] = []
     if paper_backfill_ladder and len(current_papers) < paper_limit:
         needed_papers = paper_limit - len(current_papers)
         for hours in paper_backfill_ladder:
+            paper_backfill_hours_used.append(int(hours))
             recent_papers = db.get_recent_processed_articles(
                 hours=hours,
                 content_type="paper",
@@ -1494,6 +1623,7 @@ def main() -> Dict[str, Any]:
     if web_backfill_ladder and len(current_updates) < min_web_items:
         needed_updates = min_web_items - len(current_updates)
         for hours in web_backfill_ladder:
+            web_backfill_hours_used.append(int(hours))
             recent_updates = db.get_recent_processed_articles(
                 hours=hours,
                 limit=max(web_limit * 6, needed_updates * 8, 180),
@@ -1513,8 +1643,10 @@ def main() -> Dict[str, Any]:
 
     prepared_items = prepare_report_items(report_items, llm_processor, runtime_results)
     prepared_items = apply_preference_scores(prepared_items, preference_config)
+    paper_candidates = [item for item in prepared_items if item.get("content_type") == "paper"]
+    update_candidates = [item for item in prepared_items if item.get("content_type") != "paper"]
     papers = limit_papers_by_topic(
-        [item for item in prepared_items if item.get("content_type") == "paper"],
+        paper_candidates,
         paper_topic_limits,
         paper_limit,
     )
@@ -1564,7 +1696,7 @@ def main() -> Dict[str, Any]:
         papers = limit_papers_by_topic(papers, paper_topic_limits, paper_limit)
 
     deduped_updates = dedupe_updates(
-        [item for item in prepared_items if item.get("content_type") != "paper"],
+        update_candidates,
         llm_processor,
     )
     updates = filter_updates_for_report(
@@ -1581,6 +1713,23 @@ def main() -> Dict[str, Any]:
         print(f"Warning: only {len(updates)} web updates available after dedupe, below target {min_web_items}.")
     if not papers and not updates:
         print("No processed items available for the report.")
+        run_result["quality_diagnostics"] = build_quality_diagnostics(
+            current_papers_count=len(current_papers),
+            current_updates_count=len(current_updates),
+            report_items_count=len(report_items),
+            prepared_items_count=len(prepared_items),
+            paper_candidate_count=len(paper_candidates),
+            update_candidate_count=len(update_candidates),
+            deduped_update_count=len(deduped_updates),
+            selected_paper_count=0,
+            selected_update_count=0,
+            paper_limit=paper_limit,
+            web_limit=web_limit,
+            min_web_items=min_web_items,
+            paper_backfill_hours_used=paper_backfill_hours_used,
+            web_backfill_hours_used=web_backfill_hours_used,
+            collector_summary=collector_summary,
+        )
         run_result.update(
             {
                 "status": "no_content",
@@ -1606,6 +1755,23 @@ def main() -> Dict[str, Any]:
     print(f"Report contains {len(papers)} papers and {len(updates)} web updates.")
     run_result["paper_count"] = len(papers)
     run_result["update_count"] = len(updates)
+    run_result["quality_diagnostics"] = build_quality_diagnostics(
+        current_papers_count=len(current_papers),
+        current_updates_count=len(current_updates),
+        report_items_count=len(report_items),
+        prepared_items_count=len(prepared_items),
+        paper_candidate_count=len(paper_candidates),
+        update_candidate_count=len(update_candidates),
+        deduped_update_count=len(deduped_updates),
+        selected_paper_count=len(papers),
+        selected_update_count=len(updates),
+        paper_limit=paper_limit,
+        web_limit=web_limit,
+        min_web_items=min_web_items,
+        paper_backfill_hours_used=paper_backfill_hours_used,
+        web_backfill_hours_used=web_backfill_hours_used,
+        collector_summary=collector_summary,
+    )
     generator = ReportGenerator()
     mixed_items = generator.build_mixed_items(papers, updates)
     report_summary = llm_processor.summarize_report(papers, updates)

@@ -56,6 +56,10 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_history_file": "logs/doctor_history.json",
     "task_setup_script": "setup_scheduled_tasks.ps1",
     "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
+    "monitor_auxiliary_tasks": True,
+    "require_offline_tasks": False,
+    "doctor_task_name": "Web_Agent_Doctor_0900",
+    "preflight_task_name": "Web_Agent_Preflight_2030",
     "max_run_seconds": 2700,
     "validation_max_run_seconds": 900,
     "validation_report_retention_days": 7,
@@ -139,6 +143,10 @@ def build_status_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
         if row.get("status") != "success"
     ]
     snapshot["collector_summary"] = collector_summary
+    source_health = dict(snapshot.get("source_health") or {})
+    source_health.pop("rows", None)
+    if source_health:
+        snapshot["source_health"] = source_health
     return snapshot
 
 
@@ -216,6 +224,21 @@ def query_scheduled_task(task_name: str) -> Dict[str, Any]:
     parsed["task_name"] = parsed.get("task_name") or task_name
     parsed["available"] = True
     return parsed
+
+
+def is_interactive_task(task: Dict[str, Any]) -> bool:
+    logon_mode = str(task.get("logon_mode", "") or "").lower()
+    return "interactive" in logon_mode or "交互" in logon_mode
+
+
+def build_monitored_task_names(scheduler_config: Dict[str, Any]) -> list[str]:
+    names = [str(name) for name in (scheduler_config.get("task_names") or []) if str(name).strip()]
+    if scheduler_config.get("monitor_auxiliary_tasks", True):
+        for key in ("doctor_task_name", "preflight_task_name"):
+            name = str(scheduler_config.get(key, "") or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def build_status_text(
@@ -308,7 +331,7 @@ def build_scheduler_status_payload() -> Dict[str, Any]:
     }
     if lock_info:
         lock_summary["state"] = "active" if is_pid_running(lock_pid) else "stale"
-    task_names = list(scheduler_config.get("task_names") or [])
+    task_names = build_monitored_task_names(scheduler_config)
     task_infos = [query_scheduled_task(task_name) for task_name in task_names]
     return {
         "current_time": datetime.now().isoformat(timespec="seconds"),
@@ -517,7 +540,45 @@ def build_doctor_payload() -> Dict[str, Any]:
     else:
         checks.append(_doctor_item("last_success", "warn", "No successful email snapshot has been recorded yet."))
 
+    quality_diagnostics = dict(last_run.get("quality_diagnostics") or last_success.get("quality_diagnostics") or {})
+    quality_warnings = list(quality_diagnostics.get("warnings") or [])
+    if quality_diagnostics:
+        checks.append(
+            _doctor_item(
+                "quality_diagnostics",
+                "warn" if quality_warnings else "ok",
+                (
+                    "Quality diagnostics recorded warnings: " + ", ".join(str(item) for item in quality_warnings[:5])
+                    if quality_warnings
+                    else "Quality diagnostics are present and no selection warnings were recorded."
+                ),
+                quality_diagnostics,
+            )
+        )
+
+    source_health = dict(last_run.get("source_health") or last_success.get("source_health") or {})
+    risky_source_count = int(source_health.get("risky_source_count", 0) or 0)
+    if source_health:
+        checks.append(
+            _doctor_item(
+                "source_health",
+                "warn" if risky_source_count else "ok",
+                (
+                    f"Source health has {risky_source_count} risky source(s)."
+                    if risky_source_count
+                    else "Source health has no risky sources."
+                ),
+                {
+                    "source_count": source_health.get("source_count", 0),
+                    "risky_source_count": risky_source_count,
+                    "risky_rows": source_health.get("risky_rows", []),
+                },
+            )
+        )
+
     task_infos = list(status_payload.get("tasks") or [])
+    primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
+    require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
     for task in task_infos:
         task_name = str(task.get("task_name", "unknown") or "unknown")
         if not task.get("available", False):
@@ -533,16 +594,21 @@ def build_doctor_payload() -> Dict[str, Any]:
 
         result_hint = str(task.get("last_result_hint", "unknown") or "unknown")
         result_message = str(task.get("last_result_message", "") or "")
+        offline_issue = require_offline_tasks and task_name.lstrip("\\") in primary_task_names and is_interactive_task(task)
         if result_hint in DOCTOR_PASSING_HINTS:
+            level = "warn" if offline_issue else "ok"
+            detail = (
+                f"Task status={task.get('status', 'unknown')}, "
+                f"next_run={task.get('next_run_time', 'N/A')}, "
+                f"last_result={task.get('last_result', 'N/A')} ({result_hint})"
+            )
+            if offline_issue:
+                detail = f"{detail}. Offline mode required but this task still uses an interactive logon mode."
             checks.append(
                 _doctor_item(
                     f"task:{task_name}",
-                    "ok",
-                    (
-                        f"Task status={task.get('status', 'unknown')}, "
-                        f"next_run={task.get('next_run_time', 'N/A')}, "
-                        f"last_result={task.get('last_result', 'N/A')} ({result_hint})"
-                    ),
+                    level,
+                    detail,
                     task,
                 )
             )
@@ -981,6 +1047,8 @@ def build_last_success_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
         "paper_count": status.get("paper_count", 0),
         "update_count": status.get("update_count", 0),
         "new_articles_count": status.get("new_articles_count", 0),
+        "quality_diagnostics": status.get("quality_diagnostics", {}),
+        "source_health": status.get("source_health", {}),
         "log_file": status.get("log_file", ""),
     }
 
