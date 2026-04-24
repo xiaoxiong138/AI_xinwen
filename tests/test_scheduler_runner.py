@@ -646,6 +646,33 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(candidates[0]["reason"], "unavailable")
         self.assertEqual(candidates[1]["reason"], "bad_last_result")
 
+    def test_collect_task_self_heal_candidates_includes_interactive_offline_tasks(self):
+        payload = {
+            "status": {
+                "tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200_v2",
+                        "available": True,
+                        "logon_mode": "Interactive only",
+                        "last_result_hint": "success",
+                        "last_result": "0",
+                    }
+                ]
+            }
+        }
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+        scheduler_config.update(
+            {
+                "task_names": ["Web_Agent_Send_1200_v2"],
+                "require_offline_tasks": True,
+            }
+        )
+
+        candidates = collect_task_self_heal_candidates(payload, scheduler_config)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["reason"], "offline_interactive_required")
+
     def test_run_task_self_heal_supports_dry_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = Path(temp_dir) / "setup_scheduled_tasks.ps1"
@@ -659,6 +686,52 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertTrue(result["attempted"])
             self.assertTrue(result["success"])
             self.assertEqual(result["message"], "Dry run only. No changes were applied.")
+
+    def test_run_task_self_heal_blocks_offline_repair_without_password_env(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "setup_offline_tasks.ps1"
+            script_path.write_text("Write-Host 'ok'", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config["offline_task_setup_script"] = str(script_path)
+            scheduler_config["run_as_password_env"] = "WEB_AGENT_TEST_PASSWORD"
+            candidates = [{"task_name": "Web_Agent_Send_1200_v2", "reason": "offline_interactive_required"}]
+
+            with patch.dict(os.environ, {"WEB_AGENT_TEST_PASSWORD": ""}, clear=False):
+                result = run_task_self_heal(scheduler_config, candidates, dry_run=False)
+
+            self.assertTrue(result["attempted"])
+            self.assertFalse(result["success"])
+            self.assertIn("requires a Windows password", result["message"])
+
+    def test_run_task_self_heal_redacts_offline_password_in_result_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "setup_offline_tasks.ps1"
+            script_path.write_text("Write-Host 'ok'", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config["offline_task_setup_script"] = str(script_path)
+            scheduler_config["run_as_user_env"] = "WEB_AGENT_TEST_USER"
+            scheduler_config["run_as_password_env"] = "WEB_AGENT_TEST_PASSWORD"
+            candidates = [{"task_name": "Web_Agent_Send_1200_v2", "reason": "offline_interactive_required"}]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "WEB_AGENT_TEST_USER": "DESKTOP\\user",
+                    "WEB_AGENT_TEST_PASSWORD": "secret-password",
+                },
+                clear=False,
+            ):
+                with patch("scheduler_runner.subprocess.run") as mocked_run:
+                    mocked_run.return_value.returncode = 0
+                    mocked_run.return_value.stdout = "ok"
+                    mocked_run.return_value.stderr = ""
+                    result = run_task_self_heal(scheduler_config, candidates, dry_run=False)
+
+            self.assertTrue(result["success"])
+            self.assertIn("<redacted>", result["command"])
+            self.assertNotIn("secret-password", result["command"])
+            actual_command = mocked_run.call_args.args[0]
+            self.assertIn("secret-password", actual_command)
 
     def test_print_doctor_report_writes_snapshot_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

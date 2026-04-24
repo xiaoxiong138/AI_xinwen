@@ -55,9 +55,12 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_status_file": "logs/doctor_latest.json",
     "doctor_history_file": "logs/doctor_history.json",
     "task_setup_script": "setup_scheduled_tasks.ps1",
+    "offline_task_setup_script": "setup_offline_tasks.ps1",
     "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
     "monitor_auxiliary_tasks": True,
     "require_offline_tasks": False,
+    "run_as_user_env": "WEB_AGENT_RUNAS_USER",
+    "run_as_password_env": "WEB_AGENT_RUNAS_PASSWORD",
     "doctor_task_name": "Web_Agent_Doctor_0900",
     "preflight_task_name": "Web_Agent_Preflight_2030",
     "max_run_seconds": 2700,
@@ -763,16 +766,37 @@ def build_doctor_alert_html(payload: Dict[str, Any], history: Dict[str, Any]) ->
     """
 
 
-def collect_task_self_heal_candidates(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+def collect_task_self_heal_candidates(
+    payload: Dict[str, Any],
+    scheduler_config: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
     candidates: list[Dict[str, Any]] = []
     status_payload = dict(payload.get("status") or {})
+    scheduler_config = scheduler_config or {}
+    primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
+    require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
     for task in list(status_payload.get("tasks") or []):
+        task_name = str(task.get("task_name", "unknown") or "unknown")
         if not task.get("available", False):
             candidates.append(
                 {
-                    "task_name": str(task.get("task_name", "unknown") or "unknown"),
+                    "task_name": task_name,
                     "reason": "unavailable",
                     "detail": str(task.get("error", "query failed") or "query failed"),
+                }
+            )
+            continue
+
+        if (
+            require_offline_tasks
+            and task_name.lstrip("\\") in primary_task_names
+            and is_interactive_task(task)
+        ):
+            candidates.append(
+                {
+                    "task_name": task_name,
+                    "reason": "offline_interactive_required",
+                    "detail": "Offline mode is required but the task still uses an interactive logon mode.",
                 }
             )
             continue
@@ -782,7 +806,7 @@ def collect_task_self_heal_candidates(payload: Dict[str, Any]) -> list[Dict[str,
             continue
         candidates.append(
             {
-                "task_name": str(task.get("task_name", "unknown") or "unknown"),
+                "task_name": task_name,
                 "reason": "bad_last_result",
                 "detail": (
                     f"last_result={task.get('last_result', 'N/A')} "
@@ -799,7 +823,13 @@ def run_task_self_heal(
     candidates: list[Dict[str, Any]],
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    script_path = Path(str(scheduler_config.get("task_setup_script", ROOT / "setup_scheduled_tasks.ps1")))
+    needs_offline_rebuild = any(
+        str(candidate.get("reason", "") or "") == "offline_interactive_required"
+        for candidate in candidates
+    )
+    script_key = "offline_task_setup_script" if needs_offline_rebuild else "task_setup_script"
+    default_script = "setup_offline_tasks.ps1" if needs_offline_rebuild else "setup_scheduled_tasks.ps1"
+    script_path = Path(str(scheduler_config.get(script_key, ROOT / default_script)))
     if not script_path.is_absolute():
         script_path = (ROOT / script_path).resolve()
 
@@ -810,12 +840,25 @@ def run_task_self_heal(
         "-File",
         str(script_path),
     ]
+    display_command = list(command)
+    if needs_offline_rebuild:
+        user_env = str(scheduler_config.get("run_as_user_env", "WEB_AGENT_RUNAS_USER") or "WEB_AGENT_RUNAS_USER")
+        password_env = str(scheduler_config.get("run_as_password_env", "WEB_AGENT_RUNAS_PASSWORD") or "WEB_AGENT_RUNAS_PASSWORD")
+        run_as_user = os.getenv(user_env, "").strip()
+        run_as_password = os.getenv(password_env, "")
+        if run_as_user:
+            command.extend(["-RunAsUser", run_as_user])
+            display_command.extend(["-RunAsUser", run_as_user])
+        if run_as_password:
+            command.extend(["-RunAsPassword", run_as_password])
+            display_command.extend(["-RunAsPassword", "<redacted>"])
+
     result: Dict[str, Any] = {
         "attempted": bool(candidates),
         "dry_run": dry_run,
         "candidates": candidates,
         "script_path": script_path.as_posix(),
-        "command": command,
+        "command": display_command,
         "success": False,
         "returncode": None,
         "stdout": "",
@@ -831,6 +874,13 @@ def run_task_self_heal(
     if dry_run:
         result["success"] = True
         result["message"] = "Dry run only. No changes were applied."
+        return result
+    if needs_offline_rebuild and "-RunAsPassword" not in command:
+        password_env = str(scheduler_config.get("run_as_password_env", "WEB_AGENT_RUNAS_PASSWORD") or "WEB_AGENT_RUNAS_PASSWORD")
+        result["message"] = (
+            "Offline scheduled-task repair requires a Windows password. "
+            f"Set {password_env} for unattended repair or run setup_offline_tasks.ps1 interactively."
+        )
         return result
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -921,7 +971,7 @@ def print_doctor_report(
         "message": "Task self-heal not requested.",
     }
     if self_heal:
-        candidates = collect_task_self_heal_candidates(payload)
+        candidates = collect_task_self_heal_candidates(payload, scheduler_config)
         self_heal_result = run_task_self_heal(scheduler_config, candidates, dry_run=dry_run)
         if self_heal_result.get("attempted", False) and self_heal_result.get("success", False) and not dry_run:
             pre_heal_summary = {
