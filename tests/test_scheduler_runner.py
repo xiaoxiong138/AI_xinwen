@@ -10,13 +10,16 @@ from scheduler_runner import (
     DEFAULT_SCHEDULER_CONFIG,
     RESULT_MARKER,
     acquire_run_lock,
+    acquire_send_slot,
     build_doctor_payload,
     build_doctor_alert_html,
     build_monitored_task_names,
     build_scheduler_status_payload,
     build_status_snapshot,
     build_status_text,
+    build_send_slot_id,
     build_failure_email_html,
+    classify_quality_warnings,
     cleanup_old_logs,
     cleanup_validation_reports,
     collect_task_self_heal_candidates,
@@ -26,6 +29,7 @@ from scheduler_runner import (
     parse_schtasks_list_output,
     print_doctor_report,
     release_run_lock,
+    finalize_send_slot,
     run_task_self_heal,
     should_send_doctor_alert,
     should_skip_for_idempotency,
@@ -247,6 +251,35 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertEqual(last_status["delivery_status"], "sent")
             self.assertEqual(last_status["html_report_path"], "archive/report_success.html")
 
+    def test_build_send_slot_id_uses_noon_and_evening_windows(self):
+        self.assertEqual(build_send_slot_id(datetime(2026, 4, 28, 12, 0, 0)), "20260428_1200")
+        self.assertEqual(build_send_slot_id(datetime(2026, 4, 28, 21, 0, 0)), "20260428_2100")
+
+    def test_acquire_send_slot_prevents_duplicate_claims_and_persists_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            slot_dir = Path(temp_dir) / "send_slots"
+
+            acquired, slot_info = acquire_send_slot(slot_dir, "20260428_2100", stale_seconds=3600)
+            duplicate_acquired, duplicate_info = acquire_send_slot(slot_dir, "20260428_2100", stale_seconds=3600)
+
+            self.assertTrue(acquired)
+            self.assertFalse(duplicate_acquired)
+            self.assertEqual(duplicate_info["status"], "in_progress")
+
+            finalize_send_slot(
+                slot_info,
+                {
+                    "success": True,
+                    "delivery_status": "sent",
+                    "finished_at": "2026-04-28T21:08:41",
+                    "run_id": "20260428_210002",
+                    "html_report_path": "archive/report.html",
+                },
+            )
+            persisted = json.loads(Path(slot_info["slot_path"]).read_text(encoding="utf-8-sig"))
+            self.assertEqual(persisted["status"], "sent")
+            self.assertEqual(persisted["run_id"], "20260428_210002")
+
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
 任务名:                             \\Web_Agent_Send_1200
@@ -351,6 +384,12 @@ class SchedulerRunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_classify_quality_warnings_treats_dedupe_as_info(self):
+        classified = classify_quality_warnings(["dedupe_removed_updates:2", "selected_papers_below_minimum:8/10"])
+
+        self.assertEqual(classified["info"], ["dedupe_removed_updates:2"])
+        self.assertEqual(classified["warn"], ["selected_papers_below_minimum:8/10"])
+
     def test_build_scheduler_status_payload_summarizes_last_run_lock_and_tasks(self):
         mocked_tasks = [
             {
@@ -381,6 +420,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "validation_status_file": str(validation_status_path),
                     "lock_file": str(lock_path),
                     "task_names": ["Web_Agent_Send_1200"],
+                    "legacy_task_names": [],
                     "monitor_auxiliary_tasks": False,
                 }
             )
@@ -565,6 +605,55 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(payload["overall"], "warn")
         warned = [item for item in payload["checks"] if item["level"] == "warn"]
         self.assertTrue(any("Offline mode required" in item["detail"] for item in warned))
+
+    def test_build_doctor_payload_warns_when_legacy_send_tasks_are_enabled(self):
+        mocked_status = {
+            "current_time": "2026-04-12T03:10:00",
+            "last_run": {"success": True, "status": "success", "delivery_status": "sent"},
+            "last_success": {"finished_at": "2026-04-12T03:05:00", "html_report_path": "archive/report.html"},
+            "lock": {"state": "idle", "pid": "", "acquired_at": ""},
+            "tasks": [],
+            "legacy_tasks": [
+                {
+                    "task_name": "\\Web_Agent_Send_2100",
+                    "available": True,
+                    "scheduled_task_state": "Enabled",
+                    "last_result_hint": "success",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            (temp_root / "logs").mkdir()
+            (temp_root / "archive").mkdir()
+            (temp_root / "reports_manifest.json").write_text("{}", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "log_dir": str(temp_root / "logs"),
+                    "status_file": str(temp_root / "logs" / "last_run.json"),
+                    "last_success_file": str(temp_root / "logs" / "last_success.json"),
+                    "lock_file": str(temp_root / "logs" / "scheduler.lock"),
+                }
+            )
+            config = {"archive": {"report_dir": str(temp_root / "archive")}}
+
+            with patch("scheduler_runner.ROOT", temp_root):
+                with patch("scheduler_runner.load_runtime_config", return_value=(config, scheduler_config)):
+                    with patch("scheduler_runner.build_scheduler_status_payload", return_value=mocked_status):
+                        with patch.dict(
+                            os.environ,
+                            {
+                                "EMAIL_RECIPIENT": "user@example.com",
+                                "EMAIL_SENDER": "bot@example.com",
+                                "EMAIL_PASSWORD": "secret",
+                            },
+                            clear=False,
+                        ):
+                            payload = build_doctor_payload()
+
+        warned = [item for item in payload["checks"] if item["level"] == "warn"]
+        self.assertTrue(any(item["name"] == "duplicate_legacy_tasks" for item in warned))
 
     def test_write_doctor_snapshot_persists_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -901,6 +990,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "status_file": str(status_path),
                     "last_success_file": str(last_success_path),
                     "lock_file": str(lock_path),
+                    "send_slot_dir": str(log_dir / "send_slots"),
                     "log_retention_days": 30,
                     "idempotency_window_minutes": 90,
                     "task_names": [],
@@ -931,6 +1021,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "status_file": str(status_path),
                     "last_success_file": str(last_success_path),
                     "lock_file": str(lock_path),
+                    "send_slot_dir": str(log_dir / "send_slots"),
                     "log_retention_days": 30,
                     "idempotency_window_minutes": 90,
                     "task_names": [],
@@ -988,6 +1079,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "last_success_file": str(last_success_path),
                     "validation_status_file": str(validation_status_path),
                     "lock_file": str(lock_path),
+                    "send_slot_dir": str(log_dir / "send_slots"),
                     "log_retention_days": 30,
                     "idempotency_window_minutes": 90,
                     "task_names": [],

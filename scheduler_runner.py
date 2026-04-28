@@ -29,6 +29,7 @@ TASK_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     "logon_mode": ("登录状态", "Logon Mode"),
     "last_run_time": ("上次运行时间", "Last Run Time"),
     "last_result": ("上次结果", "Last Result"),
+    "scheduled_task_state": ("计划任务状态", "Scheduled Task State"),
 }
 TASK_RESULT_HINTS: Dict[int, str] = {
     0: "success",
@@ -45,6 +46,7 @@ TASK_RESULT_MESSAGES: Dict[int, str] = {
     267011: "Task has not run yet.",
 }
 DOCTOR_PASSING_HINTS = {"success", "ready", "running", "never_ran"}
+QUALITY_INFO_WARNING_PREFIXES = ("dedupe_removed_updates",)
 DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "log_dir": "logs",
     "status_file": "logs/last_run.json",
@@ -57,10 +59,13 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "task_setup_script": "setup_scheduled_tasks.ps1",
     "offline_task_setup_script": "setup_offline_tasks.ps1",
     "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
+    "legacy_task_names": ["Web_Agent_Send_1200", "Web_Agent_Send_2100"],
     "monitor_auxiliary_tasks": True,
     "require_offline_tasks": False,
     "run_as_user_env": "WEB_AGENT_RUNAS_USER",
     "run_as_password_env": "WEB_AGENT_RUNAS_PASSWORD",
+    "send_slot_dir": "logs/send_slots",
+    "send_slot_stale_seconds": 10800,
     "doctor_task_name": "Web_Agent_Doctor_0900",
     "preflight_task_name": "Web_Agent_Preflight_2030",
     "max_run_seconds": 2700,
@@ -75,6 +80,18 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_warn_streak_threshold": 2,
     "doctor_alert_subject_prefix": "[AI日报健康检查告警]",
 }
+
+
+def configure_utf8_stdio() -> None:
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONUTF8", "1")
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 class Tee:
@@ -111,6 +128,7 @@ def load_runtime_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "validation_report_dir",
         "doctor_status_file",
         "doctor_history_file",
+        "send_slot_dir",
     ):
         scheduler_config[key] = str((ROOT / str(scheduler_config[key])).resolve())
     return config, scheduler_config
@@ -244,6 +262,23 @@ def build_monitored_task_names(scheduler_config: Dict[str, Any]) -> list[str]:
     return names
 
 
+def build_legacy_task_names(scheduler_config: Dict[str, Any]) -> list[str]:
+    monitored = {name.lstrip("\\") for name in build_monitored_task_names(scheduler_config)}
+    names: list[str] = []
+    for raw_name in scheduler_config.get("legacy_task_names") or []:
+        name = str(raw_name).strip()
+        if name and name.lstrip("\\") not in monitored and name not in names:
+            names.append(name)
+    return names
+
+
+def is_task_enabled(task: Dict[str, Any]) -> bool:
+    state = str(task.get("scheduled_task_state", "") or "").lower()
+    if "disabled" in state or "禁用" in state or "已禁用" in state:
+        return False
+    return bool(task.get("available", False))
+
+
 def build_status_text(
     last_status: Dict[str, Any],
     task_infos: list[Dict[str, Any]],
@@ -336,6 +371,8 @@ def build_scheduler_status_payload() -> Dict[str, Any]:
         lock_summary["state"] = "active" if is_pid_running(lock_pid) else "stale"
     task_names = build_monitored_task_names(scheduler_config)
     task_infos = [query_scheduled_task(task_name) for task_name in task_names]
+    legacy_task_names = build_legacy_task_names(scheduler_config)
+    legacy_task_infos = [query_scheduled_task(task_name) for task_name in legacy_task_names]
     return {
         "current_time": datetime.now().isoformat(timespec="seconds"),
         "last_run": last_status,
@@ -343,6 +380,7 @@ def build_scheduler_status_payload() -> Dict[str, Any]:
         "last_validation_run": validation_status,
         "lock": lock_summary,
         "tasks": task_infos,
+        "legacy_tasks": legacy_task_infos,
     }
 
 
@@ -385,6 +423,18 @@ def _doctor_item(name: str, level: str, detail: str, data: Optional[Dict[str, An
     if data:
         payload["data"] = data
     return payload
+
+
+def classify_quality_warnings(warnings: list[Any]) -> Dict[str, list[str]]:
+    informational: list[str] = []
+    actionable: list[str] = []
+    for raw_warning in warnings:
+        warning = str(raw_warning)
+        if any(warning.startswith(prefix) for prefix in QUALITY_INFO_WARNING_PREFIXES):
+            informational.append(warning)
+        else:
+            actionable.append(warning)
+    return {"info": informational, "warn": actionable}
 
 
 def build_doctor_payload() -> Dict[str, Any]:
@@ -578,16 +628,26 @@ def build_doctor_payload() -> Dict[str, Any]:
     quality_diagnostics = dict(last_run.get("quality_diagnostics") or last_success.get("quality_diagnostics") or {})
     quality_warnings = list(quality_diagnostics.get("warnings") or [])
     if quality_diagnostics:
+        classified_quality_warnings = classify_quality_warnings(quality_warnings)
+        actionable_quality_warnings = classified_quality_warnings["warn"]
+        informational_quality_warnings = classified_quality_warnings["info"]
+        quality_payload = dict(quality_diagnostics)
+        quality_payload["warning_levels"] = classified_quality_warnings
         checks.append(
             _doctor_item(
                 "quality_diagnostics",
-                "warn" if quality_warnings else "ok",
+                "warn" if actionable_quality_warnings else "ok",
                 (
-                    "Quality diagnostics recorded warnings: " + ", ".join(str(item) for item in quality_warnings[:5])
-                    if quality_warnings
-                    else "Quality diagnostics are present and no selection warnings were recorded."
+                    "Quality diagnostics recorded actionable warnings: " + ", ".join(actionable_quality_warnings[:5])
+                    if actionable_quality_warnings
+                    else (
+                        "Quality diagnostics only recorded informational notes: "
+                        + ", ".join(informational_quality_warnings[:5])
+                        if informational_quality_warnings
+                        else "Quality diagnostics are present and no selection warnings were recorded."
+                    )
                 ),
-                quality_diagnostics,
+                quality_payload,
             )
         )
 
@@ -608,6 +668,28 @@ def build_doctor_payload() -> Dict[str, Any]:
                     "risky_source_count": risky_source_count,
                     "risky_rows": source_health.get("risky_rows", []),
                 },
+            )
+        )
+
+    legacy_task_infos = list(status_payload.get("legacy_tasks") or [])
+    active_legacy_tasks = [task for task in legacy_task_infos if task.get("available", False) and is_task_enabled(task)]
+    if active_legacy_tasks:
+        checks.append(
+            _doctor_item(
+                "duplicate_legacy_tasks",
+                "warn",
+                "Legacy Web_Agent scheduled tasks are still enabled and may duplicate sends: "
+                + ", ".join(str(task.get("task_name", "")) for task in active_legacy_tasks),
+                {"tasks": active_legacy_tasks},
+            )
+        )
+    elif legacy_task_infos:
+        checks.append(
+            _doctor_item(
+                "duplicate_legacy_tasks",
+                "ok",
+                "No enabled legacy Web_Agent send tasks were found.",
+                {"tasks": legacy_task_infos},
             )
         )
 
@@ -1089,6 +1171,70 @@ def cleanup_validation_reports(validation_dir: Path, retention_days: int) -> lis
     return removed
 
 
+def build_send_slot_id(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    slot = "1200" if now.hour < 17 else "2100"
+    return f"{now.strftime('%Y%m%d')}_{slot}"
+
+
+def acquire_send_slot(slot_dir: Path, slot_id: str, stale_seconds: int) -> Tuple[bool, Dict[str, Any]]:
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    slot_path = slot_dir / f"{slot_id}.json"
+    now = datetime.now()
+    payload = {
+        "slot_id": slot_id,
+        "pid": os.getpid(),
+        "status": "in_progress",
+        "acquired_at": now.isoformat(timespec="seconds"),
+    }
+    if slot_path.exists():
+        existing = read_json(slot_path)
+        acquired_at = str(existing.get("acquired_at", "") or existing.get("finished_at", ""))
+        try:
+            acquired_dt = datetime.fromisoformat(acquired_at)
+            age_seconds = max(0, int((now - acquired_dt).total_seconds()))
+        except ValueError:
+            age_seconds = stale_seconds + 1
+        existing["age_seconds"] = age_seconds
+        if age_seconds <= stale_seconds:
+            existing["slot_path"] = slot_path.as_posix()
+            return False, existing
+        slot_path.unlink(missing_ok=True)
+
+    try:
+        with slot_path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except FileExistsError:
+        existing = read_json(slot_path)
+        existing["slot_path"] = slot_path.as_posix()
+        return False, existing
+    payload["slot_path"] = slot_path.as_posix()
+    return True, payload
+
+
+def finalize_send_slot(slot_info: Dict[str, Any], status: Dict[str, Any]) -> None:
+    slot_path_text = str(slot_info.get("slot_path", "") or "")
+    if not slot_path_text:
+        return
+    slot_path = Path(slot_path_text)
+    if not slot_path.exists():
+        return
+    if status.get("success", False) and status.get("delivery_status") == "sent":
+        payload = dict(slot_info)
+        payload.update(
+            {
+                "status": "sent",
+                "finished_at": status.get("finished_at", datetime.now().isoformat(timespec="seconds")),
+                "run_id": status.get("run_id", ""),
+                "html_report_path": status.get("html_report_path", ""),
+                "markdown_report_path": status.get("markdown_report_path", ""),
+            }
+        )
+        write_json(slot_path, payload)
+        return
+    slot_path.unlink(missing_ok=True)
+
+
 def should_skip_for_idempotency(
     status_path: Path,
     window_minutes: int,
@@ -1237,6 +1383,7 @@ def parse_worker_result_line(line: str) -> Optional[Dict[str, Any]]:
 
 
 def _run_main_worker() -> int:
+    configure_utf8_stdio()
     started_at = datetime.now()
     try:
         import importlib
@@ -1280,6 +1427,7 @@ def run_main_once(
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     env["WEB_AGENT_EMAIL_MODE"] = email_mode
     if run_profile:
         env["WEB_AGENT_RUN_PROFILE"] = run_profile
@@ -1412,6 +1560,7 @@ def send_failure_email(config: Dict[str, Any], scheduler_config: Dict[str, Any],
 
 
 def main(validate_run: bool = False) -> int:
+    configure_utf8_stdio()
     os.chdir(ROOT)
     config, scheduler_config = load_runtime_config()
     log_dir = Path(scheduler_config["log_dir"])
@@ -1497,6 +1646,35 @@ def main(validate_run: bool = False) -> int:
                     print("Skipping this trigger because a recent successful send already covered the current window.")
                     return 0
 
+                send_slot_info: Dict[str, Any] = {}
+                if not validate_run:
+                    send_slot_id = build_send_slot_id()
+                    send_slot_acquired, send_slot_info = acquire_send_slot(
+                        Path(str(scheduler_config["send_slot_dir"])),
+                        send_slot_id,
+                        int(scheduler_config.get("send_slot_stale_seconds", scheduler_config["stale_lock_seconds"])),
+                    )
+                    if not send_slot_acquired:
+                        status = {
+                            "success": True,
+                            "status": "skipped_duplicate_slot",
+                            "retryable": False,
+                            "delivery_status": "skipped",
+                            "run_mode": run_label,
+                            "send_slot": send_slot_info,
+                            "started_at": datetime.now().isoformat(timespec="seconds"),
+                            "finished_at": datetime.now().isoformat(timespec="seconds"),
+                            "log_file": log_file.as_posix(),
+                            "attempts_used": 0,
+                            "cleanup_summary": {
+                                "removed_logs": removed_logs,
+                                "removed_validation_reports": removed_validation_reports,
+                            },
+                        }
+                        write_json(status_path, build_status_snapshot(status))
+                        print(f"Skipping this trigger because send slot {send_slot_id} is already claimed.")
+                        return 0
+
                 final_status: Dict[str, Any] = {}
                 failure_email_sent = False
                 max_attempts = max(1, int(scheduler_config["max_attempts"]))
@@ -1542,10 +1720,14 @@ def main(validate_run: bool = False) -> int:
 
                 final_status["failure_email_sent"] = failure_email_sent
                 final_status["log_file"] = log_file.as_posix()
+                if send_slot_info:
+                    final_status["send_slot"] = send_slot_info
                 final_status["cleanup_summary"] = {
                     "removed_logs": removed_logs,
                     "removed_validation_reports": removed_validation_reports,
                 }
+                if send_slot_info:
+                    finalize_send_slot(send_slot_info, final_status)
                 write_json(status_path, build_status_snapshot(final_status))
                 if (
                     not validate_run
@@ -1563,6 +1745,7 @@ def main(validate_run: bool = False) -> int:
 
 
 if __name__ == "__main__":
+    configure_utf8_stdio()
     args = set(sys.argv[1:])
     if "--worker" in args:
         sys.exit(_run_main_worker())
