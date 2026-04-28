@@ -5,7 +5,8 @@ param(
     [string]$EveningTime = "21:00",
     [string]$PythonExe = "",
     [string]$RunAsUser = "",
-    [string]$RunAsPassword = ""
+    [string]$RunAsPassword = "",
+    [string[]]$LegacyTaskNames = @("Web_Agent_Send_1200", "Web_Agent_Send_2100")
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +59,11 @@ $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.
 
 Remove-TaskIfExists -TaskName $TaskNameNoon
 Remove-TaskIfExists -TaskName $TaskNameEvening
+foreach ($legacyTaskName in $LegacyTaskNames) {
+    if ($legacyTaskName -and $legacyTaskName -notin @($TaskNameNoon, $TaskNameEvening)) {
+        Remove-TaskIfExists -TaskName $legacyTaskName
+    }
+}
 
 $createdMode = ""
 if ($RunAsPassword) {

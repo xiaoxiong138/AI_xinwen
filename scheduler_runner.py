@@ -1181,14 +1181,18 @@ def acquire_run_lock(lock_path: Path, stale_lock_seconds: int) -> Tuple[bool, Di
         existing = read_json(lock_path)
         existing_pid = int(existing.get("pid", 0) or 0)
         acquired_at = existing.get("acquired_at", "")
+        pid_running = False
         try:
             acquired_dt = datetime.fromisoformat(acquired_at)
             age_seconds = max(0, int((now - acquired_dt).total_seconds()))
         except ValueError:
             age_seconds = stale_lock_seconds + 1
 
-        if existing_pid and is_pid_running(existing_pid) and age_seconds <= stale_lock_seconds:
-            existing["age_seconds"] = age_seconds
+        if existing_pid:
+            pid_running = is_pid_running(existing_pid)
+        existing["age_seconds"] = age_seconds
+        existing["pid_running"] = pid_running
+        if age_seconds <= stale_lock_seconds:
             return False, existing
         lock_path.unlink(missing_ok=True)
 
@@ -1201,6 +1205,10 @@ def acquire_run_lock(lock_path: Path, stale_lock_seconds: int) -> Tuple[bool, Di
 
 
 def release_run_lock(lock_path: Path) -> None:
+    existing = read_json(lock_path)
+    existing_pid = int(existing.get("pid", 0) or 0)
+    if existing_pid and existing_pid != os.getpid():
+        return
     lock_path.unlink(missing_ok=True)
 
 

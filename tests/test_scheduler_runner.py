@@ -68,6 +68,26 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertEqual(lock_info["pid"], os.getpid())
             release_run_lock(lock_path)
 
+    def test_acquire_run_lock_trusts_fresh_lock_even_when_pid_probe_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "scheduler.lock"
+            write_json(
+                lock_path,
+                {
+                    "pid": 999999,
+                    "acquired_at": datetime.now().isoformat(timespec="seconds"),
+                    "hostname": "fresh-host",
+                },
+            )
+
+            with patch("scheduler_runner.is_pid_running", return_value=False):
+                acquired, lock_info = acquire_run_lock(lock_path, stale_lock_seconds=3600)
+
+            self.assertFalse(acquired)
+            self.assertEqual(lock_info["pid"], 999999)
+            self.assertFalse(lock_info["pid_running"])
+            self.assertTrue(lock_path.exists())
+
     def test_build_failure_email_html_includes_log_and_status(self):
         status = {
             "status": "timeout",
