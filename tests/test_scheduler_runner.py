@@ -18,6 +18,7 @@ from scheduler_runner import (
     build_monitored_task_names,
     build_scheduler_status_payload,
     build_send_calendar_payload,
+    build_send_calendar_text,
     build_task_repair_commands,
     build_status_snapshot,
     build_status_text,
@@ -32,6 +33,7 @@ from scheduler_runner import (
     parse_worker_result_line,
     parse_schtasks_list_output,
     print_doctor_report,
+    print_send_calendar_report,
     release_run_lock,
     resolve_send_slot,
     finalize_send_slot,
@@ -365,6 +367,70 @@ class SchedulerRunnerTests(unittest.TestCase):
             )
             self.assertEqual(calendar_path, calendar_dir / "send_calendar_20260428.json")
             self.assertTrue(calendar_path.exists())
+
+    def test_build_send_calendar_text_is_readable(self):
+        text = build_send_calendar_text(
+            {
+                "date": "2026-04-28",
+                "generated_at": "2026-04-28T21:05:00",
+                "slots": [
+                    {
+                        "slot_id": "20260428_1200",
+                        "time": "12:00",
+                        "status": "sent",
+                        "finished_at": "2026-04-28T12:05:00",
+                        "html_report_path": "archive/report_noon.html",
+                    },
+                    {
+                        "slot_id": "20260428_2100",
+                        "time": "21:00",
+                        "status": "missing",
+                    },
+                ],
+                "last_success": {
+                    "finished_at": "2026-04-28T12:05:00",
+                    "html_report_path": "archive/report_noon.html",
+                },
+            }
+        )
+
+        self.assertIn("Send calendar: 2026-04-28", text)
+        self.assertIn("12:00 20260428_1200: sent", text)
+        self.assertIn("21:00 20260428_2100: missing", text)
+        self.assertIn("Last success: 2026-04-28T12:05:00", text)
+
+    def test_print_send_calendar_report_outputs_existing_calendar_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            calendar_dir = temp_root / "logs"
+            calendar_dir.mkdir(parents=True)
+            today_name = f"send_calendar_{datetime.now().strftime('%Y%m%d')}.json"
+            write_json(
+                calendar_dir / today_name,
+                {
+                    "date": datetime.now().date().isoformat(),
+                    "generated_at": "2026-04-28T12:05:00",
+                    "slots": [{"slot_id": "today_1200", "time": "12:00", "status": "sent"}],
+                    "last_success": {},
+                },
+            )
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "send_calendar_dir": str(calendar_dir),
+                    "log_dir": str(calendar_dir),
+                    "status_file": str(calendar_dir / "last_run.json"),
+                    "last_success_file": str(calendar_dir / "last_success.json"),
+                }
+            )
+
+            with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                with patch("sys.stdout.write") as mocked_write:
+                    exit_code = print_send_calendar_report(as_json=False)
+
+            self.assertEqual(exit_code, 0)
+            output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
+            self.assertIn("today_1200", output)
 
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
@@ -1170,6 +1236,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "idempotency_window_minutes": 90,
                     "task_names": [],
                     "max_attempts": 1,
+                    "send_window_after_minutes": 1440,
                 }
             )
             attempt_result = {

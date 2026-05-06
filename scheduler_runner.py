@@ -1652,6 +1652,53 @@ def write_send_calendar(scheduler_config: Dict[str, Any], last_run: Dict[str, An
     return calendar_path
 
 
+def build_send_calendar_text(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"Send calendar: {payload.get('date', '') or 'unknown'}",
+        f"Generated at: {payload.get('generated_at', '') or 'unknown'}",
+        "",
+        "Slots:",
+    ]
+    for slot in list(payload.get("slots") or []):
+        report_path = slot.get("html_report_path", "") or "N/A"
+        finished_at = slot.get("finished_at", "") or slot.get("last_run_finished_at", "") or "N/A"
+        last_run_status = slot.get("last_run_status", "")
+        suffix = f", last_run={last_run_status}" if last_run_status else ""
+        lines.append(
+            f"- {slot.get('time', 'N/A')} {slot.get('slot_id', 'unknown')}: "
+            f"{slot.get('status', 'missing')}, finished={finished_at}, report={report_path}{suffix}"
+        )
+
+    last_success = dict(payload.get("last_success") or {})
+    lines.append("")
+    lines.append(
+        "Last success: "
+        f"{last_success.get('finished_at', '') or 'N/A'} | "
+        f"{last_success.get('html_report_path', '') or 'N/A'}"
+    )
+    return "\n".join(lines)
+
+
+def print_send_calendar_report(as_json: bool = False) -> int:
+    _, scheduler_config = load_runtime_config()
+    calendar_dir = Path(str(scheduler_config.get("send_calendar_dir", scheduler_config.get("log_dir", ROOT / "logs"))))
+    today = datetime.now()
+    calendar_path = calendar_dir / f"send_calendar_{today.strftime('%Y%m%d')}.json"
+    payload = read_json(calendar_path)
+    if not payload:
+        payload = build_send_calendar_payload(
+            scheduler_config,
+            target_datetime=today,
+            last_run=read_json(Path(str(scheduler_config["status_file"]))),
+            last_success=read_json(Path(str(scheduler_config["last_success_file"]))),
+        )
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(build_send_calendar_text(payload))
+    return 0
+
+
 def write_scheduler_status(status_path: Path, status: Dict[str, Any], scheduler_config: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = build_status_snapshot(status)
     calendar_path = write_send_calendar(scheduler_config, snapshot)
@@ -2239,6 +2286,8 @@ if __name__ == "__main__":
         )
     if "--status" in args:
         sys.exit(print_scheduler_status(as_json="--json" in args))
+    if "--send-calendar" in args:
+        sys.exit(print_send_calendar_report(as_json="--json" in args))
     if "--check-arrival" in args:
         sys.exit(print_email_arrival_report(as_json="--json" in args))
     sys.exit(main(validate_run="--validate-run" in args))
