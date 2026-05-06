@@ -149,7 +149,7 @@ network:
   arxiv_collector_timeout_seconds: 180
 email:
   arrival_check:
-    enabled: false
+    enabled: true
     imap_server: ""
     imap_port: 993
     mailbox: INBOX
@@ -287,6 +287,8 @@ scheduler:
   lock_file: logs/scheduler.lock
   doctor_status_file: logs/doctor_latest.json
   doctor_history_file: logs/doctor_history.json
+  send_calendar_dir: logs
+  log_archive_dir: logs/archive
   task_setup_script: setup_scheduled_tasks.ps1
   offline_task_setup_script: setup_offline_tasks.ps1
   task_names:
@@ -314,6 +316,7 @@ scheduler:
   preflight_task_setup_script: setup_preflight_task.ps1
   preflight_task_name: Web_Agent_Preflight_2030
   preflight_task_time: "20:30"
+  log_archive_after_days: 14
   log_retention_days: 30
   idempotency_window_minutes: 240
   max_run_seconds: 2700

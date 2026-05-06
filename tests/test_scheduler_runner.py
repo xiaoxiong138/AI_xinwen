@@ -11,10 +11,13 @@ from scheduler_runner import (
     RESULT_MARKER,
     acquire_run_lock,
     acquire_send_slot,
+    archive_old_logs,
     build_doctor_payload,
     build_doctor_alert_html,
     build_monitored_task_names,
     build_scheduler_status_payload,
+    build_send_calendar_payload,
+    build_task_repair_commands,
     build_status_snapshot,
     build_status_text,
     build_send_slot_id,
@@ -36,6 +39,7 @@ from scheduler_runner import (
     should_skip_for_idempotency,
     main as scheduler_main,
     update_doctor_history,
+    write_send_calendar,
     write_doctor_snapshot,
     write_json,
 )
@@ -145,6 +149,25 @@ class SchedulerRunnerTests(unittest.TestCase):
             removed = cleanup_old_logs(log_dir, retention_days=30)
             self.assertEqual(removed, ["old.log"])
             self.assertFalse(old_log.exists())
+            self.assertTrue(fresh_log.exists())
+
+    def test_archive_old_logs_moves_expired_files_before_deletion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            archive_dir = log_dir / "archive"
+            old_log = log_dir / "old.log"
+            fresh_log = log_dir / "fresh.log"
+            old_log.write_text("old", encoding="utf-8")
+            fresh_log.write_text("fresh", encoding="utf-8")
+
+            old_ts = (datetime.now() - timedelta(days=20)).timestamp()
+            os.utime(old_log, (old_ts, old_ts))
+
+            archived = archive_old_logs(log_dir, archive_dir, archive_after_days=14)
+
+            self.assertEqual(archived, ["archive/old.log"])
+            self.assertFalse(old_log.exists())
+            self.assertTrue((archive_dir / "old.log").exists())
             self.assertTrue(fresh_log.exists())
 
     def test_cleanup_validation_reports_removes_old_html_and_markdown(self):
@@ -287,6 +310,59 @@ class SchedulerRunnerTests(unittest.TestCase):
             persisted = json.loads(Path(slot_info["slot_path"]).read_text(encoding="utf-8-sig"))
             self.assertEqual(persisted["status"], "sent")
             self.assertEqual(persisted["run_id"], "20260428_210002")
+
+    def test_send_calendar_records_noon_and_evening_slots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            slot_dir = temp_root / "send_slots"
+            calendar_dir = temp_root / "logs"
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "send_slot_dir": str(slot_dir),
+                    "send_calendar_dir": str(calendar_dir),
+                    "last_success_file": str(temp_root / "last_success.json"),
+                }
+            )
+            slot_dir.mkdir(parents=True, exist_ok=True)
+            write_json(
+                slot_dir / "20260428_1200.json",
+                {
+                    "slot_id": "20260428_1200",
+                    "status": "sent",
+                    "run_id": "20260428_120000",
+                    "finished_at": "2026-04-28T12:05:00",
+                    "html_report_path": "archive/report_noon.html",
+                },
+            )
+
+            payload = build_send_calendar_payload(
+                scheduler_config,
+                target_datetime=datetime(2026, 4, 28, 21, 3, 0),
+                last_run={
+                    "run_mode": "scheduler",
+                    "status": "skipped_duplicate_slot",
+                    "finished_at": "2026-04-28T21:03:00",
+                    "send_slot": {"slot_id": "20260428_2100"},
+                },
+            )
+
+            self.assertEqual(payload["date"], "2026-04-28")
+            self.assertEqual([slot["slot_id"] for slot in payload["slots"]], ["20260428_1200", "20260428_2100"])
+            self.assertEqual(payload["slots"][0]["status"], "sent")
+            self.assertEqual(payload["slots"][1]["last_run_status"], "skipped_duplicate_slot")
+
+            calendar_path = write_send_calendar(
+                scheduler_config,
+                {
+                    "run_mode": "scheduler",
+                    "status": "success",
+                    "delivery_status": "sent",
+                    "finished_at": "2026-04-28T12:05:00",
+                },
+            )
+            self.assertEqual(calendar_path, calendar_dir / "send_calendar_20260428.json")
+            self.assertTrue(calendar_path.exists())
 
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
@@ -517,9 +593,11 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(payload["overall"], "warn")
         self.assertEqual(payload["counts"]["fail"], 0)
-        self.assertEqual(payload["counts"]["warn"], 1)
+        self.assertEqual(payload["counts"]["warn"], 2)
         warned = [item for item in payload["checks"] if item["level"] == "warn"]
         self.assertTrue(any("Web_Agent_Send_1200" in item["name"] for item in warned))
+        self.assertTrue(any(item["name"] == "task_repair_commands" for item in warned))
+        self.assertTrue(any("setup_offline_tasks.ps1" in command["command"] for command in payload["repair_commands"]))
 
     def test_build_doctor_payload_reports_missing_email_as_failure(self):
         mocked_status = {
@@ -790,6 +868,23 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["reason"], "offline_interactive_required")
 
+    def test_build_task_repair_commands_include_legacy_cleanup_and_offline_rebuild(self):
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+        scheduler_config.update(
+            {
+                "legacy_task_names": ["Web_Agent_Send_1200", "Web_Agent_Send_2100"],
+                "offline_task_setup_script": "setup_offline_tasks.ps1",
+            }
+        )
+
+        commands = build_task_repair_commands(scheduler_config)
+        command_text = "\n".join(command["command"] for command in commands)
+
+        self.assertIn("schtasks /Delete /TN Web_Agent_Send_1200 /F", command_text)
+        self.assertIn("schtasks /Delete /TN Web_Agent_Send_2100 /F", command_text)
+        self.assertIn("setup_offline_tasks.ps1", command_text)
+        self.assertIn("scheduler_runner.py", command_text)
+
     def test_run_task_self_heal_supports_dry_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = Path(temp_dir) / "setup_scheduled_tasks.ps1"
@@ -812,6 +907,28 @@ class SchedulerRunnerTests(unittest.TestCase):
             scheduler_config["offline_task_setup_script"] = str(script_path)
             scheduler_config["run_as_password_env"] = "WEB_AGENT_TEST_PASSWORD"
             candidates = [{"task_name": "Web_Agent_Send_1200_v2", "reason": "offline_interactive_required"}]
+
+            with patch.dict(os.environ, {"WEB_AGENT_TEST_PASSWORD": ""}, clear=False):
+                result = run_task_self_heal(scheduler_config, candidates, dry_run=False)
+
+            self.assertTrue(result["attempted"])
+            self.assertFalse(result["success"])
+            self.assertIn("requires a Windows password", result["message"])
+
+    def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "setup_offline_tasks.ps1"
+            script_path.write_text("Write-Host 'ok'", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "offline_task_setup_script": str(script_path),
+                    "run_as_password_env": "WEB_AGENT_TEST_PASSWORD",
+                    "require_offline_tasks": True,
+                    "task_names": ["Web_Agent_Send_1200_v2"],
+                }
+            )
+            candidates = [{"task_name": "\\Web_Agent_Send_1200_v2", "reason": "bad_last_result"}]
 
             with patch.dict(os.environ, {"WEB_AGENT_TEST_PASSWORD": ""}, clear=False):
                 result = run_task_self_heal(scheduler_config, candidates, dry_run=False)

@@ -6,6 +6,7 @@ import json
 import locale
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -56,6 +57,8 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "validation_report_dir": "archive/validation",
     "doctor_status_file": "logs/doctor_latest.json",
     "doctor_history_file": "logs/doctor_history.json",
+    "send_calendar_dir": "logs",
+    "log_archive_dir": "logs/archive",
     "task_setup_script": "setup_scheduled_tasks.ps1",
     "offline_task_setup_script": "setup_offline_tasks.ps1",
     "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
@@ -74,6 +77,7 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "send_window_after_minutes": 180,
     "doctor_task_name": "Web_Agent_Doctor_0900",
     "preflight_task_name": "Web_Agent_Preflight_2030",
+    "log_archive_after_days": 14,
     "max_run_seconds": 2700,
     "validation_max_run_seconds": 900,
     "validation_report_retention_days": 7,
@@ -134,6 +138,8 @@ def load_runtime_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "validation_report_dir",
         "doctor_status_file",
         "doctor_history_file",
+        "send_calendar_dir",
+        "log_archive_dir",
         "send_slot_dir",
     ):
         scheduler_config[key] = str((ROOT / str(scheduler_config[key])).resolve())
@@ -431,6 +437,57 @@ def _doctor_item(name: str, level: str, detail: str, data: Optional[Dict[str, An
     return payload
 
 
+def _quote_command_arg(value: Any) -> str:
+    text = str(value)
+    if not text:
+        return '""'
+    if any(char.isspace() for char in text) or '"' in text:
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def build_task_repair_commands(scheduler_config: Dict[str, Any]) -> list[Dict[str, str]]:
+    legacy_task_names = [str(name).lstrip("\\") for name in (scheduler_config.get("legacy_task_names") or [])]
+    offline_script = Path(str(scheduler_config.get("offline_task_setup_script", ROOT / "setup_offline_tasks.ps1")))
+    if not offline_script.is_absolute():
+        offline_script = (ROOT / offline_script).resolve()
+    doctor_command = [
+        sys.executable,
+        str(ROOT / "scheduler_runner.py"),
+        "--doctor",
+        "--record",
+    ]
+
+    commands: list[Dict[str, str]] = []
+    for task_name in legacy_task_names:
+        if task_name:
+            commands.append(
+                {
+                    "name": f"delete_legacy_{task_name}",
+                    "purpose": "Remove an old scheduled task that can duplicate sends.",
+                    "command": f"schtasks /Delete /TN {task_name} /F",
+                }
+            )
+    commands.append(
+        {
+            "name": "rebuild_offline_tasks",
+            "purpose": "Recreate 12:00 and 21:00 tasks with offline-capable Windows credentials.",
+            "command": (
+                "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                f"{_quote_command_arg(offline_script)}"
+            ),
+        }
+    )
+    commands.append(
+        {
+            "name": "record_doctor_after_repair",
+            "purpose": "Record a fresh health snapshot after task repair.",
+            "command": " ".join(_quote_command_arg(part) for part in doctor_command),
+        }
+    )
+    return commands
+
+
 def classify_quality_warnings(warnings: list[Any]) -> Dict[str, list[str]]:
     informational: list[str] = []
     actionable: list[str] = []
@@ -447,6 +504,7 @@ def build_doctor_payload() -> Dict[str, Any]:
     config, scheduler_config = load_runtime_config()
     load_dotenv(ROOT / ".env")
     status_payload = build_scheduler_status_payload()
+    repair_commands = build_task_repair_commands(scheduler_config)
     checks: list[Dict[str, Any]] = []
 
     configured_slots = list(scheduler_config.get("send_slots") or [])
@@ -639,19 +697,38 @@ def build_doctor_payload() -> Dict[str, Any]:
             )
 
     arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
-    if arrival_config.get("enabled", False) and last_success:
-        verification = dict(last_success.get("delivery_verification") or {})
-        if verification.get("verified", False):
-            checks.append(_doctor_item("delivery_arrival", "ok", "Mailbox arrival was verified for the last successful send.", verification))
-        else:
+    if arrival_config.get("enabled", False):
+        imap_config = {
+            "imap_server": bool(os.getenv("EMAIL_IMAP_SERVER") or arrival_config.get("imap_server")),
+            "username": bool(os.getenv("EMAIL_IMAP_USERNAME") or os.getenv("EMAIL_SENDER")),
+            "password": bool(os.getenv("EMAIL_IMAP_PASSWORD") or os.getenv("EMAIL_PASSWORD")),
+        }
+        missing_imap = [name for name, present in imap_config.items() if not present]
+        if missing_imap:
             checks.append(
                 _doctor_item(
-                    "delivery_arrival",
+                    "delivery_arrival_config",
                     "warn",
-                    f"Mailbox arrival is enabled but not verified yet: {verification.get('status', 'missing_verification')}",
-                    verification,
+                    "Mailbox arrival verification is enabled but IMAP settings are incomplete: "
+                    + ", ".join(missing_imap),
+                    {"present": imap_config},
                 )
             )
+        elif last_success:
+            verification = dict(last_success.get("delivery_verification") or {})
+            if verification.get("verified", False):
+                checks.append(_doctor_item("delivery_arrival", "ok", "Mailbox arrival was verified for the last successful send.", verification))
+            else:
+                checks.append(
+                    _doctor_item(
+                        "delivery_arrival",
+                        "warn",
+                        f"Mailbox arrival is enabled but not verified yet: {verification.get('status', 'missing_verification')}",
+                        verification,
+                    )
+                )
+        else:
+            checks.append(_doctor_item("delivery_arrival", "warn", "Mailbox arrival verification is enabled, but no successful send exists yet."))
 
     quality_diagnostics = dict(last_run.get("quality_diagnostics") or last_success.get("quality_diagnostics") or {})
     quality_warnings = list(quality_diagnostics.get("warnings") or [])
@@ -724,6 +801,30 @@ def build_doctor_payload() -> Dict[str, Any]:
     task_infos = list(status_payload.get("tasks") or [])
     primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
     require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
+    permission_denied_tasks = [
+        task
+        for task in task_infos
+        if str(task.get("last_result_hex", "") or "") == "0x800710E0"
+        or str(task.get("last_result", "") or "") == "-2147020576"
+    ]
+    if active_legacy_tasks or permission_denied_tasks:
+        repair_issue_names = []
+        if active_legacy_tasks:
+            repair_issue_names.append("enabled legacy tasks")
+        if permission_denied_tasks:
+            repair_issue_names.append("Windows permission denied tasks")
+        checks.append(
+            _doctor_item(
+                "task_repair_commands",
+                "warn",
+                "Repair commands are available for: " + ", ".join(repair_issue_names),
+                {
+                    "permission_denied_tasks": permission_denied_tasks,
+                    "active_legacy_tasks": active_legacy_tasks,
+                    "commands": repair_commands,
+                },
+            )
+        )
     for task in task_infos:
         task_name = str(task.get("task_name", "unknown") or "unknown")
         if not task.get("available", False):
@@ -779,6 +880,7 @@ def build_doctor_payload() -> Dict[str, Any]:
         "counts": counts,
         "checks": checks,
         "status": status_payload,
+        "repair_commands": repair_commands,
     }
 
 
@@ -933,10 +1035,18 @@ def run_task_self_heal(
     candidates: list[Dict[str, Any]],
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    needs_offline_rebuild = any(
-        str(candidate.get("reason", "") or "") == "offline_interactive_required"
-        for candidate in candidates
-    )
+    primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
+    require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
+    needs_offline_rebuild = False
+    for candidate in candidates:
+        reason = str(candidate.get("reason", "") or "")
+        task_name = str(candidate.get("task_name", "") or "").lstrip("\\")
+        if reason == "offline_interactive_required":
+            needs_offline_rebuild = True
+            break
+        if require_offline_tasks and task_name in primary_task_names and reason in {"bad_last_result", "unavailable"}:
+            needs_offline_rebuild = True
+            break
     script_key = "offline_task_setup_script" if needs_offline_rebuild else "task_setup_script"
     default_script = "setup_offline_tasks.ps1" if needs_offline_rebuild else "setup_scheduled_tasks.ps1"
     script_path = Path(str(scheduler_config.get(script_key, ROOT / default_script)))
@@ -1138,6 +1248,12 @@ def print_doctor_report(
         for item in payload.get("checks", []):
             print(f"- [{item.get('level', 'unknown')}] {item.get('name', 'unknown')}: {item.get('detail', '')}")
         print("")
+        repair_commands = list(payload.get("repair_commands") or [])
+        if repair_commands:
+            print("Repair commands:")
+            for command in repair_commands:
+                print(f"- {command.get('name', 'command')}: {command.get('command', '')}")
+            print("")
         print(f"History recorded: {persist_history}")
         print(f"Warn streak: {history.get('warn_streak', 0)}")
         print(f"Doctor alert sent: {doctor_alert_sent}")
@@ -1149,6 +1265,45 @@ def print_doctor_report(
     if self_heal and self_heal_result.get("attempted", False) and not self_heal_result.get("success", False):
         return 1
     return 0 if payload.get("overall") != "fail" else 1
+
+
+def archive_old_logs(
+    log_dir: Path,
+    archive_dir: Path,
+    archive_after_days: int,
+    keep_paths: Optional[set[Path]] = None,
+) -> list[str]:
+    keep_paths = {path.resolve() for path in (keep_paths or set())}
+    if archive_after_days <= 0 or not log_dir.exists():
+        return []
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now() - timedelta(days=archive_after_days)
+    archived: list[str] = []
+    for path in sorted(log_dir.glob("*.log")):
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            continue
+        if resolved_path in keep_paths:
+            continue
+        try:
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            continue
+        if modified_at >= cutoff:
+            continue
+
+        target = archive_dir / path.name
+        if target.exists():
+            timestamp = modified_at.strftime("%Y%m%d_%H%M%S")
+            target = archive_dir / f"{path.stem}_{timestamp}{path.suffix}"
+        try:
+            shutil.move(str(path), str(target))
+            archived.append(target.relative_to(log_dir).as_posix() if target.is_relative_to(log_dir) else target.name)
+        except OSError:
+            continue
+    return archived
 
 
 def cleanup_old_logs(log_dir: Path, retention_days: int, keep_paths: Optional[set[Path]] = None) -> list[str]:
@@ -1324,6 +1479,104 @@ def finalize_send_slot(slot_info: Dict[str, Any], status: Dict[str, Any]) -> Non
         write_json(slot_path, payload)
         return
     slot_path.unlink(missing_ok=True)
+
+
+def _parse_status_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def build_send_calendar_payload(
+    scheduler_config: Dict[str, Any],
+    target_datetime: Optional[datetime] = None,
+    last_run: Optional[Dict[str, Any]] = None,
+    last_success: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    target_datetime = target_datetime or datetime.now()
+    target_date = target_datetime.date()
+    slot_dir = Path(str(scheduler_config.get("send_slot_dir", ROOT / "logs/send_slots")))
+    slots = list(scheduler_config.get("send_slots") or DEFAULT_SCHEDULER_CONFIG["send_slots"])
+    last_run = dict(last_run or {})
+    last_success = dict(last_success or {})
+    rows: list[Dict[str, Any]] = []
+
+    for slot in slots:
+        slot_id_suffix = str(slot.get("id", "") or "").strip()
+        slot_time = str(slot.get("time", "") or "").strip()
+        if not slot_id_suffix or not slot_time:
+            continue
+        daily_slot_id = f"{target_date.strftime('%Y%m%d')}_{slot_id_suffix}"
+        slot_payload = read_json(slot_dir / f"{daily_slot_id}.json")
+        row = {
+            "slot_id": daily_slot_id,
+            "time": slot_time,
+            "status": str(slot_payload.get("status", "missing") or "missing"),
+            "run_id": slot_payload.get("run_id", ""),
+            "finished_at": slot_payload.get("finished_at", ""),
+            "html_report_path": slot_payload.get("html_report_path", ""),
+            "markdown_report_path": slot_payload.get("markdown_report_path", ""),
+        }
+        if str(last_run.get("send_slot", {}).get("slot_id", "") or "") == daily_slot_id:
+            row["last_run_status"] = last_run.get("status", "")
+            row["last_run_finished_at"] = last_run.get("finished_at", "")
+            if not row["finished_at"]:
+                row["finished_at"] = last_run.get("finished_at", "")
+            if not row["html_report_path"]:
+                row["html_report_path"] = last_run.get("html_report_path", "")
+            if not row["markdown_report_path"]:
+                row["markdown_report_path"] = last_run.get("markdown_report_path", "")
+        rows.append(row)
+
+    return {
+        "date": target_date.isoformat(),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "configured_slots": [
+            {"id": str(slot.get("id", "") or ""), "time": str(slot.get("time", "") or "")}
+            for slot in slots
+        ],
+        "slots": rows,
+        "last_run": {
+            "status": last_run.get("status", ""),
+            "delivery_status": last_run.get("delivery_status", ""),
+            "finished_at": last_run.get("finished_at", ""),
+            "html_report_path": last_run.get("html_report_path", ""),
+        },
+        "last_success": {
+            "finished_at": last_success.get("finished_at", ""),
+            "html_report_path": last_success.get("html_report_path", ""),
+        },
+    }
+
+
+def write_send_calendar(scheduler_config: Dict[str, Any], last_run: Dict[str, Any]) -> Optional[Path]:
+    if str(last_run.get("run_mode", "scheduler") or "scheduler") != "scheduler":
+        return None
+    finished_at = _parse_status_datetime(last_run.get("finished_at")) or datetime.now()
+    calendar_dir = Path(str(scheduler_config.get("send_calendar_dir", scheduler_config.get("log_dir", ROOT / "logs"))))
+    calendar_path = calendar_dir / f"send_calendar_{finished_at.strftime('%Y%m%d')}.json"
+    last_success = read_json(Path(str(scheduler_config.get("last_success_file", ""))))
+    payload = build_send_calendar_payload(
+        scheduler_config,
+        target_datetime=finished_at,
+        last_run=last_run,
+        last_success=last_success,
+    )
+    write_json(calendar_path, payload)
+    return calendar_path
+
+
+def write_scheduler_status(status_path: Path, status: Dict[str, Any], scheduler_config: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = build_status_snapshot(status)
+    calendar_path = write_send_calendar(scheduler_config, snapshot)
+    if calendar_path:
+        snapshot["send_calendar_file"] = calendar_path.as_posix()
+    write_json(status_path, snapshot)
+    return snapshot
 
 
 def should_skip_for_idempotency(
@@ -1668,17 +1921,31 @@ def main(validate_run: bool = False) -> int:
         tee = Tee(sys.__stdout__, log_handle)
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             print(f"[{datetime.now().isoformat(timespec='seconds')}] {run_label.capitalize()} runner started.")
+            archived_logs = archive_old_logs(
+                log_dir,
+                Path(str(scheduler_config.get("log_archive_dir", log_dir / "archive"))),
+                int(scheduler_config.get("log_archive_after_days", 14)),
+                keep_paths={log_file},
+            )
             removed_logs = cleanup_old_logs(
                 log_dir,
                 int(scheduler_config.get("log_retention_days", 30)),
                 keep_paths={log_file},
             )
+            removed_archived_logs = cleanup_old_logs(
+                Path(str(scheduler_config.get("log_archive_dir", log_dir / "archive"))),
+                int(scheduler_config.get("log_retention_days", 30)),
+            )
             removed_validation_reports = cleanup_validation_reports(
                 Path(scheduler_config["validation_report_dir"]),
                 int(scheduler_config.get("validation_report_retention_days", 7)),
             )
+            if archived_logs:
+                print(f"Archived {len(archived_logs)} old log files.")
             if removed_logs:
                 print(f"Cleaned up {len(removed_logs)} expired log files.")
+            if removed_archived_logs:
+                print(f"Cleaned up {len(removed_archived_logs)} expired archived log files.")
             if removed_validation_reports:
                 print(f"Cleaned up {len(removed_validation_reports)} expired validation report files.")
             acquired, lock_info = acquire_run_lock(lock_path, int(scheduler_config["stale_lock_seconds"]))
@@ -1695,11 +1962,13 @@ def main(validate_run: bool = False) -> int:
                     "log_file": log_file.as_posix(),
                     "attempts_used": 0,
                     "cleanup_summary": {
+                        "archived_logs": archived_logs,
                         "removed_logs": removed_logs,
+                        "removed_archived_logs": removed_archived_logs,
                         "removed_validation_reports": removed_validation_reports,
                     },
                 }
-                write_json(status_path, build_status_snapshot(status))
+                write_scheduler_status(status_path, status, scheduler_config)
                 print("Another scheduler run is still active. Skipping this trigger.")
                 return 0
 
@@ -1724,7 +1993,9 @@ def main(validate_run: bool = False) -> int:
                         "log_file": log_file.as_posix(),
                         "attempts_used": 0,
                         "cleanup_summary": {
+                            "archived_logs": archived_logs,
                             "removed_logs": removed_logs,
+                            "removed_archived_logs": removed_archived_logs,
                             "removed_validation_reports": removed_validation_reports,
                         },
                         "previous_success": {
@@ -1733,7 +2004,7 @@ def main(validate_run: bool = False) -> int:
                             "markdown_report_path": last_status.get("markdown_report_path", ""),
                         },
                     }
-                    write_json(status_path, build_status_snapshot(status))
+                    write_scheduler_status(status_path, status, scheduler_config)
                     print("Skipping this trigger because a recent successful send already covered the current window.")
                     return 0
 
@@ -1753,11 +2024,13 @@ def main(validate_run: bool = False) -> int:
                             "log_file": log_file.as_posix(),
                             "attempts_used": 0,
                             "cleanup_summary": {
+                                "archived_logs": archived_logs,
                                 "removed_logs": removed_logs,
+                                "removed_archived_logs": removed_archived_logs,
                                 "removed_validation_reports": removed_validation_reports,
                             },
                         }
-                        write_json(status_path, build_status_snapshot(status))
+                        write_scheduler_status(status_path, status, scheduler_config)
                         print("Skipping this trigger because it is outside the configured send windows.")
                         return 0
                     send_slot_id = str(resolved_send_slot["slot_id"])
@@ -1786,11 +2059,13 @@ def main(validate_run: bool = False) -> int:
                             "log_file": log_file.as_posix(),
                             "attempts_used": 0,
                             "cleanup_summary": {
+                                "archived_logs": archived_logs,
                                 "removed_logs": removed_logs,
+                                "removed_archived_logs": removed_archived_logs,
                                 "removed_validation_reports": removed_validation_reports,
                             },
                         }
-                        write_json(status_path, build_status_snapshot(status))
+                        write_scheduler_status(status_path, status, scheduler_config)
                         print(f"Skipping this trigger because send slot {send_slot_id} is already claimed.")
                         return 0
 
@@ -1842,12 +2117,14 @@ def main(validate_run: bool = False) -> int:
                 if send_slot_info:
                     final_status["send_slot"] = send_slot_info
                 final_status["cleanup_summary"] = {
+                    "archived_logs": archived_logs,
                     "removed_logs": removed_logs,
+                    "removed_archived_logs": removed_archived_logs,
                     "removed_validation_reports": removed_validation_reports,
                 }
                 if send_slot_info:
                     finalize_send_slot(send_slot_info, final_status)
-                write_json(status_path, build_status_snapshot(final_status))
+                write_scheduler_status(status_path, final_status, scheduler_config)
                 if (
                     not validate_run
                     and final_status.get("success", False)
