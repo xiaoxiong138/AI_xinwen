@@ -34,6 +34,7 @@ from scheduler_runner import (
     build_failure_email_html,
     classify_quality_warnings,
     cleanup_old_logs,
+    cleanup_task_backups,
     cleanup_validation_reports,
     collect_task_self_heal_candidates,
     describe_task_result,
@@ -207,6 +208,54 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertFalse(old_html.exists())
             self.assertFalse(old_md.exists())
             self.assertTrue(fresh_html.exists())
+
+    def test_cleanup_task_backups_limits_age_and_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_dir = Path(temp_dir)
+            paths = [
+                backup_dir / "Web_Agent_Send_1200_20260506_120000.xml",
+                backup_dir / "Web_Agent_Send_2100_20260505_210000.xml",
+                backup_dir / "Web_Agent_Send_1200_20260401_120000.xml",
+                backup_dir / "Web_Agent_Send_2100_20260401_210000.xml",
+            ]
+            for index, path in enumerate(paths):
+                path.write_text("<Task></Task>", encoding="utf-8")
+                modified_ts = (datetime.now() - timedelta(days=index)).timestamp()
+                os.utime(path, (modified_ts, modified_ts))
+            old_ts = (datetime.now() - timedelta(days=45)).timestamp()
+            os.utime(paths[2], (old_ts, old_ts))
+            os.utime(paths[3], (old_ts - 10, old_ts - 10))
+            ignored_text = backup_dir / "notes.txt"
+            ignored_text.write_text("keep", encoding="utf-8")
+
+            removed = cleanup_task_backups(backup_dir, retention_days=30, keep_count=2)
+
+            self.assertEqual(sorted(removed), sorted([paths[2].name, paths[3].name]))
+            self.assertTrue(paths[0].exists())
+            self.assertTrue(paths[1].exists())
+            self.assertFalse(paths[2].exists())
+            self.assertFalse(paths[3].exists())
+            self.assertTrue(ignored_text.exists())
+
+    def test_cleanup_task_backups_honors_count_cap_for_fresh_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_dir = Path(temp_dir)
+            paths = [
+                backup_dir / "Web_Agent_Send_1200_20260506_120000.xml",
+                backup_dir / "Web_Agent_Send_2100_20260505_210000.xml",
+                backup_dir / "Web_Agent_Send_1200_20260504_120000.xml",
+            ]
+            for index, path in enumerate(paths):
+                path.write_text("<Task></Task>", encoding="utf-8")
+                modified_ts = (datetime.now() - timedelta(minutes=index)).timestamp()
+                os.utime(path, (modified_ts, modified_ts))
+
+            removed = cleanup_task_backups(backup_dir, retention_days=30, keep_count=2)
+
+            self.assertEqual(removed, [paths[2].name])
+            self.assertTrue(paths[0].exists())
+            self.assertTrue(paths[1].exists())
+            self.assertFalse(paths[2].exists())
 
     def test_should_skip_for_idempotency_when_recent_success_exists(self):
         with tempfile.TemporaryDirectory() as temp_dir:

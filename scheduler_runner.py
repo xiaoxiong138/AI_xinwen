@@ -80,6 +80,8 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_task_name": "Web_Agent_Doctor_0900",
     "preflight_task_name": "Web_Agent_Preflight_2030",
     "log_archive_after_days": 14,
+    "task_backup_retention_days": 30,
+    "task_backup_keep_count": 20,
     "max_run_seconds": 2700,
     "validation_max_run_seconds": 900,
     "validation_report_retention_days": 7,
@@ -333,8 +335,10 @@ def build_status_text(
     cleanup_summary = dict(last_status.get("cleanup_summary") or {})
     removed_logs = list(cleanup_summary.get("removed_logs") or [])
     removed_validation_reports = list(cleanup_summary.get("removed_validation_reports") or [])
+    removed_task_backups = list(cleanup_summary.get("removed_task_backups") or [])
     lines.append(f"Removed logs this run: {len(removed_logs)}")
     lines.append(f"Removed validation reports this run: {len(removed_validation_reports)}")
+    lines.append(f"Removed task backups this run: {len(removed_task_backups)}")
 
     if lock_info:
         lock_pid = int(lock_info.get("pid", 0) or 0)
@@ -1981,6 +1985,36 @@ def cleanup_validation_reports(validation_dir: Path, retention_days: int) -> lis
     return removed
 
 
+def cleanup_task_backups(backup_dir: Path, retention_days: int, keep_count: int) -> list[str]:
+    if not backup_dir.exists():
+        return []
+
+    cutoff = datetime.now() - timedelta(days=retention_days) if retention_days > 0 else None
+    keep_count = max(0, keep_count)
+    removed: list[str] = []
+    candidates: list[tuple[float, Path]] = []
+    for path in backup_dir.glob("*.xml"):
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+
+    for index, (modified_ts, path) in enumerate(sorted(candidates, key=lambda item: item[0], reverse=True)):
+        modified_at = datetime.fromtimestamp(modified_ts)
+        if keep_count > 0 and index < keep_count:
+            continue
+        exceeds_count = keep_count > 0 and index >= keep_count
+        expired = cutoff is not None and modified_at < cutoff
+        if not exceeds_count and not expired:
+            continue
+        try:
+            path.unlink()
+            removed.append(path.name)
+        except OSError:
+            continue
+    return removed
+
+
 def parse_time_of_day(value: str) -> tuple[int, int]:
     hour_text, minute_text = str(value).strip().split(":", 1)
     hour = int(hour_text)
@@ -2634,6 +2668,18 @@ def main(validate_run: bool = False) -> int:
                 Path(scheduler_config["validation_report_dir"]),
                 int(scheduler_config.get("validation_report_retention_days", 7)),
             )
+            removed_task_backups = cleanup_task_backups(
+                Path(str(scheduler_config.get("task_backup_dir", log_dir / "task_backups"))),
+                int(scheduler_config.get("task_backup_retention_days", 30)),
+                int(scheduler_config.get("task_backup_keep_count", 20)),
+            )
+            cleanup_summary = {
+                "archived_logs": archived_logs,
+                "removed_logs": removed_logs,
+                "removed_archived_logs": removed_archived_logs,
+                "removed_validation_reports": removed_validation_reports,
+                "removed_task_backups": removed_task_backups,
+            }
             if archived_logs:
                 print(f"Archived {len(archived_logs)} old log files.")
             if removed_logs:
@@ -2642,6 +2688,8 @@ def main(validate_run: bool = False) -> int:
                 print(f"Cleaned up {len(removed_archived_logs)} expired archived log files.")
             if removed_validation_reports:
                 print(f"Cleaned up {len(removed_validation_reports)} expired validation report files.")
+            if removed_task_backups:
+                print(f"Cleaned up {len(removed_task_backups)} expired task backup files.")
             acquired, lock_info = acquire_run_lock(lock_path, int(scheduler_config["stale_lock_seconds"]))
             if not acquired:
                 status = {
@@ -2655,12 +2703,7 @@ def main(validate_run: bool = False) -> int:
                     "finished_at": datetime.now().isoformat(timespec="seconds"),
                     "log_file": log_file.as_posix(),
                     "attempts_used": 0,
-                    "cleanup_summary": {
-                        "archived_logs": archived_logs,
-                        "removed_logs": removed_logs,
-                        "removed_archived_logs": removed_archived_logs,
-                        "removed_validation_reports": removed_validation_reports,
-                    },
+                    "cleanup_summary": cleanup_summary,
                 }
                 write_scheduler_status(status_path, status, scheduler_config)
                 print("Another scheduler run is still active. Skipping this trigger.")
@@ -2686,12 +2729,7 @@ def main(validate_run: bool = False) -> int:
                         "finished_at": datetime.now().isoformat(timespec="seconds"),
                         "log_file": log_file.as_posix(),
                         "attempts_used": 0,
-                        "cleanup_summary": {
-                            "archived_logs": archived_logs,
-                            "removed_logs": removed_logs,
-                            "removed_archived_logs": removed_archived_logs,
-                            "removed_validation_reports": removed_validation_reports,
-                        },
+                        "cleanup_summary": cleanup_summary,
                         "previous_success": {
                             "finished_at": last_status.get("finished_at", ""),
                             "html_report_path": last_status.get("html_report_path", ""),
@@ -2717,12 +2755,7 @@ def main(validate_run: bool = False) -> int:
                             "finished_at": datetime.now().isoformat(timespec="seconds"),
                             "log_file": log_file.as_posix(),
                             "attempts_used": 0,
-                            "cleanup_summary": {
-                                "archived_logs": archived_logs,
-                                "removed_logs": removed_logs,
-                                "removed_archived_logs": removed_archived_logs,
-                                "removed_validation_reports": removed_validation_reports,
-                            },
+                            "cleanup_summary": cleanup_summary,
                         }
                         write_scheduler_status(status_path, status, scheduler_config)
                         print("Skipping this trigger because it is outside the configured send windows.")
@@ -2752,12 +2785,7 @@ def main(validate_run: bool = False) -> int:
                             "finished_at": datetime.now().isoformat(timespec="seconds"),
                             "log_file": log_file.as_posix(),
                             "attempts_used": 0,
-                            "cleanup_summary": {
-                                "archived_logs": archived_logs,
-                                "removed_logs": removed_logs,
-                                "removed_archived_logs": removed_archived_logs,
-                                "removed_validation_reports": removed_validation_reports,
-                            },
+                            "cleanup_summary": cleanup_summary,
                         }
                         write_scheduler_status(status_path, status, scheduler_config)
                         print(f"Skipping this trigger because send slot {send_slot_id} is already claimed.")
@@ -2810,12 +2838,7 @@ def main(validate_run: bool = False) -> int:
                 final_status["log_file"] = log_file.as_posix()
                 if send_slot_info:
                     final_status["send_slot"] = send_slot_info
-                final_status["cleanup_summary"] = {
-                    "archived_logs": archived_logs,
-                    "removed_logs": removed_logs,
-                    "removed_archived_logs": removed_archived_logs,
-                    "removed_validation_reports": removed_validation_reports,
-                }
+                final_status["cleanup_summary"] = cleanup_summary
                 if send_slot_info:
                     finalize_send_slot(send_slot_info, final_status)
                 write_scheduler_status(status_path, final_status, scheduler_config)

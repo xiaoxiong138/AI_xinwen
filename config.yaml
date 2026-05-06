@@ -320,6 +320,8 @@ scheduler:
   preflight_task_time: "20:30"
   log_archive_after_days: 14
   log_retention_days: 30
+  task_backup_retention_days: 30
+  task_backup_keep_count: 20
   idempotency_window_minutes: 240
   max_run_seconds: 2700
   validation_max_run_seconds: 900
