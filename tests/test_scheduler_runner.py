@@ -29,6 +29,7 @@ from scheduler_runner import (
     parse_schtasks_list_output,
     print_doctor_report,
     release_run_lock,
+    resolve_send_slot,
     finalize_send_slot,
     run_task_self_heal,
     should_send_doctor_alert,
@@ -254,6 +255,13 @@ class SchedulerRunnerTests(unittest.TestCase):
     def test_build_send_slot_id_uses_noon_and_evening_windows(self):
         self.assertEqual(build_send_slot_id(datetime(2026, 4, 28, 12, 0, 0)), "20260428_1200")
         self.assertEqual(build_send_slot_id(datetime(2026, 4, 28, 21, 0, 0)), "20260428_2100")
+        self.assertEqual(build_send_slot_id(datetime(2026, 4, 28, 18, 0, 0)), "")
+
+    def test_resolve_send_slot_reports_outside_window(self):
+        resolved = resolve_send_slot(datetime(2026, 4, 28, 18, 0, 0))
+
+        self.assertFalse(resolved["allowed"])
+        self.assertEqual(resolved["reason"], "outside_send_window")
 
     def test_acquire_send_slot_prevents_duplicate_claims_and_persists_success(self):
         with tempfile.TemporaryDirectory() as temp_dir:

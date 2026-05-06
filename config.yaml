@@ -301,6 +301,13 @@ scheduler:
   run_as_password_env: WEB_AGENT_RUNAS_PASSWORD
   send_slot_dir: logs/send_slots
   send_slot_stale_seconds: 10800
+  send_slots:
+    - id: "1200"
+      time: "12:00"
+    - id: "2100"
+      time: "21:00"
+  send_window_before_minutes: 10
+  send_window_after_minutes: 180
   doctor_task_setup_script: setup_doctor_task.ps1
   doctor_task_name: Web_Agent_Doctor_0900
   doctor_task_time: "09:00"

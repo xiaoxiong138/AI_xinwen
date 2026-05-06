@@ -66,6 +66,12 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "run_as_password_env": "WEB_AGENT_RUNAS_PASSWORD",
     "send_slot_dir": "logs/send_slots",
     "send_slot_stale_seconds": 10800,
+    "send_slots": [
+        {"id": "1200", "time": "12:00"},
+        {"id": "2100", "time": "21:00"},
+    ],
+    "send_window_before_minutes": 10,
+    "send_window_after_minutes": 180,
     "doctor_task_name": "Web_Agent_Doctor_0900",
     "preflight_task_name": "Web_Agent_Preflight_2030",
     "max_run_seconds": 2700,
@@ -442,6 +448,28 @@ def build_doctor_payload() -> Dict[str, Any]:
     load_dotenv(ROOT / ".env")
     status_payload = build_scheduler_status_payload()
     checks: list[Dict[str, Any]] = []
+
+    configured_slots = list(scheduler_config.get("send_slots") or [])
+    configured_slot_times = [str(slot.get("time", "") or "") for slot in configured_slots]
+    expected_slot_times = {"12:00", "21:00"}
+    if set(configured_slot_times) == expected_slot_times and len(configured_slot_times) == 2:
+        checks.append(
+            _doctor_item(
+                "send_schedule_config",
+                "ok",
+                "Configured send windows are exactly 12:00 and 21:00.",
+                {"send_slots": configured_slots},
+            )
+        )
+    else:
+        checks.append(
+            _doctor_item(
+                "send_schedule_config",
+                "warn",
+                f"Expected exactly 12:00 and 21:00 send windows, got: {', '.join(configured_slot_times) or 'none'}",
+                {"send_slots": configured_slots},
+            )
+        )
 
     email_vars = {
         "EMAIL_RECIPIENT": bool(os.getenv("EMAIL_RECIPIENT")),
@@ -1171,10 +1199,73 @@ def cleanup_validation_reports(validation_dir: Path, retention_days: int) -> lis
     return removed
 
 
-def build_send_slot_id(now: Optional[datetime] = None) -> str:
+def parse_time_of_day(value: str) -> tuple[int, int]:
+    hour_text, minute_text = str(value).strip().split(":", 1)
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError(f"Invalid time of day: {value}")
+    return hour, minute
+
+
+def resolve_send_slot(
+    now: Optional[datetime] = None,
+    scheduler_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     now = now or datetime.now()
-    slot = "1200" if now.hour < 17 else "2100"
-    return f"{now.strftime('%Y%m%d')}_{slot}"
+    scheduler_config = scheduler_config or DEFAULT_SCHEDULER_CONFIG
+    before_minutes = max(0, int(scheduler_config.get("send_window_before_minutes", 10)))
+    after_minutes = max(0, int(scheduler_config.get("send_window_after_minutes", 180)))
+    slots = list(scheduler_config.get("send_slots") or DEFAULT_SCHEDULER_CONFIG["send_slots"])
+
+    candidates: list[Dict[str, Any]] = []
+    for slot in slots:
+        slot_id = str(slot.get("id", "") or "").strip()
+        slot_time = str(slot.get("time", "") or "").strip()
+        if not slot_id or not slot_time:
+            continue
+        try:
+            hour, minute = parse_time_of_day(slot_time)
+        except (TypeError, ValueError):
+            continue
+        scheduled_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        window_start = scheduled_at - timedelta(minutes=before_minutes)
+        window_end = scheduled_at + timedelta(minutes=after_minutes)
+        if window_start <= now <= window_end:
+            candidates.append(
+                {
+                    "id": slot_id,
+                    "time": slot_time,
+                    "slot_id": f"{scheduled_at.strftime('%Y%m%d')}_{slot_id}",
+                    "scheduled_at": scheduled_at.isoformat(timespec="seconds"),
+                    "window_start": window_start.isoformat(timespec="seconds"),
+                    "window_end": window_end.isoformat(timespec="seconds"),
+                    "distance_seconds": abs(int((now - scheduled_at).total_seconds())),
+                }
+            )
+    if not candidates:
+        return {
+            "allowed": False,
+            "reason": "outside_send_window",
+            "checked_at": now.isoformat(timespec="seconds"),
+            "configured_slots": slots,
+            "window_before_minutes": before_minutes,
+            "window_after_minutes": after_minutes,
+        }
+    candidates.sort(key=lambda item: int(item["distance_seconds"]))
+    selected = dict(candidates[0])
+    selected["allowed"] = True
+    return selected
+
+
+def build_send_slot_id(
+    now: Optional[datetime] = None,
+    scheduler_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    slot = resolve_send_slot(now, scheduler_config)
+    if not slot.get("allowed", False):
+        return ""
+    return str(slot["slot_id"])
 
 
 def acquire_send_slot(slot_dir: Path, slot_id: str, stale_seconds: int) -> Tuple[bool, Dict[str, Any]]:
@@ -1648,11 +1739,39 @@ def main(validate_run: bool = False) -> int:
 
                 send_slot_info: Dict[str, Any] = {}
                 if not validate_run:
-                    send_slot_id = build_send_slot_id()
+                    resolved_send_slot = resolve_send_slot(scheduler_config=scheduler_config)
+                    if not resolved_send_slot.get("allowed", False):
+                        status = {
+                            "success": True,
+                            "status": "skipped_outside_send_window",
+                            "retryable": False,
+                            "delivery_status": "skipped",
+                            "run_mode": run_label,
+                            "send_slot": resolved_send_slot,
+                            "started_at": datetime.now().isoformat(timespec="seconds"),
+                            "finished_at": datetime.now().isoformat(timespec="seconds"),
+                            "log_file": log_file.as_posix(),
+                            "attempts_used": 0,
+                            "cleanup_summary": {
+                                "removed_logs": removed_logs,
+                                "removed_validation_reports": removed_validation_reports,
+                            },
+                        }
+                        write_json(status_path, build_status_snapshot(status))
+                        print("Skipping this trigger because it is outside the configured send windows.")
+                        return 0
+                    send_slot_id = str(resolved_send_slot["slot_id"])
                     send_slot_acquired, send_slot_info = acquire_send_slot(
                         Path(str(scheduler_config["send_slot_dir"])),
                         send_slot_id,
                         int(scheduler_config.get("send_slot_stale_seconds", scheduler_config["stale_lock_seconds"])),
+                    )
+                    send_slot_info.update(
+                        {
+                            "scheduled_at": resolved_send_slot.get("scheduled_at", ""),
+                            "window_start": resolved_send_slot.get("window_start", ""),
+                            "window_end": resolved_send_slot.get("window_end", ""),
+                        }
                     )
                     if not send_slot_acquired:
                         status = {
