@@ -22,7 +22,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.collectors import ArxivCollector, HuggingFaceCollector, RSSCollector, WebSearchCollector
 from src.database import Database
 from src.generator import ReportGenerator
-from src.notifier import EmailNotifier, verify_email_arrival
+from src.notifier import EmailNotifier, resolve_imap_server, verify_email_arrival
 from src.processors import LLMProcessor
 from src.relevance import infer_impact_tag, is_low_signal_update, normalize_text, score_preference_boost, score_update_quality
 
@@ -1936,14 +1936,19 @@ def main() -> Dict[str, Any]:
             retry_delay_seconds=email_retry_delay,
         )
         subject = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {report_title}"
+        run_result["email_subject"] = subject
         success = notifier.send_email(recipient_email=recipient, subject=subject, html_content=html_report)
         if success:
             print("Notification sent successfully.")
             notification_sent = True
             arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
             if arrival_config.get("enabled", False):
+                imap_server = resolve_imap_server(
+                    smtp_server=os.getenv("EMAIL_SMTP_SERVER", smtp_server),
+                    configured_imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
+                )
                 run_result["delivery_verification"] = verify_email_arrival(
-                    imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
+                    imap_server=imap_server,
                     imap_port=int(os.getenv("EMAIL_IMAP_PORT", str(arrival_config.get("imap_port", 993)))),
                     username=os.getenv("EMAIL_IMAP_USERNAME", os.getenv("EMAIL_SENDER", "")),
                     password=os.getenv("EMAIL_IMAP_PASSWORD", os.getenv("EMAIL_PASSWORD", "")),

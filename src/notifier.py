@@ -82,6 +82,26 @@ def _decode_header_text(value: str) -> str:
     return "".join(decoded)
 
 
+def resolve_imap_server(smtp_server: str = "", configured_imap_server: str = "") -> str:
+    configured = str(configured_imap_server or "").strip()
+    if configured:
+        return configured
+
+    smtp = str(smtp_server or "").strip().lower()
+    known_servers = {
+        "smtp.gmail.com": "imap.gmail.com",
+        "smtp.qq.com": "imap.qq.com",
+        "smtp.163.com": "imap.163.com",
+        "smtp.126.com": "imap.126.com",
+        "smtp.office365.com": "outlook.office365.com",
+    }
+    if smtp in known_servers:
+        return known_servers[smtp]
+    if smtp.startswith("smtp."):
+        return f"imap.{smtp[5:]}"
+    return ""
+
+
 def verify_email_arrival(
     *,
     imap_server: str,

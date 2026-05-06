@@ -14,6 +14,7 @@ from scheduler_runner import (
     archive_old_logs,
     build_doctor_payload,
     build_doctor_alert_html,
+    build_email_arrival_check,
     build_monitored_task_names,
     build_scheduler_status_payload,
     build_send_calendar_payload,
@@ -43,6 +44,7 @@ from scheduler_runner import (
     write_doctor_snapshot,
     write_json,
 )
+from src.notifier import resolve_imap_server
 
 
 class SchedulerRunnerTests(unittest.TestCase):
@@ -473,6 +475,22 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(classified["info"], ["dedupe_removed_updates:2"])
         self.assertEqual(classified["warn"], ["selected_papers_below_minimum:8/10"])
+
+    def test_resolve_imap_server_infers_common_smtp_hosts(self):
+        self.assertEqual(resolve_imap_server("smtp.qq.com"), "imap.qq.com")
+        self.assertEqual(resolve_imap_server("smtp.example.com"), "imap.example.com")
+        self.assertEqual(resolve_imap_server("smtp.gmail.com", "imap.custom.test"), "imap.custom.test")
+
+    def test_build_email_arrival_check_requires_recorded_subject(self):
+        result = build_email_arrival_check(
+            {"email": {"arrival_check": {"enabled": True}}},
+            dict(DEFAULT_SCHEDULER_CONFIG),
+            {"finished_at": "2026-05-06T12:05:00"},
+        )
+
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "skipped_missing_subject")
+        self.assertIn("email_subject", result["error"])
 
     def test_build_scheduler_status_payload_summarizes_last_run_lock_and_tasks(self):
         mocked_tasks = [
@@ -1164,6 +1182,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                 "run_id": "20260424_120000",
                 "html_report_path": "archive/report_20260424_1205.html",
                 "markdown_report_path": "archive/report_20260424_1205.md",
+                "email_subject": "[2026-04-24 12:05] AI Frontier Intelligence Daily",
                 "paper_count": 12,
                 "update_count": 20,
             }
@@ -1176,6 +1195,7 @@ class SchedulerRunnerTests(unittest.TestCase):
             persisted = json.loads(last_success_path.read_text(encoding="utf-8-sig"))
             self.assertEqual(persisted["delivery_status"], "sent")
             self.assertEqual(persisted["html_report_path"], "archive/report_20260424_1205.html")
+            self.assertEqual(persisted["email_subject"], "[2026-04-24 12:05] AI Frontier Intelligence Daily")
 
     def test_validate_run_uses_separate_status_file_and_bypasses_idempotency(self):
         with tempfile.TemporaryDirectory() as temp_dir:

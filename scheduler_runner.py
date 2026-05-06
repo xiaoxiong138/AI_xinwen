@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 from dotenv import load_dotenv
 
-from src.notifier import EmailNotifier
+from src.notifier import EmailNotifier, resolve_imap_server, verify_email_arrival
 
 ROOT = Path(__file__).resolve().parent
 RESULT_MARKER = "__SCHEDULER_RESULT__="
@@ -712,8 +712,12 @@ def build_doctor_payload() -> Dict[str, Any]:
 
     arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
     if arrival_config.get("enabled", False):
+        resolved_imap_server = resolve_imap_server(
+            smtp_server=os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com"),
+            configured_imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
+        )
         imap_config = {
-            "imap_server": bool(os.getenv("EMAIL_IMAP_SERVER") or arrival_config.get("imap_server")),
+            "imap_server": bool(resolved_imap_server),
             "username": bool(os.getenv("EMAIL_IMAP_USERNAME") or os.getenv("EMAIL_SENDER")),
             "password": bool(os.getenv("EMAIL_IMAP_PASSWORD") or os.getenv("EMAIL_PASSWORD")),
         }
@@ -1188,6 +1192,70 @@ def send_doctor_alert_email(config: Dict[str, Any], scheduler_config: Dict[str, 
     )
 
 
+def build_email_arrival_check(config: Dict[str, Any], scheduler_config: Dict[str, Any], last_success: Dict[str, Any]) -> Dict[str, Any]:
+    load_dotenv(ROOT / ".env")
+    arrival_config = dict(config.get("email", {}).get("arrival_check", {}) or {})
+    subject = str(last_success.get("email_subject", "") or "").strip()
+    if not subject:
+        return {
+            "enabled": bool(arrival_config.get("enabled", False)),
+            "verified": False,
+            "status": "skipped_missing_subject",
+            "matched_subject": "",
+            "matched_date": "",
+            "error": "Last successful send does not include email_subject yet. The next send will record it.",
+        }
+
+    smtp_server = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+    imap_server = resolve_imap_server(
+        smtp_server=smtp_server,
+        configured_imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
+    )
+    return verify_email_arrival(
+        imap_server=imap_server,
+        imap_port=int(os.getenv("EMAIL_IMAP_PORT", str(arrival_config.get("imap_port", 993)))),
+        username=os.getenv("EMAIL_IMAP_USERNAME", os.getenv("EMAIL_SENDER", "")),
+        password=os.getenv("EMAIL_IMAP_PASSWORD", os.getenv("EMAIL_PASSWORD", "")),
+        subject_contains=subject,
+        since_minutes=int(arrival_config.get("since_minutes", 30)),
+        mailbox=str(arrival_config.get("mailbox", "INBOX")),
+        timeout_seconds=int(arrival_config.get("timeout_seconds", config.get("network", {}).get("timeout_seconds", 25))),
+    )
+
+
+def print_email_arrival_report(as_json: bool = False) -> int:
+    config, scheduler_config = load_runtime_config()
+    last_success_path = Path(str(scheduler_config["last_success_file"]))
+    last_success = read_json(last_success_path)
+    if not last_success:
+        result = {
+            "enabled": bool(config.get("email", {}).get("arrival_check", {}).get("enabled", False)),
+            "verified": False,
+            "status": "skipped_missing_last_success",
+            "matched_subject": "",
+            "matched_date": "",
+            "error": "No last_success.json snapshot exists yet.",
+        }
+    else:
+        result = build_email_arrival_check(config, scheduler_config, last_success)
+        last_success["delivery_verification"] = result
+        last_success["arrival_checked_at"] = datetime.now().isoformat(timespec="seconds")
+        write_json(last_success_path, last_success)
+
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"Arrival check status: {result.get('status', 'unknown')}")
+        print(f"Verified: {result.get('verified', False)}")
+        if result.get("matched_subject"):
+            print(f"Matched subject: {result.get('matched_subject')}")
+        if result.get("matched_date"):
+            print(f"Matched date: {result.get('matched_date')}")
+        if result.get("error"):
+            print(f"Error: {result.get('error')}")
+    return 0 if result.get("verified", False) else 1
+
+
 def print_doctor_report(
     as_json: bool = False,
     self_heal: bool = False,
@@ -1656,6 +1724,7 @@ def build_last_success_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
         "quality_diagnostics": status.get("quality_diagnostics", {}),
         "source_health": status.get("source_health", {}),
         "source_weight_adjustments": status.get("source_weight_adjustments", {}),
+        "email_subject": status.get("email_subject", ""),
         "delivery_verification": status.get("delivery_verification", {}),
         "log_file": status.get("log_file", ""),
     }
@@ -2170,4 +2239,6 @@ if __name__ == "__main__":
         )
     if "--status" in args:
         sys.exit(print_scheduler_status(as_json="--json" in args))
+    if "--check-arrival" in args:
+        sys.exit(print_email_arrival_report(as_json="--json" in args))
     sys.exit(main(validate_run="--validate-run" in args))
