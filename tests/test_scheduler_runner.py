@@ -27,6 +27,8 @@ from scheduler_runner import (
     build_status_snapshot,
     build_status_text,
     build_send_slot_id,
+    build_task_backups_payload,
+    build_task_backups_text,
     build_failure_email_html,
     classify_quality_warnings,
     cleanup_old_logs,
@@ -41,6 +43,7 @@ from scheduler_runner import (
     print_legacy_cleanup_report,
     print_repair_plan,
     print_send_calendar_report,
+    print_task_backups_report,
     release_run_lock,
     resolve_send_slot,
     finalize_send_slot,
@@ -1214,6 +1217,41 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
         self.assertIn("Legacy cleanup status: preview", output)
+
+    def test_build_task_backups_payload_lists_restore_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_dir = Path(temp_dir) / "task_backups"
+            backup_dir.mkdir(parents=True)
+            backup_path = backup_dir / "Web_Agent_Send_1200_20260506_223000.xml"
+            backup_path.write_text("<Task></Task>", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config["task_backup_dir"] = str(backup_dir)
+
+            payload = build_task_backups_payload(scheduler_config)
+            text = build_task_backups_text(payload)
+
+            self.assertEqual(payload["backup_count"], 1)
+            self.assertEqual(payload["backups"][0]["task_name"], "Web_Agent_Send_1200")
+            self.assertIn("/XML", payload["backups"][0]["restore_command"])
+            self.assertIn("Web_Agent_Send_1200", text)
+            self.assertIn("restore:", text)
+
+    def test_print_task_backups_report_outputs_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_dir = Path(temp_dir) / "task_backups"
+            backup_dir.mkdir(parents=True)
+            (backup_dir / "Web_Agent_Send_2100_20260506_223500.xml").write_text("<Task></Task>", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config["task_backup_dir"] = str(backup_dir)
+
+            with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                with patch("sys.stdout.write") as mocked_write:
+                    exit_code = print_task_backups_report(as_json=False)
+
+            self.assertEqual(exit_code, 0)
+            output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
+            self.assertIn("Task backups: 1", output)
+            self.assertIn("Web_Agent_Send_2100", output)
 
     def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:

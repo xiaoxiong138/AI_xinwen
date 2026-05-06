@@ -1516,6 +1516,76 @@ def print_legacy_cleanup_report(as_json: bool = False, confirm: bool = False) ->
     return 0
 
 
+def _infer_task_name_from_backup(path: Path) -> str:
+    stem = path.stem
+    parts = stem.rsplit("_", 2)
+    if len(parts) == 3 and parts[-2].isdigit() and parts[-1].isdigit():
+        return parts[0]
+    return stem
+
+
+def build_task_backups_payload(scheduler_config: Dict[str, Any]) -> Dict[str, Any]:
+    backup_dir = Path(str(scheduler_config.get("task_backup_dir", ROOT / "logs/task_backups")))
+    backups: list[Dict[str, Any]] = []
+    if backup_dir.exists():
+        for path in sorted(backup_dir.glob("*.xml"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            task_name = _infer_task_name_from_backup(path)
+            backups.append(
+                {
+                    "task_name": task_name,
+                    "backup_path": path.as_posix(),
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                    "restore_command": (
+                        "schtasks /Create /TN "
+                        f"{_quote_command_arg(task_name)} /XML {_quote_command_arg(path)} /F"
+                    ),
+                }
+            )
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "backup_dir": backup_dir.as_posix(),
+        "backup_count": len(backups),
+        "backups": backups,
+    }
+
+
+def build_task_backups_text(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"Task backups: {payload.get('backup_count', 0)}",
+        f"Backup dir: {payload.get('backup_dir', '') or 'N/A'}",
+    ]
+    backups = list(payload.get("backups") or [])
+    if not backups:
+        lines.append("No task backup XML files found.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Backups:")
+    for backup in backups:
+        lines.append(
+            f"- {backup.get('task_name', 'unknown')} | "
+            f"{backup.get('modified_at', 'unknown')} | "
+            f"{backup.get('backup_path', '')}"
+        )
+        lines.append(f"  restore: {backup.get('restore_command', '')}")
+    return "\n".join(lines)
+
+
+def print_task_backups_report(as_json: bool = False) -> int:
+    _, scheduler_config = load_runtime_config()
+    payload = build_task_backups_payload(scheduler_config)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(build_task_backups_text(payload))
+    return 0
+
+
 def should_send_doctor_alert(payload: Dict[str, Any], history: Dict[str, Any], scheduler_config: Dict[str, Any]) -> bool:
     if not scheduler_config.get("send_doctor_alert_email", True):
         return False
@@ -2672,6 +2742,8 @@ if __name__ == "__main__":
         sys.exit(_run_main_worker())
     if "--cleanup-legacy-tasks" in args:
         sys.exit(print_legacy_cleanup_report(as_json="--json" in args, confirm="--confirm" in args))
+    if "--task-backups" in args:
+        sys.exit(print_task_backups_report(as_json="--json" in args))
     if "--repair-plan" in args:
         sys.exit(print_repair_plan(as_json="--json" in args))
     if "--doctor" in args:
