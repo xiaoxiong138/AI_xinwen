@@ -1262,6 +1262,10 @@ def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any])
         for part in [sys.executable, str(ROOT / "scheduler_runner.py"), "--doctor", "--self-heal"]
     )
     dry_run_command = f"{runner_command} --dry-run"
+    legacy_cleanup_command = " ".join(
+        _quote_command_arg(part)
+        for part in [sys.executable, str(ROOT / "scheduler_runner.py"), "--cleanup-legacy-tasks", "--confirm"]
+    )
     repair_script = Path(str(scheduler_config.get("repair_task_script", ROOT / "repair_scheduled_tasks.ps1")))
     if not repair_script.is_absolute():
         repair_script = (ROOT / repair_script).resolve()
@@ -1287,7 +1291,7 @@ def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any])
                 "step": len(action_items) + 1,
                 "name": "delete_legacy_tasks",
                 "description": "Delete legacy scheduled tasks that can duplicate noon/evening sends.",
-                "command": runner_command,
+                "command": legacy_cleanup_command,
                 "destructive": True,
                 "requires_password": False,
                 "blocked": False,
@@ -1371,6 +1375,84 @@ def print_repair_plan(as_json: bool = False) -> int:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
     else:
         print(build_repair_plan_text(plan))
+    return 0
+
+
+def build_legacy_cleanup_payload(
+    payload: Dict[str, Any],
+    scheduler_config: Dict[str, Any],
+    confirm: bool = False,
+) -> Dict[str, Any]:
+    candidates = [
+        candidate for candidate in collect_task_self_heal_candidates(payload, scheduler_config)
+        if str(candidate.get("reason", "") or "") == "enabled_legacy_task"
+    ]
+    results: list[Dict[str, Any]] = []
+    if confirm:
+        results = [
+            delete_scheduled_task(str(candidate.get("task_name", "") or ""))
+            for candidate in candidates
+        ]
+    success = bool(candidates) if not confirm else all(result.get("success", False) for result in results)
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "confirmed": confirm,
+        "destructive": confirm,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "results": results,
+        "success": success,
+        "status": "completed" if confirm else "preview",
+        "message": (
+            "No enabled legacy scheduled tasks were found."
+            if not candidates
+            else (
+                "Legacy scheduled task cleanup completed."
+                if confirm and success
+                else "Legacy scheduled task cleanup failed."
+                if confirm
+                else "Preview only. Add --confirm to delete these legacy scheduled tasks."
+            )
+        ),
+    }
+
+
+def build_legacy_cleanup_text(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"Legacy cleanup status: {payload.get('status', 'unknown')}",
+        f"Confirmed: {payload.get('confirmed', False)}",
+        f"Candidates: {payload.get('candidate_count', 0)}",
+        f"Message: {payload.get('message', '')}",
+    ]
+    candidates = list(payload.get("candidates") or [])
+    if candidates:
+        lines.append("")
+        lines.append("Legacy tasks:")
+        for candidate in candidates:
+            lines.append(f"- {candidate.get('task_name', 'unknown')}: {candidate.get('detail', '')}")
+    results = list(payload.get("results") or [])
+    if results:
+        lines.append("")
+        lines.append("Delete results:")
+        for result in results:
+            lines.append(
+                f"- {result.get('task_name', 'unknown')}: "
+                f"{'success' if result.get('success', False) else 'failed'} "
+                f"(returncode={result.get('returncode')})"
+            )
+    return "\n".join(lines)
+
+
+def print_legacy_cleanup_report(as_json: bool = False, confirm: bool = False) -> int:
+    doctor_payload = build_doctor_payload()
+    _, scheduler_config = load_runtime_config()
+    payload = build_legacy_cleanup_payload(doctor_payload, scheduler_config, confirm=confirm)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(build_legacy_cleanup_text(payload))
+    if confirm:
+        return 0 if payload.get("success", False) else 1
     return 0
 
 
@@ -2528,6 +2610,8 @@ if __name__ == "__main__":
     args = set(sys.argv[1:])
     if "--worker" in args:
         sys.exit(_run_main_worker())
+    if "--cleanup-legacy-tasks" in args:
+        sys.exit(print_legacy_cleanup_report(as_json="--json" in args, confirm="--confirm" in args))
     if "--repair-plan" in args:
         sys.exit(print_repair_plan(as_json="--json" in args))
     if "--doctor" in args:

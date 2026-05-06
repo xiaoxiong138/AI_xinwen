@@ -15,6 +15,8 @@ from scheduler_runner import (
     build_doctor_payload,
     build_doctor_alert_html,
     build_email_arrival_check,
+    build_legacy_cleanup_payload,
+    build_legacy_cleanup_text,
     build_monitored_task_names,
     build_repair_plan,
     build_repair_plan_text,
@@ -35,6 +37,7 @@ from scheduler_runner import (
     parse_worker_result_line,
     parse_schtasks_list_output,
     print_doctor_report,
+    print_legacy_cleanup_report,
     print_repair_plan,
     print_send_calendar_report,
     release_run_lock,
@@ -1104,6 +1107,9 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertTrue(plan["offline_rebuild_needed"])
         self.assertFalse(plan["password_present"])
         self.assertTrue(any(item["name"] == "delete_legacy_tasks" for item in plan["action_items"]))
+        cleanup = next(item for item in plan["action_items"] if item["name"] == "delete_legacy_tasks")
+        self.assertIn("--cleanup-legacy-tasks", cleanup["command"])
+        self.assertIn("--confirm", cleanup["command"])
         rebuild = next(item for item in plan["action_items"] if item["name"] == "rebuild_offline_tasks")
         self.assertTrue(rebuild["blocked"])
         text = build_repair_plan_text(plan)
@@ -1123,6 +1129,70 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
         self.assertIn('"candidate_count": 0', output)
+
+    def test_legacy_cleanup_preview_requires_confirm_for_deletion(self):
+        payload = {
+            "status": {
+                "legacy_tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200",
+                        "available": True,
+                        "scheduled_task_state": "已启用",
+                    }
+                ],
+                "tasks": [],
+            }
+        }
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+
+        with patch("scheduler_runner.delete_scheduled_task") as mocked_delete:
+            cleanup = build_legacy_cleanup_payload(payload, scheduler_config, confirm=False)
+
+        self.assertEqual(cleanup["status"], "preview")
+        self.assertEqual(cleanup["candidate_count"], 1)
+        self.assertIn("--confirm", cleanup["message"])
+        mocked_delete.assert_not_called()
+        text = build_legacy_cleanup_text(cleanup)
+        self.assertIn("Legacy cleanup status: preview", text)
+        self.assertIn("\\Web_Agent_Send_1200", text)
+
+    def test_legacy_cleanup_confirm_deletes_candidates(self):
+        payload = {
+            "status": {
+                "legacy_tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200",
+                        "available": True,
+                        "scheduled_task_state": "已启用",
+                    }
+                ],
+                "tasks": [],
+            }
+        }
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+
+        with patch(
+            "scheduler_runner.delete_scheduled_task",
+            return_value={"task_name": "Web_Agent_Send_1200", "success": True, "returncode": 0},
+        ) as mocked_delete:
+            cleanup = build_legacy_cleanup_payload(payload, scheduler_config, confirm=True)
+
+        self.assertEqual(cleanup["status"], "completed")
+        self.assertTrue(cleanup["success"])
+        mocked_delete.assert_called_once_with("\\Web_Agent_Send_1200")
+
+    def test_print_legacy_cleanup_report_outputs_preview(self):
+        payload = {"overall": "ok", "status": {"tasks": [], "legacy_tasks": []}}
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+
+        with patch("scheduler_runner.build_doctor_payload", return_value=payload):
+            with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                with patch("sys.stdout.write") as mocked_write:
+                    exit_code = print_legacy_cleanup_report(as_json=False, confirm=False)
+
+        self.assertEqual(exit_code, 0)
+        output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
+        self.assertIn("Legacy cleanup status: preview", output)
 
     def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
