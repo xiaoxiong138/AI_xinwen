@@ -693,6 +693,30 @@ def build_doctor_payload() -> Dict[str, Any]:
     else:
         checks.append(_doctor_item("last_success", "warn", "No successful email snapshot has been recorded yet."))
 
+    send_calendar = build_send_calendar_payload(
+        scheduler_config,
+        target_datetime=datetime.now(),
+        last_run=last_run,
+        last_success=last_success,
+    )
+    missed_slots = [
+        slot for slot in list(send_calendar.get("slots") or [])
+        if str(slot.get("health_status", "") or "") == "missed"
+    ]
+    checks.append(
+        _doctor_item(
+            "send_calendar",
+            "warn" if missed_slots else "ok",
+            (
+                "Missed send slots detected today: "
+                + ", ".join(f"{slot.get('time')} ({slot.get('slot_id')})" for slot in missed_slots)
+                if missed_slots
+                else "No missed send slots detected for today."
+            ),
+            {"calendar": send_calendar, "missed_slots": missed_slots},
+        )
+    )
+
     observability_config = dict(config.get("observability") or {})
     if observability_config.get("require_production_diagnostics", False) and last_success:
         if last_success.get("quality_diagnostics") and last_success.get("source_health"):
@@ -1583,6 +1607,8 @@ def build_send_calendar_payload(
     target_date = target_datetime.date()
     slot_dir = Path(str(scheduler_config.get("send_slot_dir", ROOT / "logs/send_slots")))
     slots = list(scheduler_config.get("send_slots") or DEFAULT_SCHEDULER_CONFIG["send_slots"])
+    before_minutes = max(0, int(scheduler_config.get("send_window_before_minutes", 10)))
+    after_minutes = max(0, int(scheduler_config.get("send_window_after_minutes", 180)))
     last_run = dict(last_run or {})
     last_success = dict(last_success or {})
     rows: list[Dict[str, Any]] = []
@@ -1592,12 +1618,32 @@ def build_send_calendar_payload(
         slot_time = str(slot.get("time", "") or "").strip()
         if not slot_id_suffix or not slot_time:
             continue
+        try:
+            hour, minute = parse_time_of_day(slot_time)
+            scheduled_at = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        except (TypeError, ValueError):
+            scheduled_at = datetime.combine(target_date, datetime.min.time())
+        window_start = scheduled_at - timedelta(minutes=before_minutes)
+        window_end = scheduled_at + timedelta(minutes=after_minutes)
         daily_slot_id = f"{target_date.strftime('%Y%m%d')}_{slot_id_suffix}"
         slot_payload = read_json(slot_dir / f"{daily_slot_id}.json")
+        raw_status = str(slot_payload.get("status", "missing") or "missing")
+        health_status = raw_status
+        if raw_status == "missing":
+            if target_datetime < window_start:
+                health_status = "upcoming"
+            elif target_datetime <= window_end:
+                health_status = "pending"
+            else:
+                health_status = "missed"
         row = {
             "slot_id": daily_slot_id,
             "time": slot_time,
-            "status": str(slot_payload.get("status", "missing") or "missing"),
+            "status": raw_status,
+            "health_status": health_status,
+            "scheduled_at": scheduled_at.isoformat(timespec="seconds"),
+            "window_start": window_start.isoformat(timespec="seconds"),
+            "window_end": window_end.isoformat(timespec="seconds"),
             "run_id": slot_payload.get("run_id", ""),
             "finished_at": slot_payload.get("finished_at", ""),
             "html_report_path": slot_payload.get("html_report_path", ""),
@@ -1666,7 +1712,8 @@ def build_send_calendar_text(payload: Dict[str, Any]) -> str:
         suffix = f", last_run={last_run_status}" if last_run_status else ""
         lines.append(
             f"- {slot.get('time', 'N/A')} {slot.get('slot_id', 'unknown')}: "
-            f"{slot.get('status', 'missing')}, finished={finished_at}, report={report_path}{suffix}"
+            f"{slot.get('health_status', slot.get('status', 'missing'))}, "
+            f"raw={slot.get('status', 'missing')}, finished={finished_at}, report={report_path}{suffix}"
         )
 
     last_success = dict(payload.get("last_success") or {})
@@ -1681,17 +1728,13 @@ def build_send_calendar_text(payload: Dict[str, Any]) -> str:
 
 def print_send_calendar_report(as_json: bool = False) -> int:
     _, scheduler_config = load_runtime_config()
-    calendar_dir = Path(str(scheduler_config.get("send_calendar_dir", scheduler_config.get("log_dir", ROOT / "logs"))))
     today = datetime.now()
-    calendar_path = calendar_dir / f"send_calendar_{today.strftime('%Y%m%d')}.json"
-    payload = read_json(calendar_path)
-    if not payload:
-        payload = build_send_calendar_payload(
-            scheduler_config,
-            target_datetime=today,
-            last_run=read_json(Path(str(scheduler_config["status_file"]))),
-            last_success=read_json(Path(str(scheduler_config["last_success_file"]))),
-        )
+    payload = build_send_calendar_payload(
+        scheduler_config,
+        target_datetime=today,
+        last_run=read_json(Path(str(scheduler_config["status_file"]))),
+        last_success=read_json(Path(str(scheduler_config["last_success_file"]))),
+    )
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

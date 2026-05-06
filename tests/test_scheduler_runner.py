@@ -354,7 +354,9 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertEqual(payload["date"], "2026-04-28")
             self.assertEqual([slot["slot_id"] for slot in payload["slots"]], ["20260428_1200", "20260428_2100"])
             self.assertEqual(payload["slots"][0]["status"], "sent")
+            self.assertEqual(payload["slots"][0]["health_status"], "sent")
             self.assertEqual(payload["slots"][1]["last_run_status"], "skipped_duplicate_slot")
+            self.assertEqual(payload["slots"][1]["health_status"], "pending")
 
             calendar_path = write_send_calendar(
                 scheduler_config,
@@ -385,6 +387,7 @@ class SchedulerRunnerTests(unittest.TestCase):
                         "slot_id": "20260428_2100",
                         "time": "21:00",
                         "status": "missing",
+                        "health_status": "missed",
                     },
                 ],
                 "last_success": {
@@ -396,24 +399,26 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertIn("Send calendar: 2026-04-28", text)
         self.assertIn("12:00 20260428_1200: sent", text)
-        self.assertIn("21:00 20260428_2100: missing", text)
+        self.assertIn("21:00 20260428_2100: missed", text)
         self.assertIn("Last success: 2026-04-28T12:05:00", text)
 
-    def test_print_send_calendar_report_outputs_existing_calendar_json(self):
+    def test_send_calendar_marks_missing_slots_by_time_window(self):
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scheduler_config["send_slot_dir"] = str(Path(temp_dir) / "send_slots")
+            payload = build_send_calendar_payload(
+                scheduler_config,
+                target_datetime=datetime(2026, 4, 28, 16, 0, 0),
+            )
+
+        self.assertEqual(payload["slots"][0]["health_status"], "missed")
+        self.assertEqual(payload["slots"][1]["health_status"], "upcoming")
+
+    def test_print_send_calendar_report_outputs_fresh_calendar(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             calendar_dir = temp_root / "logs"
             calendar_dir.mkdir(parents=True)
-            today_name = f"send_calendar_{datetime.now().strftime('%Y%m%d')}.json"
-            write_json(
-                calendar_dir / today_name,
-                {
-                    "date": datetime.now().date().isoformat(),
-                    "generated_at": "2026-04-28T12:05:00",
-                    "slots": [{"slot_id": "today_1200", "time": "12:00", "status": "sent"}],
-                    "last_success": {},
-                },
-            )
             scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
             scheduler_config.update(
                 {
@@ -430,7 +435,8 @@ class SchedulerRunnerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
-            self.assertIn("today_1200", output)
+            self.assertIn("Send calendar:", output)
+            self.assertIn("Slots:", output)
 
     def test_parse_schtasks_list_output_extracts_key_fields(self):
         output = """
@@ -677,10 +683,11 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(payload["overall"], "warn")
         self.assertEqual(payload["counts"]["fail"], 0)
-        self.assertEqual(payload["counts"]["warn"], 2)
+        self.assertEqual(payload["counts"]["warn"], 3)
         warned = [item for item in payload["checks"] if item["level"] == "warn"]
         self.assertTrue(any("Web_Agent_Send_1200" in item["name"] for item in warned))
         self.assertTrue(any(item["name"] == "task_repair_commands" for item in warned))
+        self.assertTrue(any(item["name"] == "send_calendar" for item in warned))
         self.assertTrue(any("setup_offline_tasks.ps1" in command["command"] for command in payload["repair_commands"]))
 
     def test_build_doctor_payload_reports_missing_email_as_failure(self):
