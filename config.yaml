@@ -289,6 +289,7 @@ scheduler:
   doctor_history_file: logs/doctor_history.json
   send_calendar_dir: logs
   log_archive_dir: logs/archive
+  task_backup_dir: logs/task_backups
   task_setup_script: setup_scheduled_tasks.ps1
   offline_task_setup_script: setup_offline_tasks.ps1
   repair_task_script: repair_scheduled_tasks.ps1

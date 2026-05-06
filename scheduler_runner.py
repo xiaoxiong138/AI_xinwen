@@ -59,6 +59,7 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "doctor_history_file": "logs/doctor_history.json",
     "send_calendar_dir": "logs",
     "log_archive_dir": "logs/archive",
+    "task_backup_dir": "logs/task_backups",
     "task_setup_script": "setup_scheduled_tasks.ps1",
     "offline_task_setup_script": "setup_offline_tasks.ps1",
     "repair_task_script": "repair_scheduled_tasks.ps1",
@@ -141,6 +142,7 @@ def load_runtime_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "doctor_history_file",
         "send_calendar_dir",
         "log_archive_dir",
+        "task_backup_dir",
         "send_slot_dir",
     ):
         scheduler_config[key] = str((ROOT / str(scheduler_config[key])).resolve())
@@ -1083,11 +1085,15 @@ def collect_task_self_heal_candidates(
     return candidates
 
 
-def delete_scheduled_task(task_name: str) -> Dict[str, Any]:
+def export_scheduled_task_xml(task_name: str, backup_dir: Path) -> Dict[str, Any]:
     clean_name = str(task_name or "").lstrip("\\")
-    command = ["schtasks", "/Delete", "/TN", clean_name, "/F"]
+    safe_name = clean_name.replace("\\", "_").replace("/", "_")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml"
+    command = ["schtasks", "/Query", "/TN", clean_name, "/XML"]
     result: Dict[str, Any] = {
         "task_name": clean_name,
+        "backup_path": backup_path.as_posix(),
         "command": command,
         "success": False,
         "returncode": None,
@@ -1097,6 +1103,49 @@ def delete_scheduled_task(task_name: str) -> Dict[str, Any]:
     if not clean_name:
         result["stderr"] = "Task name is empty."
         return result
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        command,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+        check=False,
+    )
+    result["returncode"] = completed.returncode
+    result["stdout"] = (completed.stdout or "").strip()
+    result["stderr"] = (completed.stderr or "").strip()
+    result["success"] = completed.returncode == 0 and bool(result["stdout"])
+    if result["success"]:
+        backup_path.write_text(str(result["stdout"]), encoding="utf-8")
+        result["stdout"] = ""
+    return result
+
+
+def delete_scheduled_task(task_name: str, backup_dir: Optional[Path] = None) -> Dict[str, Any]:
+    clean_name = str(task_name or "").lstrip("\\")
+    command = ["schtasks", "/Delete", "/TN", clean_name, "/F"]
+    result: Dict[str, Any] = {
+        "task_name": clean_name,
+        "command": command,
+        "backup": {},
+        "success": False,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+    }
+    if not clean_name:
+        result["stderr"] = "Task name is empty."
+        return result
+    if backup_dir is not None:
+        backup_result = export_scheduled_task_xml(clean_name, backup_dir)
+        result["backup"] = backup_result
+        if not backup_result.get("success", False):
+            result["stderr"] = "Scheduled task backup failed; deletion was not attempted."
+            return result
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     completed = subprocess.run(
@@ -1195,8 +1244,9 @@ def run_task_self_heal(
         return result
 
     if legacy_candidates:
+        backup_dir = Path(str(scheduler_config.get("task_backup_dir", ROOT / "logs/task_backups")))
         cleanup_results = [
-            delete_scheduled_task(str(candidate.get("task_name", "") or ""))
+            delete_scheduled_task(str(candidate.get("task_name", "") or ""), backup_dir=backup_dir)
             for candidate in legacy_candidates
         ]
         result["legacy_cleanup"]["results"] = cleanup_results
@@ -1286,15 +1336,17 @@ def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any])
         }
     ]
     if legacy_candidates:
+        backup_dir = Path(str(scheduler_config.get("task_backup_dir", ROOT / "logs/task_backups")))
         action_items.append(
             {
                 "step": len(action_items) + 1,
                 "name": "delete_legacy_tasks",
-                "description": "Delete legacy scheduled tasks that can duplicate noon/evening sends.",
+                "description": "Back up and delete legacy scheduled tasks that can duplicate noon/evening sends.",
                 "command": legacy_cleanup_command,
                 "destructive": True,
                 "requires_password": False,
                 "blocked": False,
+                "backup_dir": backup_dir.as_posix(),
                 "tasks": [str(candidate.get("task_name", "") or "") for candidate in legacy_candidates],
             }
         )
@@ -1363,6 +1415,8 @@ def build_repair_plan_text(plan: Dict[str, Any]) -> str:
         tasks = list(item.get("tasks") or [])
         if tasks:
             lines.append("   tasks: " + ", ".join(tasks))
+        if item.get("backup_dir"):
+            lines.append(f"   backup_dir: {item.get('backup_dir')}")
         lines.append(f"   command: {item.get('command', '')}")
     return "\n".join(lines)
 
@@ -1388,9 +1442,10 @@ def build_legacy_cleanup_payload(
         if str(candidate.get("reason", "") or "") == "enabled_legacy_task"
     ]
     results: list[Dict[str, Any]] = []
+    backup_dir = Path(str(scheduler_config.get("task_backup_dir", ROOT / "logs/task_backups")))
     if confirm:
         results = [
-            delete_scheduled_task(str(candidate.get("task_name", "") or ""))
+            delete_scheduled_task(str(candidate.get("task_name", "") or ""), backup_dir=backup_dir)
             for candidate in candidates
         ]
     success = bool(candidates) if not confirm else all(result.get("success", False) for result in results)
@@ -1399,6 +1454,7 @@ def build_legacy_cleanup_payload(
         "confirmed": confirm,
         "destructive": confirm,
         "candidate_count": len(candidates),
+        "backup_dir": backup_dir.as_posix(),
         "candidates": candidates,
         "results": results,
         "success": success,
@@ -1422,6 +1478,7 @@ def build_legacy_cleanup_text(payload: Dict[str, Any]) -> str:
         f"Legacy cleanup status: {payload.get('status', 'unknown')}",
         f"Confirmed: {payload.get('confirmed', False)}",
         f"Candidates: {payload.get('candidate_count', 0)}",
+        f"Backup dir: {payload.get('backup_dir', '') or 'N/A'}",
         f"Message: {payload.get('message', '')}",
     ]
     candidates = list(payload.get("candidates") or [])
@@ -1440,6 +1497,9 @@ def build_legacy_cleanup_text(payload: Dict[str, Any]) -> str:
                 f"{'success' if result.get('success', False) else 'failed'} "
                 f"(returncode={result.get('returncode')})"
             )
+            backup = dict(result.get("backup") or {})
+            if backup:
+                lines.append(f"   backup: {backup.get('backup_path', '') or 'N/A'} ({'ok' if backup.get('success', False) else 'failed'})")
     return "\n".join(lines)
 
 

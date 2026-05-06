@@ -21,12 +21,34 @@ function Remove-TaskIfExists {
     cmd /c "schtasks /Delete /TN `"$TaskName`" /F >nul 2>nul" | Out-Null
 }
 
+function Export-TaskBackupIfExists {
+    param(
+        [string]$TaskName,
+        [string]$BackupRoot
+    )
+    if (-not $TaskName) {
+        return
+    }
+    $safeName = $TaskName.Replace("\", "_").Replace("/", "_")
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $backupPath = Join-Path $BackupRoot "$safeName`_$stamp.xml"
+    $xml = schtasks /Query /TN $TaskName /XML 2>$null
+    if ($LASTEXITCODE -eq 0 -and $xml) {
+        $xml | Out-File -FilePath $backupPath -Encoding UTF8
+        Write-Host "Backed up $TaskName to $backupPath"
+    }
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$backupRoot = Join-Path $root "logs\task_backups"
+New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
 $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
 $password = $RunAsPassword
 $credentialUserName = $currentUser
 
 Write-Host "Removing legacy Web_Agent scheduled tasks..."
+Export-TaskBackupIfExists -TaskName "Web_Agent_Send_1200" -BackupRoot $backupRoot
+Export-TaskBackupIfExists -TaskName "Web_Agent_Send_2100" -BackupRoot $backupRoot
 Remove-TaskIfExists -TaskName "Web_Agent_Send_1200"
 Remove-TaskIfExists -TaskName "Web_Agent_Send_2100"
 

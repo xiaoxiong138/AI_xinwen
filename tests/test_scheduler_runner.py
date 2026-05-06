@@ -33,6 +33,7 @@ from scheduler_runner import (
     cleanup_validation_reports,
     collect_task_self_heal_candidates,
     describe_task_result,
+    export_scheduled_task_xml,
     is_interactive_task,
     parse_worker_result_line,
     parse_schtasks_list_output,
@@ -1066,8 +1067,24 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertTrue(result["legacy_cleanup"]["success"])
             self.assertIn("requires a Windows password", result["message"])
-            mocked_run.assert_called_once()
-            self.assertEqual(mocked_run.call_args.args[0][:4], ["schtasks", "/Delete", "/TN", "Web_Agent_Send_1200"])
+            self.assertEqual(mocked_run.call_count, 2)
+            self.assertEqual(mocked_run.call_args_list[-1].args[0][:4], ["schtasks", "/Delete", "/TN", "Web_Agent_Send_1200"])
+
+    def test_export_scheduled_task_xml_writes_backup_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_dir = Path(temp_dir) / "task_backups"
+
+            with patch("scheduler_runner.subprocess.run") as mocked_run:
+                mocked_run.return_value.returncode = 0
+                mocked_run.return_value.stdout = "<Task></Task>"
+                mocked_run.return_value.stderr = ""
+                result = export_scheduled_task_xml("\\Web_Agent_Send_1200", backup_dir)
+
+            self.assertTrue(result["success"])
+            backup_path = Path(result["backup_path"])
+            self.assertTrue(backup_path.exists())
+            self.assertEqual(backup_path.read_text(encoding="utf-8"), "<Task></Task>")
+            self.assertEqual(mocked_run.call_args.args[0][:4], ["schtasks", "/Query", "/TN", "Web_Agent_Send_1200"])
 
     def test_build_repair_plan_separates_legacy_cleanup_and_offline_rebuild(self):
         payload = {
@@ -1110,6 +1127,7 @@ class SchedulerRunnerTests(unittest.TestCase):
         cleanup = next(item for item in plan["action_items"] if item["name"] == "delete_legacy_tasks")
         self.assertIn("--cleanup-legacy-tasks", cleanup["command"])
         self.assertIn("--confirm", cleanup["command"])
+        self.assertIn("task_backups", cleanup["backup_dir"])
         rebuild = next(item for item in plan["action_items"] if item["name"] == "rebuild_offline_tasks")
         self.assertTrue(rebuild["blocked"])
         text = build_repair_plan_text(plan)
@@ -1179,7 +1197,10 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(cleanup["status"], "completed")
         self.assertTrue(cleanup["success"])
-        mocked_delete.assert_called_once_with("\\Web_Agent_Send_1200")
+        self.assertEqual(Path(cleanup["backup_dir"]), Path(DEFAULT_SCHEDULER_CONFIG["task_backup_dir"]))
+        mocked_delete.assert_called_once()
+        self.assertEqual(mocked_delete.call_args.args[0], "\\Web_Agent_Send_1200")
+        self.assertIsInstance(mocked_delete.call_args.kwargs["backup_dir"], Path)
 
     def test_print_legacy_cleanup_report_outputs_preview(self):
         payload = {"overall": "ok", "status": {"tasks": [], "legacy_tasks": []}}
