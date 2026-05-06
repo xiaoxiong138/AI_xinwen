@@ -1245,6 +1245,135 @@ def run_task_self_heal(
     return result
 
 
+def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any]) -> Dict[str, Any]:
+    candidates = collect_task_self_heal_candidates(payload, scheduler_config)
+    legacy_candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("reason", "") or "") == "enabled_legacy_task"
+    ]
+    repair_candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("reason", "") or "") != "enabled_legacy_task"
+    ]
+    password_env = str(scheduler_config.get("run_as_password_env", "WEB_AGENT_RUNAS_PASSWORD") or "WEB_AGENT_RUNAS_PASSWORD")
+    password_present = bool(os.getenv(password_env, ""))
+    runner_command = " ".join(
+        _quote_command_arg(part)
+        for part in [sys.executable, str(ROOT / "scheduler_runner.py"), "--doctor", "--self-heal"]
+    )
+    dry_run_command = f"{runner_command} --dry-run"
+    repair_script = Path(str(scheduler_config.get("repair_task_script", ROOT / "repair_scheduled_tasks.ps1")))
+    if not repair_script.is_absolute():
+        repair_script = (ROOT / repair_script).resolve()
+    repair_script_command = (
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f"{_quote_command_arg(repair_script)}"
+    )
+
+    action_items: list[Dict[str, Any]] = [
+        {
+            "step": 1,
+            "name": "preview_self_heal",
+            "description": "Preview the cleanup and rebuild candidates without changing scheduled tasks.",
+            "command": dry_run_command,
+            "destructive": False,
+            "requires_password": False,
+            "blocked": False,
+        }
+    ]
+    if legacy_candidates:
+        action_items.append(
+            {
+                "step": len(action_items) + 1,
+                "name": "delete_legacy_tasks",
+                "description": "Delete legacy scheduled tasks that can duplicate noon/evening sends.",
+                "command": runner_command,
+                "destructive": True,
+                "requires_password": False,
+                "blocked": False,
+                "tasks": [str(candidate.get("task_name", "") or "") for candidate in legacy_candidates],
+            }
+        )
+    if repair_candidates:
+        action_items.append(
+            {
+                "step": len(action_items) + 1,
+                "name": "rebuild_offline_tasks",
+                "description": "Rebuild offline-capable send, doctor, and preflight tasks.",
+                "command": repair_script_command,
+                "destructive": True,
+                "requires_password": True,
+                "blocked": not password_present,
+                "password_env": password_env,
+                "tasks": [str(candidate.get("task_name", "") or "") for candidate in repair_candidates],
+            }
+        )
+    action_items.append(
+        {
+            "step": len(action_items) + 1,
+            "name": "record_doctor",
+            "description": "Record a fresh health snapshot after repair.",
+            "command": " ".join(
+                _quote_command_arg(part)
+                for part in [sys.executable, str(ROOT / "scheduler_runner.py"), "--doctor", "--record"]
+            ),
+            "destructive": False,
+            "requires_password": False,
+            "blocked": False,
+        }
+    )
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "overall": payload.get("overall", "unknown"),
+        "candidate_count": len(candidates),
+        "legacy_cleanup_needed": bool(legacy_candidates),
+        "offline_rebuild_needed": bool(repair_candidates),
+        "password_env": password_env,
+        "password_present": password_present,
+        "candidates": candidates,
+        "action_items": action_items,
+    }
+
+
+def build_repair_plan_text(plan: Dict[str, Any]) -> str:
+    lines = [
+        f"Repair plan generated at: {plan.get('generated_at', '') or 'unknown'}",
+        f"Doctor overall: {plan.get('overall', 'unknown')}",
+        f"Candidates: {plan.get('candidate_count', 0)}",
+        f"Windows password env: {plan.get('password_env', 'WEB_AGENT_RUNAS_PASSWORD')} "
+        f"({'present' if plan.get('password_present', False) else 'missing'})",
+        "",
+        "Actions:",
+    ]
+    for item in list(plan.get("action_items") or []):
+        flags = []
+        if item.get("destructive", False):
+            flags.append("destructive")
+        if item.get("requires_password", False):
+            flags.append("requires_password")
+        if item.get("blocked", False):
+            flags.append("blocked")
+        flag_text = f" [{' / '.join(flags)}]" if flags else ""
+        lines.append(f"{item.get('step', '?')}. {item.get('name', 'action')}{flag_text}: {item.get('description', '')}")
+        tasks = list(item.get("tasks") or [])
+        if tasks:
+            lines.append("   tasks: " + ", ".join(tasks))
+        lines.append(f"   command: {item.get('command', '')}")
+    return "\n".join(lines)
+
+
+def print_repair_plan(as_json: bool = False) -> int:
+    payload = build_doctor_payload()
+    _, scheduler_config = load_runtime_config()
+    plan = build_repair_plan(payload, scheduler_config)
+    if as_json:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        print(build_repair_plan_text(plan))
+    return 0
+
+
 def should_send_doctor_alert(payload: Dict[str, Any], history: Dict[str, Any], scheduler_config: Dict[str, Any]) -> bool:
     if not scheduler_config.get("send_doctor_alert_email", True):
         return False
@@ -2399,6 +2528,8 @@ if __name__ == "__main__":
     args = set(sys.argv[1:])
     if "--worker" in args:
         sys.exit(_run_main_worker())
+    if "--repair-plan" in args:
+        sys.exit(print_repair_plan(as_json="--json" in args))
     if "--doctor" in args:
         sys.exit(
             print_doctor_report(

@@ -16,6 +16,8 @@ from scheduler_runner import (
     build_doctor_alert_html,
     build_email_arrival_check,
     build_monitored_task_names,
+    build_repair_plan,
+    build_repair_plan_text,
     build_scheduler_status_payload,
     build_send_calendar_payload,
     build_send_calendar_text,
@@ -33,6 +35,7 @@ from scheduler_runner import (
     parse_worker_result_line,
     parse_schtasks_list_output,
     print_doctor_report,
+    print_repair_plan,
     print_send_calendar_report,
     release_run_lock,
     resolve_send_slot,
@@ -1062,6 +1065,64 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertIn("requires a Windows password", result["message"])
             mocked_run.assert_called_once()
             self.assertEqual(mocked_run.call_args.args[0][:4], ["schtasks", "/Delete", "/TN", "Web_Agent_Send_1200"])
+
+    def test_build_repair_plan_separates_legacy_cleanup_and_offline_rebuild(self):
+        payload = {
+            "overall": "warn",
+            "status": {
+                "legacy_tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200",
+                        "available": True,
+                        "scheduled_task_state": "已启用",
+                    }
+                ],
+                "tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200_v2",
+                        "available": True,
+                        "logon_mode": "Interactive only",
+                        "last_result_hint": "success",
+                    }
+                ],
+            },
+        }
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+        scheduler_config.update(
+            {
+                "task_names": ["Web_Agent_Send_1200_v2"],
+                "require_offline_tasks": True,
+                "run_as_password_env": "WEB_AGENT_TEST_PASSWORD",
+                "repair_task_script": "repair_scheduled_tasks.ps1",
+            }
+        )
+
+        with patch.dict(os.environ, {"WEB_AGENT_TEST_PASSWORD": ""}, clear=False):
+            plan = build_repair_plan(payload, scheduler_config)
+
+        self.assertTrue(plan["legacy_cleanup_needed"])
+        self.assertTrue(plan["offline_rebuild_needed"])
+        self.assertFalse(plan["password_present"])
+        self.assertTrue(any(item["name"] == "delete_legacy_tasks" for item in plan["action_items"]))
+        rebuild = next(item for item in plan["action_items"] if item["name"] == "rebuild_offline_tasks")
+        self.assertTrue(rebuild["blocked"])
+        text = build_repair_plan_text(plan)
+        self.assertIn("delete_legacy_tasks", text)
+        self.assertIn("rebuild_offline_tasks", text)
+        self.assertIn("WEB_AGENT_TEST_PASSWORD", text)
+
+    def test_print_repair_plan_outputs_json(self):
+        payload = {"overall": "ok", "status": {"tasks": [], "legacy_tasks": []}}
+        scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+
+        with patch("scheduler_runner.build_doctor_payload", return_value=payload):
+            with patch("scheduler_runner.load_runtime_config", return_value=({}, scheduler_config)):
+                with patch("sys.stdout.write") as mocked_write:
+                    exit_code = print_repair_plan(as_json=True)
+
+        self.assertEqual(exit_code, 0)
+        output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
+        self.assertIn('"candidate_count": 0', output)
 
     def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
