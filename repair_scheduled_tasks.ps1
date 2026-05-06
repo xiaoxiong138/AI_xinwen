@@ -26,6 +26,10 @@ $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.
 $password = $RunAsPassword
 $credentialUserName = $currentUser
 
+Write-Host "Removing legacy Web_Agent scheduled tasks..."
+Remove-TaskIfExists -TaskName "Web_Agent_Send_1200"
+Remove-TaskIfExists -TaskName "Web_Agent_Send_2100"
+
 if (-not $password) {
     $envPassword = [Environment]::GetEnvironmentVariable("WEB_AGENT_RUNAS_PASSWORD")
     if ($envPassword) {
@@ -46,10 +50,6 @@ if (-not $password) {
     $credentialUserName = $credential.UserName
     $password = $credential.GetNetworkCredential().Password
 }
-
-Write-Host "Removing legacy Web_Agent scheduled tasks..."
-Remove-TaskIfExists -TaskName "Web_Agent_Send_1200"
-Remove-TaskIfExists -TaskName "Web_Agent_Send_2100"
 
 Write-Host "Rebuilding offline-capable Web_Agent tasks for $credentialUserName..."
 & (Join-Path $root "setup_offline_tasks.ps1") `

@@ -1029,6 +1029,17 @@ def collect_task_self_heal_candidates(
     scheduler_config = scheduler_config or {}
     primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
     require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
+    for task in list(status_payload.get("legacy_tasks") or []):
+        task_name = str(task.get("task_name", "unknown") or "unknown")
+        if task.get("available", False) and is_task_enabled(task):
+            candidates.append(
+                {
+                    "task_name": task_name,
+                    "reason": "enabled_legacy_task",
+                    "detail": "Legacy scheduled task is still enabled and may duplicate sends.",
+                }
+            )
+
     for task in list(status_payload.get("tasks") or []):
         task_name = str(task.get("task_name", "unknown") or "unknown")
         if not task.get("available", False):
@@ -1072,15 +1083,56 @@ def collect_task_self_heal_candidates(
     return candidates
 
 
+def delete_scheduled_task(task_name: str) -> Dict[str, Any]:
+    clean_name = str(task_name or "").lstrip("\\")
+    command = ["schtasks", "/Delete", "/TN", clean_name, "/F"]
+    result: Dict[str, Any] = {
+        "task_name": clean_name,
+        "command": command,
+        "success": False,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+    }
+    if not clean_name:
+        result["stderr"] = "Task name is empty."
+        return result
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        command,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+        check=False,
+    )
+    result["returncode"] = completed.returncode
+    result["stdout"] = (completed.stdout or "").strip()
+    result["stderr"] = (completed.stderr or "").strip()
+    result["success"] = completed.returncode == 0
+    return result
+
+
 def run_task_self_heal(
     scheduler_config: Dict[str, Any],
     candidates: list[Dict[str, Any]],
     dry_run: bool = False,
 ) -> Dict[str, Any]:
+    legacy_candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("reason", "") or "") == "enabled_legacy_task"
+    ]
+    repair_candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("reason", "") or "") != "enabled_legacy_task"
+    ]
     primary_task_names = {str(name) for name in (scheduler_config.get("task_names") or [])}
     require_offline_tasks = bool(scheduler_config.get("require_offline_tasks", False))
     needs_offline_rebuild = False
-    for candidate in candidates:
+    for candidate in repair_candidates:
         reason = str(candidate.get("reason", "") or "")
         task_name = str(candidate.get("task_name", "") or "").lstrip("\\")
         if reason == "offline_interactive_required":
@@ -1126,16 +1178,41 @@ def run_task_self_heal(
         "stdout": "",
         "stderr": "",
         "message": "",
+        "legacy_cleanup": {
+            "attempted": bool(legacy_candidates),
+            "success": False,
+            "candidates": legacy_candidates,
+            "results": [],
+        },
     }
     if not candidates:
         result["message"] = "No scheduled task repair candidates were found."
         return result
-    if not script_path.exists():
-        result["message"] = f"Task setup script is missing: {script_path.as_posix()}"
-        return result
     if dry_run:
+        result["legacy_cleanup"]["success"] = bool(legacy_candidates)
         result["success"] = True
         result["message"] = "Dry run only. No changes were applied."
+        return result
+
+    if legacy_candidates:
+        cleanup_results = [
+            delete_scheduled_task(str(candidate.get("task_name", "") or ""))
+            for candidate in legacy_candidates
+        ]
+        result["legacy_cleanup"]["results"] = cleanup_results
+        result["legacy_cleanup"]["success"] = all(item.get("success", False) for item in cleanup_results)
+
+    if not repair_candidates:
+        result["success"] = bool(result["legacy_cleanup"].get("success", False))
+        result["message"] = (
+            "Legacy scheduled task cleanup completed."
+            if result["success"]
+            else "Legacy scheduled task cleanup failed."
+        )
+        return result
+
+    if not script_path.exists():
+        result["message"] = f"Task setup script is missing: {script_path.as_posix()}"
         return result
     if needs_offline_rebuild and "-RunAsPassword" not in command:
         password_env = str(scheduler_config.get("run_as_password_env", "WEB_AGENT_RUNAS_PASSWORD") or "WEB_AGENT_RUNAS_PASSWORD")
@@ -1159,7 +1236,11 @@ def run_task_self_heal(
     result["returncode"] = completed.returncode
     result["stdout"] = (completed.stdout or "").strip()
     result["stderr"] = (completed.stderr or "").strip()
-    result["success"] = completed.returncode == 0
+    legacy_cleanup_ok = (
+        not result["legacy_cleanup"].get("attempted", False)
+        or bool(result["legacy_cleanup"].get("success", False))
+    )
+    result["success"] = completed.returncode == 0 and legacy_cleanup_ok
     result["message"] = "Scheduled task repair completed." if result["success"] else "Scheduled task repair failed."
     return result
 

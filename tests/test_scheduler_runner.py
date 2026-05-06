@@ -959,6 +959,31 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["reason"], "offline_interactive_required")
 
+    def test_collect_task_self_heal_candidates_includes_enabled_legacy_tasks(self):
+        payload = {
+            "status": {
+                "tasks": [],
+                "legacy_tasks": [
+                    {
+                        "task_name": "\\Web_Agent_Send_1200",
+                        "available": True,
+                        "scheduled_task_state": "已启用",
+                    },
+                    {
+                        "task_name": "\\Web_Agent_Send_2100",
+                        "available": True,
+                        "scheduled_task_state": "已禁用",
+                    },
+                ],
+            }
+        }
+
+        candidates = collect_task_self_heal_candidates(payload, dict(DEFAULT_SCHEDULER_CONFIG))
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["reason"], "enabled_legacy_task")
+        self.assertEqual(candidates[0]["task_name"], "\\Web_Agent_Send_1200")
+
     def test_build_task_repair_commands_include_legacy_cleanup_and_offline_rebuild(self):
         scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
         scheduler_config.update(
@@ -1006,6 +1031,37 @@ class SchedulerRunnerTests(unittest.TestCase):
             self.assertTrue(result["attempted"])
             self.assertFalse(result["success"])
             self.assertIn("requires a Windows password", result["message"])
+
+    def test_run_task_self_heal_cleans_legacy_tasks_before_password_block(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "setup_offline_tasks.ps1"
+            script_path.write_text("Write-Host 'ok'", encoding="utf-8")
+            scheduler_config = dict(DEFAULT_SCHEDULER_CONFIG)
+            scheduler_config.update(
+                {
+                    "offline_task_setup_script": str(script_path),
+                    "run_as_password_env": "WEB_AGENT_TEST_PASSWORD",
+                    "require_offline_tasks": True,
+                    "task_names": ["Web_Agent_Send_1200_v2"],
+                }
+            )
+            candidates = [
+                {"task_name": "\\Web_Agent_Send_1200", "reason": "enabled_legacy_task"},
+                {"task_name": "\\Web_Agent_Send_1200_v2", "reason": "offline_interactive_required"},
+            ]
+
+            with patch.dict(os.environ, {"WEB_AGENT_TEST_PASSWORD": ""}, clear=False):
+                with patch("scheduler_runner.subprocess.run") as mocked_run:
+                    mocked_run.return_value.returncode = 0
+                    mocked_run.return_value.stdout = "SUCCESS"
+                    mocked_run.return_value.stderr = ""
+                    result = run_task_self_heal(scheduler_config, candidates, dry_run=False)
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["legacy_cleanup"]["success"])
+            self.assertIn("requires a Windows password", result["message"])
+            mocked_run.assert_called_once()
+            self.assertEqual(mocked_run.call_args.args[0][:4], ["schtasks", "/Delete", "/TN", "Web_Agent_Send_1200"])
 
     def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
