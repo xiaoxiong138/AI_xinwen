@@ -29,6 +29,8 @@ from scheduler_runner import (
     build_send_slot_id,
     build_task_backups_payload,
     build_task_backups_text,
+    build_task_restore_payload,
+    build_task_restore_text,
     build_failure_email_html,
     classify_quality_warnings,
     cleanup_old_logs,
@@ -44,6 +46,7 @@ from scheduler_runner import (
     print_repair_plan,
     print_send_calendar_report,
     print_task_backups_report,
+    print_task_restore_report,
     release_run_lock,
     resolve_send_slot,
     finalize_send_slot,
@@ -1232,9 +1235,13 @@ class SchedulerRunnerTests(unittest.TestCase):
 
             self.assertEqual(payload["backup_count"], 1)
             self.assertEqual(payload["backups"][0]["task_name"], "Web_Agent_Send_1200")
-            self.assertIn("/XML", payload["backups"][0]["restore_command"])
+            self.assertIn("--restore-task-backup", payload["backups"][0]["preview_command"])
+            self.assertIn("--confirm", payload["backups"][0]["restore_command"])
+            self.assertIn("/XML", payload["backups"][0]["raw_schtasks_restore_command"])
             self.assertIn("Web_Agent_Send_1200", text)
+            self.assertIn("preview:", text)
             self.assertIn("restore:", text)
+            self.assertIn("raw_schtasks_restore:", text)
 
     def test_print_task_backups_report_outputs_text(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1252,6 +1259,63 @@ class SchedulerRunnerTests(unittest.TestCase):
             output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
             self.assertIn("Task backups: 1", output)
             self.assertIn("Web_Agent_Send_2100", output)
+
+    def test_build_task_restore_payload_previews_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = Path(temp_dir) / "Web_Agent_Send_1200_20260506_223000.xml"
+            backup_path.write_text("<Task></Task>", encoding="utf-8")
+
+            with patch("scheduler_runner.subprocess.run") as mocked_run:
+                payload = build_task_restore_payload(str(backup_path), confirm=False)
+
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["status"], "preview")
+            self.assertEqual(payload["task_name"], "Web_Agent_Send_1200")
+            self.assertIn("/XML", payload["command"])
+            self.assertIn("--confirm", payload["message"])
+            mocked_run.assert_not_called()
+            text = build_task_restore_text(payload)
+            self.assertIn("Restore status: preview", text)
+            self.assertIn(str(backup_path), text)
+
+    def test_build_task_restore_payload_reports_missing_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_path = Path(temp_dir) / "Web_Agent_Send_1200_20260506_223000.xml"
+
+            payload = build_task_restore_payload(str(missing_path), confirm=False)
+
+            self.assertFalse(payload["success"])
+            self.assertEqual(payload["status"], "missing_backup")
+            self.assertIn("not found", payload["message"])
+
+    def test_build_task_restore_payload_confirm_executes_schtasks_create(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = Path(temp_dir) / "Web_Agent_Send_1200_20260506_223000.xml"
+            backup_path.write_text("<Task></Task>", encoding="utf-8")
+
+            with patch("scheduler_runner.subprocess.run") as mocked_run:
+                mocked_run.return_value.returncode = 0
+                mocked_run.return_value.stdout = "SUCCESS"
+                mocked_run.return_value.stderr = ""
+                payload = build_task_restore_payload(str(backup_path), confirm=True)
+
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(mocked_run.call_args.args[0][:4], ["schtasks", "/Create", "/TN", "Web_Agent_Send_1200"])
+            self.assertIn(str(backup_path), mocked_run.call_args.args[0])
+
+    def test_print_task_restore_report_outputs_preview(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = Path(temp_dir) / "Web_Agent_Send_1200_20260506_223000.xml"
+            backup_path.write_text("<Task></Task>", encoding="utf-8")
+
+            with patch("sys.stdout.write") as mocked_write:
+                exit_code = print_task_restore_report(str(backup_path), as_json=False, confirm=False)
+
+            self.assertEqual(exit_code, 0)
+            output = "".join(str(call.args[0]) for call in mocked_write.call_args_list)
+            self.assertIn("Restore status: preview", output)
+            self.assertIn("--confirm", output)
 
     def test_run_task_self_heal_uses_offline_rebuild_for_primary_permission_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:

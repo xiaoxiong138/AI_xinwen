@@ -1534,13 +1534,20 @@ def build_task_backups_payload(scheduler_config: Dict[str, Any]) -> Dict[str, An
             except OSError:
                 continue
             task_name = _infer_task_name_from_backup(path)
+            preview_command = " ".join(
+                _quote_command_arg(part)
+                for part in [sys.executable, str(ROOT / "scheduler_runner.py"), "--restore-task-backup", str(path)]
+            )
+            restore_command = f"{preview_command} --confirm"
             backups.append(
                 {
                     "task_name": task_name,
                     "backup_path": path.as_posix(),
                     "size_bytes": stat.st_size,
                     "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-                    "restore_command": (
+                    "preview_command": preview_command,
+                    "restore_command": restore_command,
+                    "raw_schtasks_restore_command": (
                         "schtasks /Create /TN "
                         f"{_quote_command_arg(task_name)} /XML {_quote_command_arg(path)} /F"
                     ),
@@ -1572,7 +1579,9 @@ def build_task_backups_text(payload: Dict[str, Any]) -> str:
             f"{backup.get('modified_at', 'unknown')} | "
             f"{backup.get('backup_path', '')}"
         )
+        lines.append(f"  preview: {backup.get('preview_command', '')}")
         lines.append(f"  restore: {backup.get('restore_command', '')}")
+        lines.append(f"  raw_schtasks_restore: {backup.get('raw_schtasks_restore_command', '')}")
     return "\n".join(lines)
 
 
@@ -1584,6 +1593,96 @@ def print_task_backups_report(as_json: bool = False) -> int:
     else:
         print(build_task_backups_text(payload))
     return 0
+
+
+def build_task_restore_payload(backup_path_text: str, confirm: bool = False, task_name: str = "") -> Dict[str, Any]:
+    backup_path_raw = str(backup_path_text or "").strip()
+    backup_path = Path(backup_path_raw) if backup_path_raw else Path()
+    if backup_path_raw and not backup_path.is_absolute():
+        backup_path = (ROOT / backup_path).resolve()
+
+    inferred_task_name = task_name or (_infer_task_name_from_backup(backup_path) if backup_path_raw else "")
+    command = ["schtasks", "/Create", "/TN", inferred_task_name, "/XML", str(backup_path), "/F"]
+    payload: Dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "confirmed": confirm,
+        "destructive": confirm,
+        "backup_path": backup_path.as_posix() if backup_path_raw else "",
+        "task_name": inferred_task_name,
+        "command": command,
+        "success": False,
+        "status": "preview",
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "message": "",
+    }
+
+    if not backup_path_raw:
+        payload["status"] = "missing_argument"
+        payload["message"] = "Provide a backup XML path after --restore-task-backup."
+        return payload
+    if not backup_path.exists():
+        payload["status"] = "missing_backup"
+        payload["message"] = f"Backup XML was not found: {backup_path}"
+        return payload
+    if backup_path.suffix.lower() != ".xml":
+        payload["status"] = "invalid_backup_type"
+        payload["message"] = "Only .xml task backups can be restored."
+        return payload
+    if not inferred_task_name:
+        payload["status"] = "missing_task_name"
+        payload["message"] = "Unable to infer task name from backup file name."
+        return payload
+    if not confirm:
+        payload["success"] = True
+        payload["message"] = "Preview only. Add --confirm to restore this scheduled task."
+        return payload
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding=locale.getpreferredencoding(False),
+        errors="replace",
+        creationflags=creationflags,
+        check=False,
+    )
+    payload["returncode"] = completed.returncode
+    payload["stdout"] = (completed.stdout or "").strip()
+    payload["stderr"] = (completed.stderr or "").strip()
+    payload["success"] = completed.returncode == 0
+    payload["status"] = "completed" if payload["success"] else "failed"
+    payload["message"] = "Scheduled task restored from backup." if payload["success"] else "Scheduled task restore failed."
+    return payload
+
+
+def build_task_restore_text(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"Restore status: {payload.get('status', 'unknown')}",
+        f"Confirmed: {payload.get('confirmed', False)}",
+        f"Task name: {payload.get('task_name', '') or 'N/A'}",
+        f"Backup path: {payload.get('backup_path', '') or 'N/A'}",
+        "Command: " + " ".join(_quote_command_arg(part) for part in payload.get("command", [])),
+        f"Message: {payload.get('message', '')}",
+    ]
+    if payload.get("returncode") is not None:
+        lines.append(f"Return code: {payload.get('returncode')}")
+    if payload.get("stdout"):
+        lines.append(f"Stdout: {payload.get('stdout')}")
+    if payload.get("stderr"):
+        lines.append(f"Stderr: {payload.get('stderr')}")
+    return "\n".join(lines)
+
+
+def print_task_restore_report(backup_path_text: str, as_json: bool = False, confirm: bool = False) -> int:
+    payload = build_task_restore_payload(backup_path_text, confirm=confirm)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(build_task_restore_text(payload))
+    return 0 if payload.get("success", False) else 1
 
 
 def should_send_doctor_alert(payload: Dict[str, Any], history: Dict[str, Any], scheduler_config: Dict[str, Any]) -> bool:
@@ -2737,11 +2836,18 @@ def main(validate_run: bool = False) -> int:
 
 if __name__ == "__main__":
     configure_utf8_stdio()
-    args = set(sys.argv[1:])
+    raw_args = sys.argv[1:]
+    args = set(raw_args)
     if "--worker" in args:
         sys.exit(_run_main_worker())
     if "--cleanup-legacy-tasks" in args:
         sys.exit(print_legacy_cleanup_report(as_json="--json" in args, confirm="--confirm" in args))
+    if "--restore-task-backup" in args:
+        try:
+            backup_arg = raw_args[raw_args.index("--restore-task-backup") + 1]
+        except (ValueError, IndexError):
+            backup_arg = ""
+        sys.exit(print_task_restore_report(backup_arg, as_json="--json" in args, confirm="--confirm" in args))
     if "--task-backups" in args:
         sys.exit(print_task_backups_report(as_json="--json" in args))
     if "--repair-plan" in args:
