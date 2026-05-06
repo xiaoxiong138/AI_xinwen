@@ -291,6 +291,7 @@ scheduler:
   log_archive_dir: logs/archive
   task_setup_script: setup_scheduled_tasks.ps1
   offline_task_setup_script: setup_offline_tasks.ps1
+  repair_task_script: repair_scheduled_tasks.ps1
   task_names:
     - Web_Agent_Send_1200_v2
     - Web_Agent_Send_2100_v2

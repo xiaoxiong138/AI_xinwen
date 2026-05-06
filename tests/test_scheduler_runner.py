@@ -880,6 +880,7 @@ class SchedulerRunnerTests(unittest.TestCase):
         commands = build_task_repair_commands(scheduler_config)
         command_text = "\n".join(command["command"] for command in commands)
 
+        self.assertIn("repair_scheduled_tasks.ps1", command_text)
         self.assertIn("schtasks /Delete /TN Web_Agent_Send_1200 /F", command_text)
         self.assertIn("schtasks /Delete /TN Web_Agent_Send_2100 /F", command_text)
         self.assertIn("setup_offline_tasks.ps1", command_text)

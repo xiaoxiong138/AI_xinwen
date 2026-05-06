@@ -61,6 +61,7 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "log_archive_dir": "logs/archive",
     "task_setup_script": "setup_scheduled_tasks.ps1",
     "offline_task_setup_script": "setup_offline_tasks.ps1",
+    "repair_task_script": "repair_scheduled_tasks.ps1",
     "task_names": ["Web_Agent_Send_1200_v2", "Web_Agent_Send_2100_v2"],
     "legacy_task_names": ["Web_Agent_Send_1200", "Web_Agent_Send_2100"],
     "monitor_auxiliary_tasks": True,
@@ -451,6 +452,9 @@ def build_task_repair_commands(scheduler_config: Dict[str, Any]) -> list[Dict[st
     offline_script = Path(str(scheduler_config.get("offline_task_setup_script", ROOT / "setup_offline_tasks.ps1")))
     if not offline_script.is_absolute():
         offline_script = (ROOT / offline_script).resolve()
+    repair_script = Path(str(scheduler_config.get("repair_task_script", ROOT / "repair_scheduled_tasks.ps1")))
+    if not repair_script.is_absolute():
+        repair_script = (ROOT / repair_script).resolve()
     doctor_command = [
         sys.executable,
         str(ROOT / "scheduler_runner.py"),
@@ -459,6 +463,16 @@ def build_task_repair_commands(scheduler_config: Dict[str, Any]) -> list[Dict[st
     ]
 
     commands: list[Dict[str, str]] = []
+    commands.append(
+        {
+            "name": "repair_all_scheduled_tasks",
+            "purpose": "Delete legacy tasks, rebuild offline-capable tasks, and record a fresh doctor snapshot.",
+            "command": (
+                "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                f"{_quote_command_arg(repair_script)}"
+            ),
+        }
+    )
     for task_name in legacy_task_names:
         if task_name:
             commands.append(
