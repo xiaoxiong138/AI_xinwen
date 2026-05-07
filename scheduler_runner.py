@@ -266,6 +266,8 @@ def query_scheduled_task(task_name: str) -> Dict[str, Any]:
 
 def is_interactive_task(task: Dict[str, Any]) -> bool:
     logon_mode = str(task.get("logon_mode", "") or "").lower()
+    if "background" in logon_mode or "后台" in logon_mode or "s4u" in logon_mode:
+        return False
     return "interactive" in logon_mode or "交互" in logon_mode
 
 
@@ -479,6 +481,16 @@ def build_task_repair_commands(scheduler_config: Dict[str, Any]) -> list[Dict[st
             ),
         }
     )
+    commands.append(
+        {
+            "name": "repair_all_scheduled_tasks_s4u",
+            "purpose": "Delete legacy tasks and rebuild S4U/background tasks without storing a Windows password.",
+            "command": (
+                "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                f"{_quote_command_arg(repair_script)} -UseS4U -NoPrompt"
+            ),
+        }
+    )
     for task_name in legacy_task_names:
         if task_name:
             commands.append(
@@ -495,6 +507,16 @@ def build_task_repair_commands(scheduler_config: Dict[str, Any]) -> list[Dict[st
             "command": (
                 "powershell -NoProfile -ExecutionPolicy Bypass -File "
                 f"{_quote_command_arg(offline_script)}"
+            ),
+        }
+    )
+    commands.append(
+        {
+            "name": "rebuild_s4u_background_tasks",
+            "purpose": "Recreate 12:00 and 21:00 tasks in S4U/background mode without storing a Windows password.",
+            "command": (
+                "powershell -NoProfile -ExecutionPolicy Bypass -File "
+                f"{_quote_command_arg(offline_script)} -UseS4U"
             ),
         }
     )
@@ -1327,6 +1349,7 @@ def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any])
         "powershell -NoProfile -ExecutionPolicy Bypass -File "
         f"{_quote_command_arg(repair_script)}"
     )
+    s4u_repair_script_command = f"{repair_script_command} -UseS4U -NoPrompt"
 
     action_items: list[Dict[str, Any]] = [
         {
@@ -1355,6 +1378,22 @@ def build_repair_plan(payload: Dict[str, Any], scheduler_config: Dict[str, Any])
             }
         )
     if repair_candidates:
+        if not password_present:
+            action_items.append(
+                {
+                    "step": len(action_items) + 1,
+                    "name": "rebuild_s4u_background_tasks",
+                    "description": (
+                        "Rebuild send, doctor, and preflight tasks in S4U/background mode without storing a password. "
+                        "This avoids InteractiveToken-only failures but may have fewer network privileges than password mode."
+                    ),
+                    "command": s4u_repair_script_command,
+                    "destructive": True,
+                    "requires_password": False,
+                    "blocked": False,
+                    "tasks": [str(candidate.get("task_name", "") or "") for candidate in repair_candidates],
+                }
+            )
         action_items.append(
             {
                 "step": len(action_items) + 1,

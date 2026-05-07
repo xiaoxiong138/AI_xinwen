@@ -580,6 +580,9 @@ class SchedulerRunnerTests(unittest.TestCase):
     def test_is_interactive_task_detects_chinese_and_english_logon_modes(self):
         self.assertTrue(is_interactive_task({"logon_mode": "只使用交互方式"}))
         self.assertTrue(is_interactive_task({"logon_mode": "Interactive only"}))
+        self.assertFalse(is_interactive_task({"logon_mode": "交互方式/后台方式"}))
+        self.assertFalse(is_interactive_task({"logon_mode": "Interactive/Background"}))
+        self.assertFalse(is_interactive_task({"logon_mode": "S4U"}))
         self.assertFalse(is_interactive_task({"logon_mode": "Password"}))
 
     def test_build_monitored_task_names_includes_auxiliary_tasks_once(self):
@@ -745,11 +748,10 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(payload["overall"], "warn")
         self.assertEqual(payload["counts"]["fail"], 0)
-        self.assertEqual(payload["counts"]["warn"], 3)
+        self.assertEqual(payload["counts"]["warn"], 2)
         warned = [item for item in payload["checks"] if item["level"] == "warn"]
         self.assertTrue(any("Web_Agent_Send_1200" in item["name"] for item in warned))
         self.assertTrue(any(item["name"] == "task_repair_commands" for item in warned))
-        self.assertTrue(any(item["name"] == "send_calendar" for item in warned))
         self.assertTrue(any("setup_offline_tasks.ps1" in command["command"] for command in payload["repair_commands"]))
 
     def test_build_doctor_payload_reports_missing_email_as_failure(self):
@@ -1062,6 +1064,8 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertIn("schtasks /Delete /TN Web_Agent_Send_1200 /F", command_text)
         self.assertIn("schtasks /Delete /TN Web_Agent_Send_2100 /F", command_text)
         self.assertIn("setup_offline_tasks.ps1", command_text)
+        self.assertIn("repair_scheduled_tasks.ps1 -UseS4U -NoPrompt", command_text)
+        self.assertIn("setup_offline_tasks.ps1 -UseS4U", command_text)
         self.assertIn("scheduler_runner.py", command_text)
 
     def test_run_task_self_heal_supports_dry_run(self):
@@ -1183,10 +1187,15 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertIn("--cleanup-legacy-tasks", cleanup["command"])
         self.assertIn("--confirm", cleanup["command"])
         self.assertIn("task_backups", cleanup["backup_dir"])
+        s4u_rebuild = next(item for item in plan["action_items"] if item["name"] == "rebuild_s4u_background_tasks")
+        self.assertFalse(s4u_rebuild["blocked"])
+        self.assertFalse(s4u_rebuild["requires_password"])
+        self.assertIn("-UseS4U", s4u_rebuild["command"])
         rebuild = next(item for item in plan["action_items"] if item["name"] == "rebuild_offline_tasks")
         self.assertTrue(rebuild["blocked"])
         text = build_repair_plan_text(plan)
         self.assertIn("delete_legacy_tasks", text)
+        self.assertIn("rebuild_s4u_background_tasks", text)
         self.assertIn("rebuild_offline_tasks", text)
         self.assertIn("WEB_AGENT_TEST_PASSWORD", text)
 

@@ -6,6 +6,7 @@ param(
     [string]$DoctorTime = "09:00",
     [string]$PreflightTime = "20:30",
     [string]$RunAsPassword = "",
+    [switch]$UseS4U,
     [switch]$NoPrompt
 )
 
@@ -52,7 +53,7 @@ Export-TaskBackupIfExists -TaskName "Web_Agent_Send_2100" -BackupRoot $backupRoo
 Remove-TaskIfExists -TaskName "Web_Agent_Send_1200"
 Remove-TaskIfExists -TaskName "Web_Agent_Send_2100"
 
-if (-not $password) {
+if (-not $UseS4U -and -not $password) {
     $envPassword = [Environment]::GetEnvironmentVariable("WEB_AGENT_RUNAS_PASSWORD")
     if ($envPassword) {
         $password = $envPassword
@@ -64,7 +65,7 @@ if (-not $RunAsUser -and $envUser) {
     $credentialUserName = $envUser
 }
 
-if (-not $password) {
+if (-not $UseS4U -and -not $password) {
     if ($NoPrompt) {
         throw "Missing Windows password. Set WEB_AGENT_RUNAS_PASSWORD or rerun without -NoPrompt."
     }
@@ -73,15 +74,27 @@ if (-not $password) {
     $password = $credential.GetNetworkCredential().Password
 }
 
-Write-Host "Rebuilding offline-capable Web_Agent tasks for $credentialUserName..."
-& (Join-Path $root "setup_offline_tasks.ps1") `
-    -RunAsUser $credentialUserName `
-    -RunAsPassword $password `
-    -PythonExe $PythonExe `
-    -NoonTime $NoonTime `
-    -EveningTime $EveningTime `
-    -DoctorTime $DoctorTime `
-    -PreflightTime $PreflightTime
+if ($UseS4U) {
+    Write-Host "Rebuilding S4U/background Web_Agent tasks for $credentialUserName..."
+    & (Join-Path $root "setup_offline_tasks.ps1") `
+        -RunAsUser $credentialUserName `
+        -UseS4U `
+        -PythonExe $PythonExe `
+        -NoonTime $NoonTime `
+        -EveningTime $EveningTime `
+        -DoctorTime $DoctorTime `
+        -PreflightTime $PreflightTime
+} else {
+    Write-Host "Rebuilding offline-capable Web_Agent tasks for $credentialUserName..."
+    & (Join-Path $root "setup_offline_tasks.ps1") `
+        -RunAsUser $credentialUserName `
+        -RunAsPassword $password `
+        -PythonExe $PythonExe `
+        -NoonTime $NoonTime `
+        -EveningTime $EveningTime `
+        -DoctorTime $DoctorTime `
+        -PreflightTime $PreflightTime
+}
 
 $python = if ($PythonExe) { $PythonExe } elseif (Test-Path "D:\python\python.exe") { "D:\python\python.exe" } else { "python" }
 Write-Host "Recording fresh doctor snapshot..."

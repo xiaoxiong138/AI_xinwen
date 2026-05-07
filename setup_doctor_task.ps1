@@ -3,7 +3,8 @@ param(
     [string]$At = "09:00",
     [string]$PythonExe = "",
     [string]$RunAsUser = "",
-    [string]$RunAsPassword = ""
+    [string]$RunAsPassword = "",
+    [switch]$UseS4U
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,13 +31,21 @@ function Remove-TaskIfExists {
     cmd /c "schtasks /Delete /TN `"$Name`" /F >nul 2>nul" | Out-Null
 }
 
+function Invoke-Schtasks {
+    param([string[]]$Arguments)
+    & schtasks @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "schtasks failed with exit code ${LASTEXITCODE}: schtasks $($Arguments -join ' ')"
+    }
+}
+
 function New-InteractiveTask {
     param(
         [string]$Name,
         [string]$Time,
         [string]$TaskCommand
     )
-    schtasks /Create /TN $Name /SC DAILY /ST $Time /TR $TaskCommand /RL LIMITED /IT /F | Out-Null
+    Invoke-Schtasks -Arguments @("/Create", "/TN", $Name, "/SC", "DAILY", "/ST", $Time, "/TR", $TaskCommand, "/RL", "LIMITED", "/IT", "/F")
 }
 
 function New-PasswordTask {
@@ -47,7 +56,17 @@ function New-PasswordTask {
         [string]$UserName,
         [string]$Password
     )
-    schtasks /Create /TN $Name /SC DAILY /ST $Time /TR $TaskCommand /RU $UserName /RP $Password /F | Out-Null
+    Invoke-Schtasks -Arguments @("/Create", "/TN", $Name, "/SC", "DAILY", "/ST", $Time, "/TR", $TaskCommand, "/RU", $UserName, "/RP", $Password, "/F")
+}
+
+function New-S4UTask {
+    param(
+        [string]$Name,
+        [string]$Time,
+        [string]$TaskCommand,
+        [string]$UserName
+    )
+    Invoke-Schtasks -Arguments @("/Create", "/TN", $Name, "/SC", "DAILY", "/ST", $Time, "/TR", $TaskCommand, "/RU", $UserName, "/NP", "/RL", "LIMITED", "/F")
 }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -62,8 +81,12 @@ $createdMode = ""
 if ($RunAsPassword) {
     New-PasswordTask -Name $TaskName -Time $At -TaskCommand $taskCommand -UserName $currentUser -Password $RunAsPassword
     $createdMode = "password"
+} elseif ($UseS4U) {
+    Write-Warning "Creating S4U/background doctor task without storing a password."
+    New-S4UTask -Name $TaskName -Time $At -TaskCommand $taskCommand -UserName $currentUser
+    $createdMode = "s4u"
 } else {
-    Write-Warning "Creating InteractiveToken doctor task because S4U/background mode breaks network access for this project. To enable true offline/background execution, rerun this script with -RunAsPassword."
+    Write-Warning "Creating InteractiveToken doctor task. Rerun with -UseS4U to avoid InteractiveToken-only failures, or with -RunAsPassword for strongest offline/background execution."
     New-InteractiveTask -Name $TaskName -Time $At -TaskCommand $taskCommand
     $createdMode = "interactive"
 }
