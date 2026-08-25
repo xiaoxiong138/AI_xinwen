@@ -3,6 +3,8 @@
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 import feedparser
 
@@ -96,28 +98,69 @@ class WebSearchCollector(BaseCollector):
             snippet = entry.get("summary", "") or title
             if not url or url in seen_urls:
                 continue
+            canonical_url = self._canonicalize_google_news_url(entry, url)
+            if canonical_url in seen_urls:
+                continue
             if not is_ai_web_content(title, snippet):
                 continue
-            seen_urls.add(url)
-            platform = forced_platform or infer_platform(url, name)
+            seen_urls.add(canonical_url)
+            platform = forced_platform or infer_platform(canonical_url, name)
             results.append(
                 {
                     "source": "Web Search",
                     "source_detail": name,
                     "title": title,
-                    "url": url,
+                    "url": canonical_url,
                     "content": clean_snippet(snippet, limit=600),
                     "publish_date": published_dt.isoformat(),
                     "author": platform,
                     "content_type": content_type,
                     "platform": platform,
                     "topic": topic,
+                    "original_url": url if canonical_url != url else "",
                 }
             )
             added += 1
             if added >= max_results:
                 break
         return added
+
+    def _canonicalize_google_news_url(self, entry: Any, url: str) -> str:
+        if urlparse(url or "").netloc.lower() != "news.google.com":
+            return url
+        for candidate in self._google_news_candidate_urls(entry, url):
+            if candidate and urlparse(candidate).netloc.lower() != "news.google.com":
+                return candidate
+        try:
+            request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request, timeout=8) as response:
+                resolved_url = response.geturl()
+            if resolved_url and urlparse(resolved_url).netloc.lower() != "news.google.com":
+                return resolved_url
+        except Exception:
+            return url
+        return url
+
+    def _google_news_candidate_urls(self, entry: Any, url: str) -> List[str]:
+        candidates: List[str] = []
+        parsed = urlparse(url or "")
+        query = parse_qs(parsed.query)
+        for key in ("url", "u"):
+            for value in query.get(key, []):
+                decoded = unquote(value)
+                if decoded.startswith("http"):
+                    candidates.append(decoded)
+        source = entry.get("source", {}) if hasattr(entry, "get") else {}
+        if isinstance(source, dict):
+            href = source.get("href")
+            if isinstance(href, str) and href.startswith("http"):
+                candidates.append(href)
+        for link in entry.get("links", []) if hasattr(entry, "get") else []:
+            if isinstance(link, dict):
+                href = link.get("href", "")
+                if href.startswith("http"):
+                    candidates.append(href)
+        return candidates
 
     def _parse_entry_date(self, entry: Any) -> datetime:
         if hasattr(entry, "published_parsed") and entry.published_parsed:

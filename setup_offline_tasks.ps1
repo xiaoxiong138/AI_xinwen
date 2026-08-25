@@ -1,7 +1,7 @@
 param(
     [string]$RunAsUser = "",
     [string]$PythonExe = "",
-    [string]$NoonTime = "12:00",
+    [string]$NoonTime = "13:00",
     [string]$EveningTime = "21:00",
     [string]$DoctorTime = "09:00",
     [string]$PreflightTime = "20:30",

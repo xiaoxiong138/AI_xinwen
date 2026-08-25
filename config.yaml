@@ -7,22 +7,26 @@
       - cs.CV
       - cs.LG
       - eess.SY
-    max_results: 20
-    candidate_pool: 220
+    max_results: 56
+    candidate_pool: 500
     days_back: 1
     fallback_days:
       - 1
       - 3
-      - 7
-      - 14
     topic_limits:
-      Physical AI: 5
-      World Model: 5
-      Robotics: 5
+      Physical AI: 12
+      World Model: 12
+      Robotics: 12
+      Agent / Models: 10
+      Multimodal / Video: 8
+      Infra / Efficient AI: 8
     topic_queries:
       Physical AI: all:"physical ai" OR all:"embodied ai" OR all:"vision-language-action" OR all:"robot foundation model" OR all:"embodied agent" OR all:"diffusion policy"
       World Model: all:"world model" OR all:"world models" OR all:"video prediction" OR all:"predictive model" OR all:"latent dynamics" OR all:"dynamics model"
       Robotics: cat:cs.RO OR all:robotics OR all:robot OR all:humanoid OR all:manipulation OR all:locomotion
+      Agent / Models: all:"AI agent" OR all:"language model agent" OR all:"tool use" OR all:"reasoning model" OR all:"agentic workflow"
+      Multimodal / Video: all:"multimodal model" OR all:"video generation" OR all:"video understanding" OR all:"vision language model"
+      Infra / Efficient AI: all:"efficient inference" OR all:"model compression" OR all:"quantization" OR all:"distributed training" OR all:"mixture of experts"
   rss:
     enabled: true
     days_back: 2
@@ -98,6 +102,11 @@
     enabled: true
     locale: US:en
     days_back: 1
+    degradation:
+      enabled: true
+      empty_success_threshold: 5
+      lookback_runs: 5
+      recovery_interval_hours: 24
     fallback_days:
       - 1
       - 2
@@ -109,20 +118,91 @@
         content_type: news
         max_results: 8
       - name: Robotics AI News
-        query: robotics AI
+        query: robotics AI humanoid robot deployment
         platform: News
         content_type: news
-        max_results: 8
+        max_results: 10
       - name: World Model News
         query: world model AI
         platform: News
         content_type: news
         max_results: 6
+      - name: World Model Training Tech DeepMind
+        query: DeepMind Genie world model video prediction robotics planning
+        platform: Website
+        content_type: news
+        max_results: 12
+        fallback_days: [3, 7, 14, 30]
+      - name: World Model Training Tech Meta JEPA
+        query: JEPA predictive learning LeCun world model
+        platform: Website
+        content_type: news
+        max_results: 10
+        fallback_days: [7, 14, 30, 60]
+      - name: World Model Robotics Policy Tech
+        query: world model robot learning policy simulation planning
+        platform: Website
+        content_type: news
+        max_results: 10
+        fallback_days: [3, 7, 14, 30]
+      - name: World Model AI Leader Interviews
+        query: LeCun world model interview
+        platform: Website
+        content_type: news
+        max_results: 8
+        fallback_days: [30, 60, 90]
+      - name: World Model Technical Essays
+        query: world models robotics AI essay prediction planning
+        platform: Website
+        content_type: news
+        max_results: 10
+        fallback_days: [3, 7, 14, 30]
+      - name: World Model Research Systems
+        query: world model training video prediction action planning
+        platform: Website
+        content_type: news
+        max_results: 10
+        fallback_days: [3, 7, 14, 30]
       - name: Physical AI News
-        query: physical AI robotics
+        query: physical AI robotics embodied AI
         platform: News
         content_type: news
-        max_results: 6
+        max_results: 10
+      - name: Physical AI Industry
+        query: physical AI humanoid robotics startup deployment
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: Embodied AI Robotics
+        query: embodied AI robots manipulation warehouse manufacturing
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: Humanoid Robot AI
+        query: humanoid robot AI foundation model deployment
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: Humanoid Warehouse Deployment
+        query: humanoid robot warehouse deployment logistics AI
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: Robot Foundation Model Deployment
+        query: robot foundation model real world deployment
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: VLA Robot Real World
+        query: VLA robot manipulation real world deployment
+        platform: News
+        content_type: news
+        max_results: 8
+      - name: Industrial Robotics AI Deployment
+        query: industrial robotics AI deployment manufacturing warehouse
+        platform: News
+        content_type: news
+        max_results: 8
       - name: Open Source AI
         query: open source LLM
         platform: Website
@@ -133,6 +213,46 @@
         platform: News
         content_type: news
         max_results: 6
+      - name: Primary AI Research Releases
+        query: site:research.google OR site:deepmind.google OR site:ai.meta.com AI model robotics research
+        platform: Website
+        content_type: news
+        max_results: 12
+      - name: OpenAI Technical Releases
+        query: site:openai.com research model system card API release
+        platform: Website
+        content_type: news
+        max_results: 8
+      - name: Anthropic Technical Releases
+        query: site:anthropic.com research engineering model release
+        platform: Website
+        content_type: news
+        max_results: 8
+      - name: NVIDIA AI Engineering
+        query: site:developer.nvidia.com OR site:research.nvidia.com AI inference robotics model
+        platform: Website
+        content_type: news
+        max_results: 8
+      - name: Microsoft AWS AI Engineering
+        query: site:microsoft.com/research OR site:aws.amazon.com/blogs/machine-learning AI model agent infrastructure
+        platform: Website
+        content_type: news
+        max_results: 10
+      - name: Hugging Face Model Releases
+        query: site:huggingface.co/blog OR site:huggingface.co/papers model release robotics agent inference
+        platform: Website
+        content_type: news
+        max_results: 10
+      - name: OpenReview AI Papers
+        query: site:openreview.net AI agent robotics world model multimodal
+        platform: Website
+        content_type: paper
+        max_results: 12
+      - name: GitHub AI Model Releases
+        query: site:github.com AI model release robotics agent inference
+        platform: Website
+        content_type: news
+        max_results: 12
       - name: AI on YouTube
         query: site:youtube.com AI robotics
         platform: YouTube
@@ -141,8 +261,13 @@
 llm:
   api_key_env: DEEPSEEK_API_KEY
   base_url: https://api.deepseek.com
-  model: deepseek-chat
+  model: deepseek-v4-pro
+  fallback_model: deepseek-chat
+  primary_mode: fact_extraction
+  primary_thinking: disabled
   temperature: 0.2
+  timeout_seconds: 20
+  force_json_response: true
 network:
   timeout_seconds: 25
   collector_timeout_seconds: 90
@@ -153,26 +278,85 @@ email:
     imap_server: ""
     imap_port: 993
     mailbox: INBOX
+    mailboxes:
+      - INBOX
     since_minutes: 30
     timeout_seconds: 25
+    retry_attempts: 3
+    retry_delay_seconds: 8
 report:
   title: AI Frontier Intelligence Daily
-  paper_limit: 15
+  product_mode: intelligence_v10_learning_digest
+  reading_mode: detailed_15min
+  design_version: v10-learning-digest
+  email_client_mode: compatible
+  paper_limit: 25
+  research_limit: 25
+  paper_featured_limit: 10
+  paper_appendix_limit: 15
+  min_visible_paper_count: 10
+  paper_target_min_count: 18
+  paper_target_max_count: 25
+  min_visible_information_count: 20
+  physical_ai_min_items: 4
+  paper_technical_intro_min_count: 4
+  physical_ai_featured_min_count: 2
   paper_enrichment_cache_hours: 168
   paper_backfill_hours: 168
   paper_backfill_hours_ladder:
     - 72
-    - 168
-  min_web_items: 20
+  paper_fresh_candidate_hours: 72
+  paper_domain_quotas:
+    world_model:
+      min: 4
+      max: 6
+    physical_ai:
+      min: 5
+      max: 8
+    agent_models:
+      min: 3
+      max: 5
+    infra_open_source:
+      min: 2
+      max: 4
+    other:
+      min: 2
+      max: 4
+  min_web_items: 30
   web_backfill_hours: 24
   web_backfill_hours_ladder:
     - 24
     - 48
     - 72
-  web_limit: 20
+    - 168
+  web_limit: 45
+  v8_focus_candidate_target: 12
+  v8_focus_source_target: 6
+  v8_focus_domain_target: 4
   top_update_limit: 5
   focus_update_limit: 10
   brief_update_limit: 15
+  must_read_limit: 10
+  domain_item_limit: 4
+  brief_limit: 3
+  total_visible_chars_min: 10000
+  total_visible_chars_max: 20000
+  memory_total_char_limit: 240
+  news_body_char_limit: 180
+  paper_plain_summary_char_min: 100
+  paper_plain_summary_char_max: 170
+  paper_body_char_min: 120
+  paper_body_char_limit: 300
+  source_focus_limit: 6
+  topic_focus_limit: 12
+  continuity_lookback_days: 14
+  continuity_history_limit: 800
+  suppress_repeated_focus: true
+  paper_freshness_enabled: true
+  paper_repeat_cooldown_days: 7
+  paper_repeat_history_limit: 1600
+  reading_queue_limit: 5
+  weekly_digest_weekday: 0
 source_preferences:
   whitelist_hosts:
     - openai.com
@@ -180,6 +364,10 @@ source_preferences:
     - deepmind.google
     - google.com
     - huggingface.co
+    - openreview.net
+    - github.com
+    - ai.meta.com
+    - research.google
     - blogs.nvidia.com
     - aws.amazon.com
     - microsoft.com
@@ -194,20 +382,39 @@ source_preferences:
     - youtu.be
     - msn.com
     - blockchain-council.org
+    - twincities.com
+    - wral.com
+    - kdhnews.com
+    - mdjonline.com
+    - wowktv.com
+    - letsdatascience.com
+    - kucoin.com
+    - simplilearn.com
   source_weights:
     openai.com: 2.5
     anthropic.com: 2.3
     deepmind.google: 2.3
+    research.google: 2.2
+    ai.meta.com: 2.1
     huggingface.co: 2.0
+    openreview.net: 2.1
+    github.com: 1.9
+    ai.meta.com: 2.2
+    research.google: 2.2
     blogs.nvidia.com: 2.1
+    developer.nvidia.com: 2.2
+    nvidianews.nvidia.com: 1.8
     aws.amazon.com: 1.8
     microsoft.com: 1.7
+    axios.com: 1.1
     techcrunch.com: 1.3
     venturebeat.com: 1.2
     marktechpost.com: 1.2
     unite.ai: 1.0
     youtube.com: -1.6
     youtu.be: -1.6
+    techtimes.com: -0.4
+    eu.36kr.com: -0.2
   platform_weights:
     Blog: 1.0
     News: 0.8
@@ -225,6 +432,7 @@ source_preferences:
     视频解读: -0.5
     应用落地: 0.6
 preferences:
+  feedback_lookback_days: 30
   content_type_weights:
     paper: 1.4
     news: 1.0
@@ -252,6 +460,44 @@ preferences:
     chip: 0.6
     inference: 0.5
     open source: 0.5
+quality_gate:
+  enabled: true
+  v10_enabled: true
+  v8_enabled: true
+  v3_enabled: true
+  editorial_enabled: true
+  block_mixed_language_titles: true
+  block_field_label_leaks: true
+  auto_rewrite_once: true
+  max_auto_rewrite_items: 6
+  max_model_path_backfill_items: 8
+  max_repeated_sentence_count: 1
+  max_opening_repeat_count: 3
+  block_send_on_final_failure: true
+  allow_degraded_send_on_soft_failure: true
+  final_html_bad_title_count: 0
+  untranslated_fact_count: 0
+  exact_duplicate_sentence_count: 1
+  paper_mechanism_missing_count: 0
+  paper_result_context_missing_count: 0
+  appendix_body_overlap_count: 0
+  truncated_focus_text_count: 0
+  paper_intro_length_fail_count: 0
+  low_value_module_count: 0
+  title_only_item_count: 0
+  generic_phrase_count: 0
+  unsupported_claim_count: 0
+  duplicate_event_ratio_max: 0.08
+  primary_source_ratio_min: 0.70
+  paper_plain_summary_pass_rate_min: 1.0
+  min_visible_paper_count: 10
+  adjacent_report_paper_overlap_max: 0.10
+  min_visible_information_count: 20
+  focus_source_concentration_max: 0.30
+feedback:
+  enabled: true
+  host: 127.0.0.1
+  port: 18765
 alerts:
   enabled: true
   recipients_env: EMAIL_RECIPIENT
@@ -266,6 +512,7 @@ trends:
   max_items: 5
   min_occurrences: 2
 observability:
+  arxiv_collection_stale_hours: 36
   source_health_history_limit: 160
   require_production_diagnostics: true
   source_health_weighting:
@@ -279,6 +526,11 @@ archive:
   report_dir: archive
   output_html: reports_index.html
   output_markdown: reports_index.md
+database:
+  path: C:/Users/zhiwang/AppData/Local/Web_Agent/data/ai_news.db
+runtime:
+  max_unprocessed_items: 28
+  max_analysis_backfill_items: 4
 scheduler:
   log_dir: logs
   status_file: logs/last_run.json
@@ -294,20 +546,21 @@ scheduler:
   offline_task_setup_script: setup_offline_tasks.ps1
   repair_task_script: repair_scheduled_tasks.ps1
   task_names:
-    - Web_Agent_Send_1200_v2
+    - Web_Agent_Send_1300_v2
     - Web_Agent_Send_2100_v2
   legacy_task_names:
     - Web_Agent_Send_1200
+    - Web_Agent_Send_1200_v2
     - Web_Agent_Send_2100
-  monitor_auxiliary_tasks: true
-  require_offline_tasks: true
+  monitor_auxiliary_tasks: false
+  require_offline_tasks: false
   run_as_user_env: WEB_AGENT_RUNAS_USER
   run_as_password_env: WEB_AGENT_RUNAS_PASSWORD
   send_slot_dir: logs/send_slots
   send_slot_stale_seconds: 10800
   send_slots:
-    - id: "1200"
-      time: "12:00"
+    - id: "1300"
+      time: "13:00"
     - id: "2100"
       time: "21:00"
   send_window_before_minutes: 10
@@ -333,5 +586,7 @@ scheduler:
   send_failure_email: false
   send_doctor_alert_email: false
   doctor_warn_streak_threshold: 2
+  minimum_free_disk_mb: 512
+  critical_free_disk_mb: 8
   failure_email_subject_prefix: "[AI日报调度失败]"
   doctor_alert_subject_prefix: "[AI日报健康检查告警]"

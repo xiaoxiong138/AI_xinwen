@@ -1,13 +1,13 @@
 param(
-    [string]$TaskNameNoon = "Web_Agent_Send_1200_v2",
+    [string]$TaskNameNoon = "Web_Agent_Send_1300_v2",
     [string]$TaskNameEvening = "Web_Agent_Send_2100_v2",
-    [string]$NoonTime = "12:00",
+    [string]$NoonTime = "13:00",
     [string]$EveningTime = "21:00",
     [string]$PythonExe = "",
     [string]$RunAsUser = "",
     [string]$RunAsPassword = "",
     [switch]$UseS4U,
-    [string[]]$LegacyTaskNames = @("Web_Agent_Send_1200", "Web_Agent_Send_2100")
+    [string[]]$LegacyTaskNames = @("Web_Agent_Send_1200", "Web_Agent_Send_1200_v2", "Web_Agent_Send_2100")
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,10 +72,48 @@ function New-S4UTask {
     Invoke-Schtasks -Arguments @("/Create", "/TN", $TaskName, "/SC", "DAILY", "/ST", $At, "/TR", $TaskCommand, "/RU", $UserName, "/NP", "/RL", "LIMITED", "/F")
 }
 
+function Optimize-TaskRuntimeSettings {
+    param(
+        [string]$TaskName,
+        [string]$PythonPath,
+        [string]$RunnerPath,
+        [string]$WorkingDirectory,
+        [string]$HiddenLauncherPath
+    )
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) -or
+        -not (Get-Command Set-ScheduledTask -ErrorAction SilentlyContinue) -or
+        -not (Get-Command New-ScheduledTaskAction -ErrorAction SilentlyContinue)) {
+        Write-Warning "ScheduledTasks module is unavailable; runtime settings were not optimized for $TaskName."
+        return
+    }
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $task.Settings.DisallowStartIfOnBatteries = $false
+    $task.Settings.StopIfGoingOnBatteries = $false
+    $task.Settings.StartWhenAvailable = $true
+    $task.Settings.ExecutionTimeLimit = "PT2H"
+    $task.Settings.RestartCount = 3
+    $task.Settings.RestartInterval = "PT5M"
+    $task.Settings.IdleSettings.StopOnIdleEnd = $false
+    $task.Settings.IdleSettings.RestartOnIdle = $false
+    $action = New-ScheduledTaskAction `
+        -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $HiddenLauncherPath + '" -PythonExe "' + $PythonPath + '" -RunnerPath "' + $RunnerPath + '" -WorkingDirectory "' + $WorkingDirectory + '"') `
+        -WorkingDirectory $WorkingDirectory
+    Set-ScheduledTask -TaskName $TaskName -Action $action -Settings $task.Settings | Out-Null
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Resolve-PythonExe -Candidate $PythonExe
 $runner = Join-Path $root "scheduler_runner.py"
-$taskCommand = '"' + $python + '" "' + $runner + '"'
+$hiddenLauncher = Join-Path $root "run_scheduler_hidden.ps1"
+if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+    throw "Scheduler runner not found: $runner"
+}
+if (-not (Test-Path -LiteralPath $hiddenLauncher -PathType Leaf)) {
+    throw "Hidden scheduler launcher not found: $hiddenLauncher"
+}
+$taskCommand = 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $hiddenLauncher + '" -PythonExe "' + $python + '"'
 $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
 
 Remove-TaskIfExists -TaskName $TaskNameNoon
@@ -102,6 +140,9 @@ if ($RunAsPassword) {
     New-InteractiveTask -TaskName $TaskNameEvening -At $EveningTime -TaskCommand $taskCommand
     $createdMode = "interactive"
 }
+
+Optimize-TaskRuntimeSettings -TaskName $TaskNameNoon -PythonPath $python -RunnerPath $runner -WorkingDirectory $root -HiddenLauncherPath $hiddenLauncher
+Optimize-TaskRuntimeSettings -TaskName $TaskNameEvening -PythonPath $python -RunnerPath $runner -WorkingDirectory $root -HiddenLauncherPath $hiddenLauncher
 
 Write-Host "Created tasks using mode: $createdMode"
 schtasks /Query /TN $TaskNameNoon /FO LIST /V

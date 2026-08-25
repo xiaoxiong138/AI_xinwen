@@ -1,7 +1,7 @@
 param(
     [string]$RunAsUser = "",
     [string]$PythonExe = "",
-    [string]$NoonTime = "12:00",
+    [string]$NoonTime = "13:00",
     [string]$EveningTime = "21:00",
     [string]$DoctorTime = "09:00",
     [string]$PreflightTime = "20:30",
@@ -33,10 +33,12 @@ function Export-TaskBackupIfExists {
     $safeName = $TaskName.Replace("\", "_").Replace("/", "_")
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $backupPath = Join-Path $BackupRoot "$safeName`_$stamp.xml"
-    $xml = schtasks /Query /TN $TaskName /XML 2>$null
+    $xml = cmd /c "schtasks /Query /TN `"$TaskName`" /XML 2>nul"
     if ($LASTEXITCODE -eq 0 -and $xml) {
         $xml | Out-File -FilePath $backupPath -Encoding UTF8
         Write-Host "Backed up $TaskName to $backupPath"
+    } else {
+        Write-Host "No existing task found for $TaskName; skipping backup."
     }
 }
 

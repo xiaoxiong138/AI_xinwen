@@ -69,10 +69,35 @@ function New-S4UTask {
     Invoke-Schtasks -Arguments @("/Create", "/TN", $Name, "/SC", "DAILY", "/ST", $Time, "/TR", $TaskCommand, "/RU", $UserName, "/NP", "/RL", "LIMITED", "/F")
 }
 
+function Optimize-TaskRuntimeSettings {
+    param(
+        [string]$Name,
+        [string]$PythonPath,
+        [string]$RunnerPath,
+        [string]$WorkingDirectory,
+        [string]$HiddenLauncherPath
+    )
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
+    $task.Settings.DisallowStartIfOnBatteries = $false
+    $task.Settings.StopIfGoingOnBatteries = $false
+    $task.Settings.StartWhenAvailable = $true
+    $task.Settings.ExecutionTimeLimit = "PT30M"
+    $task.Settings.RestartCount = 3
+    $task.Settings.RestartInterval = "PT5M"
+    $task.Settings.IdleSettings.StopOnIdleEnd = $false
+    $task.Settings.IdleSettings.RestartOnIdle = $false
+    $action = New-ScheduledTaskAction `
+        -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $HiddenLauncherPath + '" -PythonExe "' + $PythonPath + '" -RunnerPath "' + $RunnerPath + '" -WorkingDirectory "' + $WorkingDirectory + '" --doctor --record') `
+        -WorkingDirectory $WorkingDirectory
+    Set-ScheduledTask -TaskName $Name -Action $action -Settings $task.Settings | Out-Null
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Resolve-PythonExe -Candidate $PythonExe
 $runner = Join-Path $root "scheduler_runner.py"
-$taskCommand = '"' + $python + '" "' + $runner + '" --doctor --record --self-heal'
+$hiddenLauncher = Join-Path $root "run_scheduler_hidden.ps1"
+$taskCommand = 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $hiddenLauncher + '" -PythonExe "' + $python + '" --doctor --record'
 $currentUser = if ($RunAsUser) { $RunAsUser } else { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
 
 Remove-TaskIfExists -Name $TaskName
@@ -90,6 +115,8 @@ if ($RunAsPassword) {
     New-InteractiveTask -Name $TaskName -Time $At -TaskCommand $taskCommand
     $createdMode = "interactive"
 }
+
+Optimize-TaskRuntimeSettings -Name $TaskName -PythonPath $python -RunnerPath $runner -WorkingDirectory $root -HiddenLauncherPath $hiddenLauncher
 
 Write-Host "Created preflight task using mode: $createdMode"
 schtasks /Query /TN $TaskName /FO LIST /V

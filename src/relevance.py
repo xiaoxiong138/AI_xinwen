@@ -115,6 +115,7 @@ LOW_SIGNAL_TITLE_PATTERNS = [
 ]
 
 LOW_SIGNAL_HOST_HINTS = (
+    "news.google.com",
     "youtube.com",
     "youtu.be",
     "msn.com",
@@ -358,6 +359,10 @@ def score_update_quality(
 
     if any(hint in host for hint in LOW_SIGNAL_HOST_HINTS):
         score -= 1.4
+    if host == "news.google.com" or "google news" in source_detail:
+        score -= 1.6
+        if len(clean_snippet(content, 500)) < 180:
+            score -= 0.8
     if platform == "youtube":
         score -= 0.8
     if len(re.findall(r"[A-Z]{4,}", title or "")) >= 2:
@@ -449,6 +454,8 @@ def is_low_signal_update(
             token in lowered_title
             for token in ["best", "top", "vs", "roundup", "review", "guide", "actually works", "adventures"]
         )
+    if host == "news.google.com" or "google news" in (source_detail or "").lower():
+        return quality_score < 2.0
     return False
 
 

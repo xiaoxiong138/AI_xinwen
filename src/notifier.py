@@ -1,11 +1,14 @@
 import imaplib
+import re
 import smtplib
 import time
 from datetime import datetime, timedelta
+from email import policy
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.parser import BytesParser
+from email.utils import parseaddr, parsedate_to_datetime
 
 
 class EmailNotifier:
@@ -82,6 +85,69 @@ def _decode_header_text(value: str) -> str:
     return "".join(decoded)
 
 
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _subject_match_variants(subject: str) -> list[str]:
+    normalized = str(subject or "").strip()
+    variants = [normalized]
+    without_timestamp = re.sub(r"^\[[^\]]*\]\s*", "", normalized).strip()
+    if without_timestamp and without_timestamp not in variants:
+        variants.append(without_timestamp)
+    for marker in ("AI Frontier Intelligence Daily", "AI日报", "AI 日报"):
+        if marker.lower() in normalized.lower() and marker not in variants:
+            variants.append(marker)
+    return [variant for variant in variants if variant]
+
+
+def _subject_matches(expected: str, actual: str) -> bool:
+    timestamp_pattern = r"^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]"
+    expected_timestamp = re.match(timestamp_pattern, str(expected or "").strip())
+    actual_timestamp = re.match(timestamp_pattern, str(actual or "").strip())
+    if expected_timestamp and actual_timestamp and expected_timestamp.group(1) != actual_timestamp.group(1):
+        return False
+    if expected_timestamp and not actual_timestamp and str(actual or "").lstrip().startswith("["):
+        return False
+    actual_norm = _normalize_match_text(actual)
+    if not actual_norm:
+        return False
+    for variant in _subject_match_variants(expected):
+        variant_norm = _normalize_match_text(variant)
+        if variant_norm and (variant_norm in actual_norm or actual_norm in variant_norm):
+            return True
+        tokens = [token for token in re.split(r"\W+", variant_norm) if len(token) >= 3]
+        if len(tokens) >= 3 and sum(1 for token in tokens if token in actual_norm) >= min(3, len(tokens)):
+            return True
+    return False
+
+
+def _parse_header_bytes(raw_header: bytes) -> dict:
+    message = BytesParser(policy=policy.default).parsebytes(raw_header or b"")
+    return {
+        "subject": _decode_header_text(str(message.get("Subject", ""))),
+        "date": str(message.get("Date", "")),
+        "from": _decode_header_text(str(message.get("From", ""))),
+        "to": _decode_header_text(str(message.get("To", ""))),
+    }
+
+
+def _message_is_recent(message_date: str, cutoff: datetime) -> bool:
+    try:
+        parsed_date = parsedate_to_datetime(message_date)
+        if parsed_date.tzinfo is not None:
+            parsed_date = parsed_date.astimezone().replace(tzinfo=None)
+        return parsed_date >= cutoff
+    except Exception:
+        return True
+
+
+def _sender_matches(expected_sender: str, actual_from: str) -> bool:
+    expected = _normalize_match_text(parseaddr(expected_sender or "")[1] or expected_sender)
+    actual = _normalize_match_text(parseaddr(actual_from or "")[1] or actual_from)
+    return not expected or not actual or expected == actual
+
+
 def resolve_imap_server(smtp_server: str = "", configured_imap_server: str = "") -> str:
     configured = str(configured_imap_server or "").strip()
     if configured:
@@ -110,8 +176,12 @@ def verify_email_arrival(
     password: str,
     subject_contains: str,
     since_minutes: int = 30,
-    mailbox: str = "INBOX",
+    mailbox: str | list[str] = "INBOX",
     timeout_seconds: int = 30,
+    expected_sender: str = "",
+    max_messages: int = 120,
+    retry_attempts: int = 1,
+    retry_delay_seconds: int = 5,
 ) -> dict:
     if not imap_server or not username or not password or not subject_contains:
         return {
@@ -120,64 +190,87 @@ def verify_email_arrival(
             "status": "skipped_missing_config",
             "matched_subject": "",
             "matched_date": "",
+            "matched_from": "",
+            "matched_mailbox": "",
+            "checked_count": 0,
             "error": "",
         }
 
     cutoff = datetime.now() - timedelta(minutes=max(1, int(since_minutes)))
+    if isinstance(mailbox, (list, tuple)):
+        mailboxes = [str(value or "").strip() for value in mailbox if str(value or "").strip()]
+    else:
+        raw_mailbox = str(mailbox or "INBOX")
+        mailboxes = [part.strip() for part in re.split(r"[,;]", raw_mailbox) if part.strip()]
+    mailboxes = mailboxes or ["INBOX"]
+
+    checked_count = 0
+    select_errors: list[str] = []
+    attempts = max(1, int(retry_attempts or 1))
     try:
-        with imaplib.IMAP4_SSL(imap_server, int(imap_port), timeout=timeout_seconds) as client:
-            client.login(username, password)
-            client.select(mailbox)
-            search_since = cutoff.strftime("%d-%b-%Y")
-            status, data = client.search(None, "SINCE", search_since)
-            if status != "OK":
-                return {
-                    "enabled": True,
-                    "verified": False,
-                    "status": "search_failed",
-                    "matched_subject": "",
-                    "matched_date": "",
-                    "error": str(data),
-                }
-            message_ids = (data[0] or b"").split()
-            for message_id in reversed(message_ids[-50:]):
-                fetch_status, fetch_data = client.fetch(message_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])")
-                if fetch_status != "OK" or not fetch_data:
-                    continue
-                raw_header = fetch_data[0][1].decode("utf-8", errors="replace")
-                subject = ""
-                message_date = ""
-                for line in raw_header.splitlines():
-                    if line.lower().startswith("subject:"):
-                        subject = _decode_header_text(line.split(":", 1)[1].strip())
-                    elif line.lower().startswith("date:"):
-                        message_date = line.split(":", 1)[1].strip()
-                if subject_contains not in subject:
-                    continue
-                try:
-                    parsed_date = parsedate_to_datetime(message_date)
-                    if parsed_date.tzinfo is not None:
-                        parsed_date = parsed_date.astimezone().replace(tzinfo=None)
-                    if parsed_date < cutoff:
+        for attempt in range(1, attempts + 1):
+            with imaplib.IMAP4_SSL(imap_server, int(imap_port), timeout=timeout_seconds) as client:
+                client.login(username, password)
+                search_since = cutoff.strftime("%d-%b-%Y")
+                for mailbox_name in mailboxes:
+                    select_status, select_data = client.select(mailbox_name)
+                    if select_status != "OK":
+                        select_errors.append(f"{mailbox_name}: {select_data}")
                         continue
-                except Exception:
-                    pass
-                return {
-                    "enabled": True,
-                    "verified": True,
-                    "status": "found",
-                    "matched_subject": subject,
-                    "matched_date": message_date,
-                    "error": "",
-                }
-            return {
-                "enabled": True,
-                "verified": False,
-                "status": "not_found",
-                "matched_subject": "",
-                "matched_date": "",
-                "error": "",
-            }
+                    status, data = client.search(None, "SINCE", search_since)
+                    if status != "OK":
+                        return {
+                            "enabled": True,
+                            "verified": False,
+                            "status": "search_failed",
+                            "matched_subject": "",
+                            "matched_date": "",
+                            "matched_from": "",
+                            "matched_mailbox": mailbox_name,
+                            "checked_count": checked_count,
+                            "error": str(data),
+                        }
+                    message_ids = (data[0] or b"").split()
+                    for message_id in reversed(message_ids[-max(1, int(max_messages)):]):
+                        fetch_status, fetch_data = client.fetch(message_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE FROM TO)])")
+                        if fetch_status != "OK" or not fetch_data:
+                            continue
+                        raw_payload = fetch_data[0][1] if isinstance(fetch_data[0], tuple) else b""
+                        headers = _parse_header_bytes(raw_payload)
+                        subject = headers["subject"]
+                        message_date = headers["date"]
+                        message_from = headers["from"]
+                        checked_count += 1
+                        if not _subject_matches(subject_contains, subject):
+                            continue
+                        if not _sender_matches(expected_sender, message_from):
+                            continue
+                        if not _message_is_recent(message_date, cutoff):
+                            continue
+                        return {
+                            "enabled": True,
+                            "verified": True,
+                            "status": "found",
+                            "matched_subject": subject,
+                            "matched_date": message_date,
+                            "matched_from": message_from,
+                            "matched_mailbox": mailbox_name,
+                            "checked_count": checked_count,
+                            "error": "",
+                        }
+            if attempt < attempts and retry_delay_seconds > 0:
+                time.sleep(max(0, int(retry_delay_seconds)))
+        return {
+            "enabled": True,
+            "verified": False,
+            "status": "not_found",
+            "matched_subject": "",
+            "matched_date": "",
+            "matched_from": "",
+            "matched_mailbox": "",
+            "checked_count": checked_count,
+            "error": "; ".join(select_errors[-5:]),
+        }
     except Exception as exc:
         return {
             "enabled": True,
@@ -185,5 +278,8 @@ def verify_email_arrival(
             "status": "error",
             "matched_subject": "",
             "matched_date": "",
+            "matched_from": "",
+            "matched_mailbox": "",
+            "checked_count": checked_count,
             "error": str(exc),
         }
