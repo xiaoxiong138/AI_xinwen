@@ -60,6 +60,8 @@ CATEGORY_CN_MAP = {
     "社交讨论": "社交讨论",
     "视频观点": "视频解读",
     "视频解读": "视频解读",
+    "访谈观点": "访谈观点",
+    "播客解读": "播客解读",
     "应用落地": "应用落地",
     "Other": "其他",
     "其他": "其他",
@@ -92,12 +94,41 @@ WEB_AI_KEYWORDS = [
     "foundation model",
     "multimodal",
     "diffusion",
+    "language model",
+    "transformer engine",
+    "megatron core",
+    "megatron-lm",
+    "fp4",
+    "model parallel",
+    "knowledge graph",
+    "medical terminology",
+    "model context protocol",
     "openai",
     "anthropic",
     "deepmind",
     "gemini",
     "gpt",
     "claude",
+    "人工智能",
+    "机器学习",
+    "大模型",
+    "语言模型",
+    "智能体",
+    "代理系统",
+    "机器人",
+    "具身智能",
+    "世界模型",
+    "基础模型",
+    "多模态",
+    "扩散模型",
+    "模型训练",
+    "后训练",
+    "强化学习",
+    "模型推理",
+    "推理部署",
+    "模型量化",
+    "视觉语言动作",
+    "神经网络",
 ]
 
 LOW_SIGNAL_TITLE_PATTERNS = [
@@ -137,6 +168,73 @@ HIGH_SIGNAL_HOST_HINTS = (
     "unite.ai",
     "artificialintelligence-news.com",
 )
+
+PRIMARY_SOURCE_HOST_HINTS = (
+    "openai.com",
+    "anthropic.com",
+    "deepmind.google",
+    "research.google",
+    "ai.google",
+    "huggingface.co",
+    "nvidia.com",
+    "aws.amazon.com",
+    "microsoft.com",
+    "meta.com",
+    "github.com",
+    "gitlab.com",
+)
+
+SECONDARY_MEDIA_HOST_HINTS = (
+    "techcrunch.com",
+    "venturebeat.com",
+    "reuters.com",
+    "bloomberg.com",
+    "theverge.com",
+    "wired.com",
+    "forbes.com",
+    "cnbc.com",
+    "fortune.com",
+    "marktechpost.com",
+    "unite.ai",
+    "artificialintelligence-news.com",
+)
+
+
+def infer_source_tier(
+    item: Mapping[str, Any],
+    source_preferences: Mapping[str, Any] | None = None,
+) -> str:
+    """Infer source provenance from the resolved URL instead of trusting model output."""
+    source_preferences = source_preferences or {}
+    host = urlparse(str(item.get("canonical_url") or item.get("url") or "")).netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    source_detail = str(item.get("source_detail") or "").lower()
+    platform = str(item.get("platform") or "").strip().lower()
+    content_type = str(item.get("content_type") or "").strip().lower()
+    if host == "news.google.com" or "google news" in source_detail:
+        return "aggregator"
+    if host in set(source_preferences.get("blacklist_hosts") or []):
+        return "low_signal"
+    if any(hint in host for hint in SECONDARY_MEDIA_HOST_HINTS):
+        return "media"
+    if content_type == "paper" or host in {"arxiv.org", "openreview.net"}:
+        return "research"
+    if host in set(source_preferences.get("whitelist_hosts") or []) or any(
+        hint in host for hint in PRIMARY_SOURCE_HOST_HINTS
+    ):
+        return "official"
+    if platform in {
+        "blog",
+        "website",
+        "github",
+        "documentation",
+        "docs",
+        "model card",
+        "system card",
+        "release notes",
+    }:
+        return "primary"
+    return "media"
 
 HIGH_SIGNAL_WEB_KEYWORDS = [
     "release",
@@ -398,14 +496,25 @@ def score_update_quality(
     if re.search(r"\b\d+%\b", lowered_title) or re.search(r"\b\d+x\b", lowered_title):
         score += 0.4
 
+    category_lower = (category or "").lower()
+    is_substantive_longform = (
+        platform in {"podcast", "interview"}
+        or category_lower in {"访谈观点", "播客解读"}
+    ) and summary_length >= 220 and action_hits >= 1 and len(unique_tokens) >= 24
+
     for pattern in LOW_INFORMATION_PATTERNS:
+        if is_substantive_longform and pattern in {r"\bopinion\b", r"\bpodcast\b"}:
+            continue
         if re.search(pattern, lowered_title):
             score -= 1.2
 
     if platform == "youtube":
         if action_hits == 0 or summary_length < 150:
             score -= 1.2
-        if any(token in lowered_title for token in ["review", "roundup", "podcast", "reaction", "watch"]):
+        youtube_low_signal_tokens = ["review", "roundup", "reaction", "watch"]
+        if not is_substantive_longform:
+            youtube_low_signal_tokens.append("podcast")
+        if any(token in lowered_title for token in youtube_low_signal_tokens):
             score -= 1.0
 
     if source_preferences:

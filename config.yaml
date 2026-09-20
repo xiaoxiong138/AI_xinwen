@@ -13,6 +13,8 @@
     fallback_days:
       - 1
       - 3
+      - 7
+      - 14
     topic_limits:
       Physical AI: 12
       World Model: 12
@@ -98,6 +100,76 @@
         max_entries: 15
   huggingface:
     enabled: false
+  codex_research_inbox:
+    enabled: true
+    path: data/codex_research/latest.json
+    candidate_paths:
+      "1300": data/codex_research/candidate_1300.json
+      "2100": data/codex_research/candidate_2100.json
+    required_schema_version: codex-research-v3
+    max_age_minutes: 360
+    minimum_items: 55
+    history_dedupe_days: 7
+    history_dedupe_limit: 5000
+    minimum_papers: 15
+    minimum_news: 20
+    minimum_technical: 20
+    technical_primary_source_ratio_min: 0.80
+    max_attribution_opener_count: 8
+    max_cross_item_template_repeat_count: 0
+    cross_item_template_similarity_threshold: 0.92
+    minimum_discovery_candidates: 160
+    minimum_discovered_by_section:
+      news: 50
+      technical: 50
+      paper: 40
+    minimum_submitted_by_section:
+      news: 30
+      technical: 27
+      paper: 20
+    minimum_key_number_items_by_section:
+      news: 8
+      technical: 10
+      paper: 10
+    technical_category_quotas:
+      embodied_world_model: 6
+      agent_systems: 4
+      training_data: 4
+      inference_deployment: 3
+      multimodal_architecture: 3
+    technical_category_minimums:
+      embodied_world_model: 3
+      agent_systems: 2
+      training_data: 2
+      inference_deployment: 1
+      multimodal_architecture: 1
+    news_format_quotas:
+      interview_or_podcast: 2
+      blog: 5
+    minimum_fresh_by_section:
+      news: 15
+      technical: 15
+      paper: 12
+    supplemental_max_age_hours_by_section:
+      news: 168
+      technical: 720
+      paper: 720
+    paper_domain_quotas:
+      world_model:
+        min: 3
+        max: 5
+      physical_ai:
+        min: 4
+        max: 6
+      agent_models:
+        min: 3
+        max: 5
+      infra_open_source:
+        min: 2
+        max: 4
+      other:
+        min: 1
+        max: 3
   web_search:
     enabled: true
     locale: US:en
@@ -259,15 +331,11 @@
         content_type: video
         max_results: 6
 llm:
-  api_key_env: DEEPSEEK_API_KEY
-  base_url: https://api.deepseek.com
-  model: deepseek-v4-pro
-  fallback_model: deepseek-chat
-  primary_mode: fact_extraction
-  primary_thinking: disabled
-  temperature: 0.2
-  timeout_seconds: 20
-  force_json_response: true
+  provider: codex_automation
+  api_mode: research_inbox
+  model: Codex Automation
+  primary_mode: scheduled_research_import
+  article_content_char_limit: 6000
 network:
   timeout_seconds: 25
   collector_timeout_seconds: 90
@@ -286,18 +354,36 @@ email:
     retry_delay_seconds: 8
 report:
   title: AI Frontier Intelligence Daily
-  product_mode: intelligence_v10_learning_digest
-  reading_mode: detailed_15min
-  design_version: v10-learning-digest
+  product_mode: intelligence_v11_editorial_library
+  summary_quality_version: v11-evidence-editor
+  reading_mode: detailed_30min
+  design_version: v11-editorial-library
   email_client_mode: compatible
+  email_html_warning_bytes: 97280
+  email_html_max_bytes: 104448
+  email_split_enabled: true
   paper_limit: 25
   research_limit: 25
   paper_featured_limit: 10
   paper_appendix_limit: 15
-  min_visible_paper_count: 10
+  min_visible_paper_count: 15
   paper_target_min_count: 18
   paper_target_max_count: 25
-  min_visible_information_count: 20
+  min_visible_information_count: 40
+  min_visible_news_count: 20
+  min_visible_technical_count: 20
+  supplemental_visible_max_by_section:
+    news: 5
+    technical: 5
+    paper: 3
+  supplemental_max_age_hours_by_section:
+    news: 168
+    technical: 720
+    paper: 720
+  news_section_limit: 24
+  technical_section_limit: 24
+  news_candidate_pool_limit: 30
+  technical_candidate_pool_limit: 30
   physical_ai_min_items: 4
   paper_technical_intro_min_count: 4
   physical_ai_featured_min_count: 2
@@ -306,13 +392,19 @@ report:
   paper_backfill_hours_ladder:
     - 72
   paper_fresh_candidate_hours: 72
+  paper_candidate_query_limit: 1000
+  paper_fresh_candidate_hours_ladder:
+    - 72
+    - 168
+    - 336
+    - 720
   paper_domain_quotas:
     world_model:
+      min: 3
+      max: 5
+    physical_ai:
       min: 4
       max: 6
-    physical_ai:
-      min: 5
-      max: 8
     agent_models:
       min: 3
       max: 5
@@ -320,8 +412,8 @@ report:
       min: 2
       max: 4
     other:
-      min: 2
-      max: 4
+      min: 1
+      max: 3
   min_web_items: 30
   web_backfill_hours: 24
   web_backfill_hours_ladder:
@@ -329,26 +421,35 @@ report:
     - 48
     - 72
     - 168
-  web_limit: 45
+    - 336
+    - 720
+  web_limit: 50
   v8_focus_candidate_target: 12
   v8_focus_source_target: 6
   v8_focus_domain_target: 4
   top_update_limit: 5
   focus_update_limit: 10
   brief_update_limit: 15
-  must_read_limit: 10
-  domain_item_limit: 4
+  must_read_limit: 6
+  must_read_source_limit: 2
+  editorial_decision_min_count: 5
+  editorial_decision_limit: 6
+  editorial_decision_max_count: 7
+  domain_item_limit: 8
   brief_limit: 3
+  source_news_brief_limit: 12
   total_visible_chars_min: 10000
-  total_visible_chars_max: 20000
+  total_visible_chars_max: 48000
   memory_total_char_limit: 240
-  news_body_char_limit: 180
+  news_body_char_limit: 300
+  interview_body_char_limit: 500
+  technical_body_char_limit: 380
   paper_plain_summary_char_min: 100
   paper_plain_summary_char_max: 170
   paper_body_char_min: 120
   paper_body_char_limit: 300
-  source_focus_limit: 6
-  topic_focus_limit: 12
+  source_focus_limit: 10
+  topic_focus_limit: 16
   continuity_lookback_days: 14
   continuity_history_limit: 800
   suppress_repeated_focus: true
@@ -461,7 +562,12 @@ preferences:
     inference: 0.5
     open source: 0.5
 quality_gate:
+  require_codex_research_inbox: true
+  v11_enabled: true
   enabled: true
+  evidence_editor_enabled: true
+  block_template_fallback_focus: true
+  allow_index_only_papers: false
   v10_enabled: true
   v8_enabled: true
   v3_enabled: true
@@ -473,6 +579,8 @@ quality_gate:
   max_model_path_backfill_items: 8
   max_repeated_sentence_count: 1
   max_opening_repeat_count: 3
+  max_attribution_opener_repeat_count: 8
+  max_attribution_opener_run: 1
   block_send_on_final_failure: true
   allow_degraded_send_on_soft_failure: true
   final_html_bad_title_count: 0
@@ -488,11 +596,17 @@ quality_gate:
   generic_phrase_count: 0
   unsupported_claim_count: 0
   duplicate_event_ratio_max: 0.08
-  primary_source_ratio_min: 0.70
+  primary_source_ratio_min: 0.80
+  technical_primary_source_ratio_min: 0.80
   paper_plain_summary_pass_rate_min: 1.0
-  min_visible_paper_count: 10
+  min_visible_paper_count: 15
+  hard_min_visible_paper_count: true
   adjacent_report_paper_overlap_max: 0.10
-  min_visible_information_count: 20
+  min_visible_information_count: 40
+  min_visible_news_count: 20
+  min_visible_technical_count: 20
+  editorial_decision_min_count: 5
+  editorial_decision_max_count: 7
   focus_source_concentration_max: 0.30
 feedback:
   enabled: true
@@ -503,7 +617,7 @@ alerts:
   recipients_env: EMAIL_RECIPIENT
   arxiv_failure_threshold: 1
   min_update_count: 20
-  min_paper_count: 10
+  min_paper_count: 15
   duplicate_ratio_threshold: 0.8
   send_separate_alert: false
 trends:
@@ -557,6 +671,12 @@ scheduler:
   run_as_user_env: WEB_AGENT_RUNAS_USER
   run_as_password_env: WEB_AGENT_RUNAS_PASSWORD
   send_slot_dir: logs/send_slots
+  ui_audit_enabled: true
+  ui_audit_output_dir: artifacts/v11_production_ui_audit
+  ui_audit_timeout_seconds: 180
+  v11_editorial_review_required: true
+  v11_client_render_review_required: true
+  v11_editorial_review_dir: data/v11_editorial_reviews
   send_slot_stale_seconds: 10800
   send_slots:
     - id: "1300"

@@ -1,0 +1,107 @@
+{
+  "description": "Real source-grounded editorial samples captured from the September 2026 research inbox. V11 must preserve these approved Chinese drafts without template rewriting.",
+  "items": [
+    {
+      "primary_section": "news",
+      "title": "Changing the game: Using agentic AI to secure infrastructure code",
+      "title_cn": "Google 用提交前代理审查补充基础设施安全检查",
+      "url": "https://cloud.google.com/blog/topics/systems/using-ai-agents-to-secure-google-infrastructure/",
+      "source_detail": "Google Cloud",
+      "content_type": "news",
+      "claim_type": "official_claim",
+      "summary": "Google 介绍在自身基础设施中使用 AI 代理发现安全问题的流程，将审查放到代码提交前，并以夜间扫描补充跨变更的交互检查。系统结合当前代码、依赖与调用关系构造局部威胁模型，再由不同角色提出漏洞候选、验证可达性和筛除误报。公司称这套方法已覆盖数亿行代码，并持续发现问题；这些规模和效果属于内部披露。修复建议仍交由人员审查。文章的核心变化是让模型检查进入现有研发关卡，并保留独立复核角色，而不是把自动生成的漏洞说明直接当作已证实的安全缺陷。",
+      "source_excerpt": "提交前使用局部威胁模型与调用关系；独立分诊环节验证候选漏洞；夜间扫描补充跨变更检查，修复仍需人工复核。",
+      "evidence_locator": "小节：提交前扫描、局部威胁模型、分诊代理、修复闭环",
+      "facts": {
+        "who": "Google Cloud",
+        "action": "发布",
+        "target": "Mantis 提交前安全审查",
+        "evidence": [
+          "提交前使用局部威胁模型与调用关系；独立分诊环节验证候选漏洞；夜间扫描补充跨变更检查，修复仍需人工复核。"
+        ],
+        "source_excerpt": "提交前使用局部威胁模型与调用关系；独立分诊环节验证候选漏洞；夜间扫描补充跨变更检查，修复仍需人工复核。",
+        "evidence_locator": "小节：提交前扫描、局部威胁模型、分诊代理、修复闭环"
+      }
+    },
+    {
+      "primary_section": "news",
+      "title": "Seven creators, $1,000 a week in AI tokens, one summer",
+      "title_cn": "霍夫曼与帕蒂尔复盘创作者资助计划：增加尝试，也保留人的判断",
+      "url": "https://www.possible.fm/podcasts/tokens9/",
+      "source_detail": "Possible / Reid Hoffman、Parth Patil",
+      "content_type": "podcast",
+      "claim_type": "interview_opinion",
+      "summary": "在 Possible 节目中，Reid Hoffman 与 Parth Patil 复盘一项面向七位创作者的夏季计划：每人每周获得一千美元的 AI 词元预算，自行探索影像、游戏、编码、安全和机器人等用途。Patil 说，参与者使用的最佳模型和工作流往往不同于组织者预期；他将这解释为应支持人的探索，而非预先锁定工具。两人认为游戏等低失败成本环境适合学习代理能力，再逐步进入后果更重的任务。\n\n谈到个人助理时，他们强调先让系统起草通信，经人确认后再发送，并把权限逐步扩大。创作部分以大量候选图像中只选一张为例，说明生成规模并没有消除人的审美与取舍。七人资助和使用经历由节目组织者自述，关于长期能力增长与个人代理价值的判断属于嘉宾观点；该计划没有随机对照，不能把个别成功故事当作普遍生产率收益。",
+      "source_excerpt": "组织者称七位参与者每人每周获一千美元词元预算；主张先在低失败成本任务试验，邮件先起草再确认，创作仍需人工筛选。",
+      "evidence_locator": "文字稿：PARTH 首段资助实验、200 张图像筛选；REID 邮件权限答复",
+      "facts": {
+        "who": "Possible 节目主持人与嘉宾",
+        "action": "复盘资助计划并讨论经验",
+        "target": "每周词元资助计划的夏季复盘",
+        "limitation": "组织者选择的七人案例，没有随机对照",
+        "evidence": [
+          "组织者称七位参与者每人每周获一千美元词元预算；主张先在低失败成本任务试验，邮件先起草再确认，创作仍需人工筛选。"
+        ],
+        "source_excerpt": "组织者称七位参与者每人每周获一千美元词元预算；主张先在低失败成本任务试验，邮件先起草再确认，创作仍需人工筛选。",
+        "evidence_locator": "文字稿：PARTH 首段资助实验、200 张图像筛选；REID 邮件权限答复"
+      }
+    },
+    {
+      "primary_section": "technical",
+      "title": "Introducing Odyssey-3: A General-Purpose Physical Intelligence",
+      "title_cn": "Odyssey-3 将预训练世界表示接入不同机体的动作解码器",
+      "url": "https://odyssey.systems/introducing-odyssey-3",
+      "source_detail": "Odyssey / Oliver Cameron、Jeff Hawke",
+      "content_type": "project",
+      "claim_type": "official_claim",
+      "technical_category": "embodied_world_model",
+      "summary": "Odyssey-3 采用自回归扩散模型学习视觉环境，再通过动作解码器把内部表示转换为具体机体的控制输出。机器人分支用观察与动作配对示范训练；驾驶实验则冻结世界模型，以二十小时仿真数据训练较小的路点策略。公司在印度道路上比较仿真训练和真实录像训练的策略，前者两次安全员介入之间的行驶距离约为后者的百分之七十七，这不是驾驶成功率。机械臂演示还展示漏抓和掉落后的恢复行为。结果来自团队自述与选定演示，跨机体一致性仍在评估，文章表示公开发布将在数周后进行，不能视为已有全面开放复现。",
+      "source_excerpt": "驾驶分支冻结世界模型，用20小时仿真数据训练路点策略；实路介入间距约为真实录像训练策略的77%；公开发布尚待数周。",
+      "evidence_locator": "小节：物理代理、车辆驾驶、早期演示的限制",
+      "facts": {
+        "who": "Odyssey / Oliver Cameron、Jeff Hawke",
+        "action": "发布",
+        "target": "Odyssey-3",
+        "method": "预训练世界表示与机体专用动作解码器，冻结骨干训练路点策略",
+        "dataset_or_benchmark": "印度道路驾驶比较；机器人示范；20小时仿真驾驶数据",
+        "baseline": "以真实驾驶录像训练的路点策略",
+        "limitation": "团队实验；未全面公开复现，跨机体稳健性仍在评估",
+        "evidence": [
+          "驾驶分支冻结世界模型，用20小时仿真数据训练路点策略；实路介入间距约为真实录像训练策略的77%；公开发布尚待数周。"
+        ],
+        "source_excerpt": "驾驶分支冻结世界模型，用20小时仿真数据训练路点策略；实路介入间距约为真实录像训练策略的77%；公开发布尚待数周。",
+        "evidence_locator": "小节：物理代理、车辆驾驶、早期演示的限制"
+      }
+    },
+    {
+      "primary_section": "paper",
+      "title": "WorldContact: A Contact-Centric World Model for Scalable Robot Learning",
+      "title_cn": "WorldContact 学习接触动力学，为柔性物体操作扩充训练数据",
+      "url": "https://arxiv.org/abs/2609.19600",
+      "source_detail": "Caoliwen Wang等",
+      "content_type": "paper",
+      "claim_type": "research_result",
+      "summary": "购物袋这类柔性物体会在抓取时折叠、变形，精细物理仿真生成训练数据很慢。WorldContact 用少量高质量轨迹学习接触过程，再快速生成更多经验，帮助机器人适应新物体。论文检验的不只是模拟画面，还包括扩充的数据能否改善真实机器人的提袋表现。\n\n方法训练接触中心世界模型，以比原数值模拟器更大的时间步预测物体状态，在十六项购物袋操作任务上评估。单张 H100 的状态展开相对原模拟器加速十倍，但不包括渲染和磁盘读写。相同视觉语言动作策略在真实提袋任务中，仅用原仿真数据微调的单次成功率为百分之六十五，加入模型扩充数据后为百分之九十五。结果支持以学习动力学降低数据生成成本，但实验对象与任务有限，状态展开加速也不能直接当作完整训练流程的加速。",
+      "paper_plain_summary": "购物袋这类柔性物体会在抓取时折叠、变形，精细物理仿真生成训练数据很慢。WorldContact 用少量高质量轨迹学习接触过程，再快速生成更多经验，帮助机器人适应新物体。论文检验的不只是模拟画面，还包括扩充的数据能否改善真实机器人的提袋表现。",
+      "paper_technical_intro": "方法训练接触中心世界模型，以比原数值模拟器更大的时间步预测物体状态，在十六项购物袋操作任务上评估。单张 H100 的状态展开相对原模拟器加速十倍，但不包括渲染和磁盘读写。相同视觉语言动作策略在真实提袋任务中，仅用原仿真数据微调的单次成功率为百分之六十五，加入模型扩充数据后为百分之九十五。结果支持以学习动力学降低数据生成成本，但实验对象与任务有限，状态展开加速也不能直接当作完整训练流程的加速。",
+      "source_excerpt": "16项购物袋任务；单H100状态展开比原模拟器快10倍且排除渲染和磁盘I/O；相同策略真实提袋由65%到95%。",
+      "evidence_locator": "arXiv摘要方法与结果；v1提交记录",
+      "facts": {
+        "who": "Caoliwen Wang等",
+        "action": "发布",
+        "target": "WorldContact",
+        "method": "学习接触中心世界模型，以较大时间步生成动力学轨迹",
+        "dataset_or_benchmark": "16项购物袋任务；H100；真实提袋",
+        "baseline": "原数值模拟器；相同策略仅用原仿真数据微调",
+        "limitation": "不含渲染和I/O开销，限定购物袋任务",
+        "evidence": [
+          "16项购物袋任务；单H100状态展开比原模拟器快10倍且排除渲染和磁盘I/O；相同策略真实提袋由65%到95%。"
+        ],
+        "source_excerpt": "16项购物袋任务；单H100状态展开比原模拟器快10倍且排除渲染和磁盘I/O；相同策略真实提袋由65%到95%。",
+        "evidence_locator": "arXiv摘要方法与结果；v1提交记录",
+        "paper_plain_summary": "购物袋这类柔性物体会在抓取时折叠、变形，精细物理仿真生成训练数据很慢。WorldContact 用少量高质量轨迹学习接触过程，再快速生成更多经验，帮助机器人适应新物体。论文检验的不只是模拟画面，还包括扩充的数据能否改善真实机器人的提袋表现。",
+        "paper_technical_intro": "方法训练接触中心世界模型，以比原数值模拟器更大的时间步预测物体状态，在十六项购物袋操作任务上评估。单张 H100 的状态展开相对原模拟器加速十倍，但不包括渲染和磁盘读写。相同视觉语言动作策略在真实提袋任务中，仅用原仿真数据微调的单次成功率为百分之六十五，加入模型扩充数据后为百分之九十五。结果支持以学习动力学降低数据生成成本，但实验对象与任务有限，状态展开加速也不能直接当作完整训练流程的加速。"
+      }
+    }
+  ]
+}

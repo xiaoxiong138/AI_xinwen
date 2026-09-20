@@ -309,6 +309,40 @@ class Database:
         finally:
             conn.close()
 
+    def update_article_source_snapshot(self, url: str, article: Dict[str, Any]) -> bool:
+        """Refresh source metadata for a newly verified copy of an existing URL."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE articles
+                SET title = ?, source = ?, source_detail = ?, content = ?, publish_date = ?,
+                    author = ?, content_type = ?, platform = ?, topic = ?, run_id = ?,
+                    canonical_url = ?, source_tier = ?
+                WHERE url = ?
+                """,
+                (
+                    article.get("title", ""),
+                    article.get("source", ""),
+                    article.get("source_detail", ""),
+                    article.get("content", ""),
+                    article.get("publish_date", ""),
+                    article.get("author", ""),
+                    article.get("content_type", "news"),
+                    article.get("platform", ""),
+                    article.get("topic", ""),
+                    article.get("run_id", ""),
+                    article.get("canonical_url", article.get("url", "")),
+                    article.get("source_tier", ""),
+                    url,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def get_unprocessed_articles(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = self._get_conn()
         cursor = conn.cursor()

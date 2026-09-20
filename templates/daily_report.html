@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="x-apple-disable-message-reformatting">
     <meta name="format-detection" content="telephone=no,address=no,email=no,date=no,url=no">
+    <meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">
     <title>{{ title }} - {{ date }}</title>
     <style>
         :root {
@@ -71,6 +73,13 @@
             letter-spacing: 0;
             overflow-wrap: anywhere;
             word-break: break-word;
+        }
+        .edition-title {
+            margin: -2px 0 9px;
+            color: #314454;
+            font-size: 16px;
+            line-height: 1.4;
+            font-weight: 750;
         }
         .hero-copy {
             max-width: 820px;
@@ -390,7 +399,7 @@
         }
         .decision-primary {
             color: var(--ink);
-            font-size: 15px;
+            font-size: 16px;
             line-height: 1.65;
             font-weight: 800;
         }
@@ -947,7 +956,8 @@
             color: #214943;
             background: #f3faf8;
         }
-        .container[data-design-version="v10-learning-digest"] {
+        .container[data-design-version="v10-learning-digest"],
+        .container[data-design-version="v11-editorial-library"] {
             max-width: 720px;
             border-radius: 0;
             box-shadow: 0 12px 36px rgba(20, 33, 43, 0.06);
@@ -990,6 +1000,35 @@
             font-size: 12px;
             line-height: 1.8;
         }
+        .v11-counts {
+            width: 100%;
+            margin-top: 14px;
+            border-collapse: collapse;
+            border-top: 1px solid #dce5e3;
+            border-bottom: 1px solid #dce5e3;
+        }
+        .v11-counts td {
+            width: 33.33%;
+            padding: 10px 8px 9px 0;
+            vertical-align: top;
+        }
+        .v11-count-value {
+            color: var(--ink);
+            font-size: 20px;
+            font-weight: 900;
+            line-height: 1.15;
+        }
+        .v11-count-label {
+            margin-top: 3px;
+            color: var(--muted);
+            font-size: 11px;
+        }
+        .v11-edition-total {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 11px;
+            line-height: 1.5;
+        }
         .v10-nav a {
             display: inline-block;
             margin-right: 14px;
@@ -1017,11 +1056,30 @@
             padding: 19px 0 20px;
             border-bottom: 1px solid #e4eaec;
         }
+        .v11-section-intro {
+            margin: -4px 0 9px;
+            padding: 11px 13px;
+            border-left: 3px solid var(--green);
+            background: #f5f8f7;
+            color: #465663;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .v11-source-note {
+            margin-top: 9px;
+            color: #6a7580;
+            font-size: 11px;
+            line-height: 1.55;
+        }
         .v10-entry:last-child { border-bottom: 0; }
         .v10-kicker {
             margin-bottom: 5px;
             color: var(--green);
             font-size: 11px;
+            font-weight: 850;
+        }
+        .v11-claim-label {
+            color: #315d4a;
             font-weight: 850;
         }
         .v10-title {
@@ -1034,8 +1092,9 @@
         }
         .v10-body {
             color: #263544;
-            font-size: 15px;
+            font-size: 16px;
             line-height: 1.72;
+            white-space: pre-line;
         }
         .v10-paper-plain {
             margin: 2px 0 0;
@@ -1046,13 +1105,15 @@
             font-size: 16.5px;
             line-height: 1.82;
             font-weight: 620;
+            white-space: pre-line;
         }
         .v10-paper-tech {
             margin-top: 13px;
             padding: 0 2px;
             color: #526170;
-            font-size: 14px;
-            line-height: 1.72;
+            font-size: 15px;
+            line-height: 1.75;
+            white-space: pre-line;
         }
         .v10-evidence {
             margin-top: 11px;
@@ -1079,7 +1140,7 @@
         .v10-more-paper:last-child { border-bottom: 0; }
         .v10-more-title {
             color: #244f75;
-            font-size: 14px;
+            font-size: 16px;
             line-height: 1.5;
             font-weight: 800;
             text-decoration: none;
@@ -1089,6 +1150,20 @@
             color: #596775;
             font-size: 13px;
             line-height: 1.62;
+        }
+        .v10-more-plain {
+            margin-top: 9px;
+            color: #263544;
+            font-size: 16px;
+            line-height: 1.72;
+            white-space: pre-line;
+        }
+        .v10-more-tech {
+            margin-top: 8px;
+            color: #596775;
+            font-size: 16px;
+            line-height: 1.72;
+            white-space: pre-line;
         }
         .footer {
             padding: 17px 30px;
@@ -1123,40 +1198,63 @@
             .v8-title { font-size: 17px; }
             .v8-body { font-size: 15px; }
             .v10-title { font-size: 17px; }
+            h1 { font-size: 24px; line-height: 1.22; }
+            .edition-title { font-size: 15px; }
+            .v10-body { font-size: 15.5px; }
             .v10-paper-plain {
                 padding: 12px 13px 13px;
                 font-size: 15.5px;
                 line-height: 1.78;
             }
-            .v10-paper-tech { font-size: 13px; }
+            .v10-paper-tech, .v10-more-plain, .v10-more-tech { font-size: 16px; }
             .v10-entry { padding: 17px 0; }
+        }
+        @media (prefers-color-scheme: dark) {
+            body { background: #14191d !important; color: #e6ecef !important; }
+            .container, .masthead, .footer { background: #1c2328 !important; border-color: #39434a !important; }
+            .v10-title, .v10-lead-title, .v11-count-value { color: #f2f6f7 !important; }
+            .v10-body, .v10-decision-text, .hero-copy, .edition-title { color: #d8e0e4 !important; }
+            .sub, .v11-count-label, .v10-decision-evidence, .v11-source-note, .v10-paper-tech, .v10-more-plain, .v10-more-tech, .v10-more-summary { color: #abb8bf !important; }
+            .v11-section-intro, .v10-evidence { background: #222c30 !important; color: #cfdbd9 !important; border-color: #5e9488 !important; }
+            .v10-paper-plain { background: #21312d !important; color: #edf5f2 !important; border-color: #68a999 !important; }
+            .v10-entry, .v10-more-paper, .v10-decision, .v11-counts { border-color: #39434a !important; }
+            a, .v10-nav a, .v10-actions a, .v10-more-title { color: #87b9e5 !important; }
         }
     </style>
 </head>
 <body>
-    <div class="preheader">AI intelligence daily: must-read, watchlist, research, brief updates, and quality notes.</div>
+    <div class="preheader">AI 前沿日报{% if v10_mode %}：{{ v10.edition_news_count }} 条新闻与观点、{{ v10.edition_technical_count }} 条技术内容、{{ v10.edition_paper_count }} 篇论文{% endif %}</div>
     <!--[if mso]><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center"><![endif]-->
     <div class="container" data-design-version="{{ design_version }}">
         <div class="masthead">
             <div class="eyebrow">AI Frontier Intelligence</div>
-            <h1>{{ title }}</h1>
+            <h1>{{ display_title }}</h1>
+            {% if display_subtitle %}<div class="edition-title">{{ display_subtitle }}</div>{% endif %}
             {% if hero_description %}<p class="hero-copy">{{ hero_description }}</p>{% endif %}
-            <div class="sub">生成时间：{{ generated_at }} · 阅读模式：{% if v10_mode %}15 分钟技术学习版{% elif v9_mode %}20 分钟连续学习版{% else %}10 分钟详版{% endif %}</div>
+            <div class="sub">生成时间：{{ generated_at }} · 阅读模式：{% if v10_mode %}30 分钟深度编辑版{% elif v9_mode %}20 分钟连续学习版{% else %}10 分钟详版{% endif %}</div>
             {% if v10_mode %}
             <div class="v10-lead">
                 <div class="v10-lead-title">今日编辑判断</div>
                 {% for item in v10.editorial_decisions %}
-                <div class="v10-decision">
+                <div class="v10-decision"{% if item.source_identity %} data-source-key="{{ item.source_identity }}"{% endif %}>
                     <div class="v10-decision-domain">{{ item.domain }}</div>
                     <div class="v10-decision-text">{{ item.text }}</div>
                     {% if item.evidence %}<div class="v10-decision-evidence">{{ item.evidence }}</div>{% endif %}
                 </div>
                 {% endfor %}
+                <table class="v11-counts" role="presentation" cellpadding="0" cellspacing="0">
+                    <tr>
+                        <td><div class="v11-count-value">{{ v10.edition_news_count }}</div><div class="v11-count-label">本期新闻 / 博客 / 访谈</div></td>
+                        <td><div class="v11-count-value">{{ v10.edition_technical_count }}</div><div class="v11-count-label">本期非论文技术内容</div></td>
+                        <td><div class="v11-count-value">{{ v10.edition_paper_count }}</div><div class="v11-count-label">本期论文</div></td>
+                    </tr>
+                </table>
+                <div class="v11-edition-total">本期共 {{ v10.edition_total_count }} 条独立内容；内容较长时按新闻、技术和论文分卷发送。</div>
                 <div class="v10-nav">
-                    <a href="#today-must-read">重点情报</a>
-                    {% for item in v10.domains %}<a href="#{{ item.anchor_id }}">{{ item.label }}</a>{% endfor %}
+                    {% if v10.news_count %}<a href="#news-and-voices">本卷新闻 / 博客 / 访谈（{{ v10.news_count }}）</a>{% endif %}
+                    {% if v10.technical_count %}<a href="#technical-trends">本卷技术方法 / 架构（{{ v10.technical_count }}）</a>{% endif %}
                     {% if v10.paper_updates %}<a href="#paper-progress-updates">重要进展更新</a>{% endif %}
-                    <a href="#paper-deep-reads">论文精读</a>
+                    {% if v10.paper_count %}<a href="#paper-deep-reads">本卷论文（{{ v10.paper_count }}）</a>{% endif %}
                     {% if v10.more_papers %}<a href="#more-papers">更多论文</a>{% endif %}
                 </div>
                 {% if v10.paper_freshness %}
@@ -1222,18 +1320,21 @@
             {% endif %}
 
             {% if v10_mode %}
-            {% if v10.must_read %}
-            <div class="section" id="today-must-read">
+            {% if v10.news_items %}
+            <div class="section" id="news-and-voices">
                 <div class="section-head">
-                    <h2>今日重点情报</h2>
-                    <div class="section-note">{{ v10.must_read|length }} 条经过事实和来源筛选的技术、产品与产业变化</div>
+                    <h2>新闻、博客与访谈</h2>
+                    <div class="section-note">{{ v10.news_count }} 条独立原始来源，正文可直接阅读；访谈观点与已发生事实分开表达</div>
                 </div>
-                {% for article in v10.must_read %}
-                <article class="v10-entry">
-                    <div class="v10-kicker">{{ article.v8_domain }} · {{ article.v8_source }}</div>
+                <div class="v11-section-intro">今天的重要事件、公开观点与原始证据。正文保留必要背景和限制，读到这里即可理解主要变化。</div>
+                {% for article in v10.news_items %}
+                <article class="v10-entry" data-v11-item-key="{{ article.v11_item_key }}">
+                    <div class="v10-kicker">{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <h3 class="v10-title">{{ article.title_cn }}</h3>
-                    <div class="v10-body">{{ article.v8_body }}</div>
+                    {% if article.v12_deck %}<div class="v10-decision-text">{{ article.v12_deck }}</div>{% endif %}
+                    <div class="v10-body">{{ article.v11_body }}</div>
                     {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
+                    {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}
                     <div class="v10-actions">
                         {% if article.v8_feedback.useful %}<a href="{{ article.v8_feedback.useful }}">有用</a>{% endif %}
                         {% if article.v8_feedback.track %}<a href="{{ article.v8_feedback.track }}">跟进</a>{% endif %}
@@ -1244,40 +1345,21 @@
             </div>
             {% endif %}
 
-            {% for domain in v10.domains %}
-            <div class="section" id="{{ domain.anchor_id }}">
+            {% if v10.technical_items %}
+            <div class="section" id="technical-trends">
                 <div class="section-head">
-                    <h2>{{ domain.label }}</h2>
-                    <div class="section-note">只展示有具体事实、机制或数据支撑的新增内容</div>
+                    <h2>技术方法、方向与架构</h2>
+                    <div class="section-note">{{ v10.technical_count }} 条非论文技术内容，覆盖训练、Agent、世界模型、具身智能、推理部署与开源架构</div>
                 </div>
-                {% for article in domain.entries %}
-                <article class="v10-entry">
-                    <div class="v10-kicker">{{ article.v8_source }}</div>
+                <div class="v11-section-intro">从输入输出、模块关系和训练或部署约束展开，重点保留可以核验的实现细节与结果。</div>
+                {% for article in v10.technical_items %}
+                <article class="v10-entry" data-v11-item-key="{{ article.v11_item_key }}">
+                    <div class="v10-kicker">{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <h3 class="v10-title">{{ article.title_cn }}</h3>
-                    <div class="v10-body">{{ article.v8_body }}</div>
+                    {% if article.v12_deck %}<div class="v10-decision-text">{{ article.v12_deck }}</div>{% endif %}
+                    <div class="v10-body">{{ article.v11_body }}</div>
                     {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
-                    <div class="v10-actions">
-                        {% if article.v8_feedback.useful %}<a href="{{ article.v8_feedback.useful }}">有用</a>{% endif %}
-                        {% if article.v8_feedback.track %}<a href="{{ article.v8_feedback.track }}">跟进</a>{% endif %}
-                        <a href="{{ article.url }}" target="_blank">查看原始来源 ↗</a>
-                    </div>
-                </article>
-                {% endfor %}
-            </div>
-            {% endfor %}
-
-            {% if v10.more_updates %}
-            <div class="section" id="more-technical-updates">
-                <div class="section-head">
-                    <h2>更多技术动态</h2>
-                    <div class="section-note">{{ v10.more_updates|length }} 条有具体机制、数字或工程证据的补充信息</div>
-                </div>
-                {% for article in v10.more_updates %}
-                <article class="v10-entry">
-                    <div class="v10-kicker">{{ article.v8_domain }} · {{ article.v8_source }}</div>
-                    <h3 class="v10-title">{{ article.title_cn }}</h3>
-                    <div class="v10-body">{{ article.v8_body }}</div>
-                    {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
+                    {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}
                     <div class="v10-actions">
                         {% if article.v8_feedback.useful %}<a href="{{ article.v8_feedback.useful }}">有用</a>{% endif %}
                         {% if article.v8_feedback.track %}<a href="{{ article.v8_feedback.track }}">跟进</a>{% endif %}
@@ -1291,17 +1373,19 @@
             {% if v10.paper_updates %}
             <div class="section" id="paper-progress-updates">
                 <div class="section-head">
-                    <h2>重要进展更新</h2>
+                    <h2>论文精读 / 重要进展更新</h2>
                     <div class="section-note">7 天内重新出现，但已有新版本、代码、实验或采用证据的论文</div>
                 </div>
                 {% for article in v10.paper_updates %}
-                <article class="v10-entry">
-                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ article.v8_domain }} · {{ article.v8_source }}</div>
+                <article class="v10-entry" data-v11-item-key="{{ article.v11_item_key }}">
+                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <h3 class="v10-title">{{ article.title_cn }}</h3>
                     {% if article.v10_change_reason %}<div class="v10-evidence">本次变化：{{ article.v10_change_reason }}</div>{% endif %}
+                    <div class="v10-kicker">先看懂这篇</div>
                     <div class="v10-paper-plain">{{ article.v10_plain_summary }}</div>
                     <div class="v10-paper-tech">{{ article.v10_technical_intro }}</div>
                     {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
+                    {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}
                     <div class="v10-actions">
                         {% if article.v8_feedback.useful %}<a href="{{ article.v8_feedback.useful }}">有用</a>{% endif %}
                         {% if article.v8_feedback.track %}<a href="{{ article.v8_feedback.track }}">跟进</a>{% endif %}
@@ -1319,13 +1403,15 @@
                     <div class="section-note">{{ v10.featured_papers|length }} 篇重点论文，先讲明白，再进入方法和实验</div>
                 </div>
                 {% for article in v10.featured_papers %}
-                <article class="v10-entry">
-                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ article.v8_domain }} · {{ article.v8_source }}</div>
+                <article class="v10-entry" data-v11-item-key="{{ article.v11_item_key }}">
+                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <h3 class="v10-title">{{ article.title_cn }}</h3>
                     {% if article.v10_change_reason %}<div class="v10-evidence">本次变化：{{ article.v10_change_reason }}</div>{% endif %}
+                    <div class="v10-kicker">先看懂这篇</div>
                     <div class="v10-paper-plain">{{ article.v10_plain_summary }}</div>
                     <div class="v10-paper-tech">{{ article.v10_technical_intro }}</div>
                     {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
+                    {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}
                     <div class="v10-actions">
                         {% if article.v8_feedback.useful %}<a href="{{ article.v8_feedback.useful }}">有用</a>{% endif %}
                         {% if article.v8_feedback.track %}<a href="{{ article.v8_feedback.track }}">跟进</a>{% endif %}
@@ -1343,11 +1429,14 @@
                     <div class="section-note">{{ v10.more_papers|length }} 篇补充阅读，每篇保留技术内容而不是只列标题</div>
                 </div>
                 {% for article in v10.more_papers %}
-                <div class="v10-more-paper">
-                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ article.v8_domain }} · {{ article.v8_source }}</div>
+                <div class="v10-more-paper" data-v11-item-key="{{ article.v11_item_key }}">
+                    <div class="v10-kicker"><span class="v10-status">{{ article.v8_freshness }}</span>{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <a class="v10-more-title" href="{{ article.url }}" target="_blank">{{ article.title_cn }}</a>
                     {% if article.v10_change_reason %}<div class="v10-more-summary">本次变化：{{ article.v10_change_reason }}</div>{% endif %}
-                    <div class="v10-more-summary">{{ article.v10_appendix_summary }}</div>
+                    <div class="v10-kicker">先看懂这篇</div>
+                    <div class="v10-more-plain">{{ article.v10_plain_summary }}</div>
+                    <div class="v10-more-tech">{{ article.v10_technical_intro }}</div>
+                    {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}
                 </div>
                 {% endfor %}
             </div>

@@ -109,6 +109,11 @@ def _subject_matches(expected: str, actual: str) -> bool:
         return False
     if expected_timestamp and not actual_timestamp and str(actual or "").lstrip().startswith("["):
         return False
+    expected_volume = re.search(r"\[(\d+)\s*/\s*(\d+)\]", str(expected or ""))
+    if expected_volume:
+        actual_volume = re.search(r"\[(\d+)\s*/\s*(\d+)\]", str(actual or ""))
+        if not actual_volume or actual_volume.groups() != expected_volume.groups():
+            return False
     actual_norm = _normalize_match_text(actual)
     if not actual_norm:
         return False

@@ -24,9 +24,23 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 from dotenv import load_dotenv
 
+from src.collectors import (
+    CodexResearchInboxCollector,
+    SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS,
+    build_codex_research_inbox_collector,
+    build_codex_research_readiness_summary,
+    evaluate_sent_history_overlap,
+)
 from src.database import Database, resolve_database_path
-from src.editorial_engine import build_editorial_quality_metrics
+from src.editorial_engine import (
+    build_editorial_quality_metrics,
+    contains_mojibake,
+    paper_plain_summary_passes,
+    paper_technical_intro_passes,
+)
 from src.notifier import EmailNotifier, resolve_imap_server, verify_email_arrival
+from src.relevance import infer_source_tier
+from src.ui_audit import run_email_ui_audit as execute_email_ui_audit
 
 ROOT = Path(__file__).resolve().parent
 RESULT_MARKER = "__SCHEDULER_RESULT__="
@@ -59,8 +73,18 @@ TASK_RESULT_MESSAGES: Dict[int, str] = {
     0xC000013A: "The scheduled process was interrupted (0xC000013A), commonly by console closure or cancellation.",
 }
 DOCTOR_PASSING_HINTS = {"success", "ready", "running", "never_ran"}
-QUALITY_INFO_WARNING_PREFIXES = ("dedupe_removed_updates",)
+QUALITY_INFO_WARNING_PREFIXES = (
+    "dedupe_removed_updates",
+    "fresh_paper_target_underfilled",
+)
 FOCUS_REPORT_SECTIONS = {"must_read", "physical_ai", "watch", "featured_papers", "research"}
+LEARNING_DIGEST_DESIGN_VERSIONS = {"v10-learning-digest", "v11-editorial-library"}
+
+
+def is_learning_digest_design(value: Any) -> bool:
+    return str(value or "") in LEARNING_DIGEST_DESIGN_VERSIONS
+
+
 DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "log_dir": "logs",
     "status_file": "logs/last_run.json",
@@ -83,6 +107,11 @@ DEFAULT_SCHEDULER_CONFIG: Dict[str, Any] = {
     "run_as_user_env": "WEB_AGENT_RUNAS_USER",
     "run_as_password_env": "WEB_AGENT_RUNAS_PASSWORD",
     "send_slot_dir": "logs/send_slots",
+    "ui_audit_enabled": True,
+    "ui_audit_output_dir": "artifacts/v11_production_ui_audit",
+    "ui_audit_timeout_seconds": 180,
+    "v11_editorial_review_required": True,
+    "v11_editorial_review_dir": "data/v11_editorial_reviews",
     "send_slot_stale_seconds": 10800,
     "send_slots": [
         {"id": "1300", "time": "13:00"},
@@ -161,6 +190,8 @@ def load_runtime_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "log_archive_dir",
         "task_backup_dir",
         "send_slot_dir",
+        "ui_audit_output_dir",
+        "v11_editorial_review_dir",
     ):
         scheduler_config[key] = str((ROOT / str(scheduler_config[key])).resolve())
     return config, scheduler_config
@@ -536,6 +567,24 @@ def check_feedback_server_status(config: Dict[str, Any]) -> Dict[str, Any]:
     return status
 
 
+def delivery_verification_passed(verification: Dict[str, Any]) -> bool:
+    if bool(verification.get("verified", False)):
+        return True
+    if str(verification.get("status") or "") != "found":
+        return False
+    volumes = list(verification.get("volumes") or [])
+    if not volumes:
+        return bool(verification.get("matched_subject"))
+    return all(
+        str(volume.get("status") or "") == "found"
+        and (
+            bool(volume.get("verified", False))
+            or bool(volume.get("matched_subject"))
+        )
+        for volume in volumes
+    )
+
+
 def build_latest_report_snapshot_metrics(report_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
     from main import evaluate_paper_domain_quotas
 
@@ -795,7 +844,7 @@ def build_paper_freshness_production_acceptance(
             report_design_version = str(diagnostics.get("report_design_version", ""))
             gate = dict(diagnostics.get("quality_gate") or {})
             freshness = dict(diagnostics.get("paper_freshness") or {})
-            report["_freshness_enabled"] = report_design_version == "v10-learning-digest" and (
+            report["_freshness_enabled"] = is_learning_digest_design(report_design_version) and (
                 bool(freshness) or bool(gate.get("paper_freshness_status"))
             )
             report["_paper_freshness_status"] = str(
@@ -978,6 +1027,1171 @@ def build_paper_freshness_production_acceptance(
     }
 
 
+V11_PRODUCT_MODE = "intelligence_v11_editorial_library"
+V11_DESIGN_VERSION = "v11-editorial-library"
+V11_ACCEPTANCE_CONTRACT_VERSION = 12
+V11_GENERIC_PHRASES = (
+    "相关机构",
+    "出现了新的动作",
+    "不只是单点更新",
+    "可能影响产品路线",
+    "值得持续关注",
+    "未来可能带来影响",
+    "学习重点是",
+    "技术上，它主要围绕",
+    "需要回看原文确认",
+    "当前摘要还缺少",
+)
+
+
+def _v11_primary_section(item: Dict[str, Any]) -> str:
+    facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+    section = str(item.get("primary_section") or facts.get("primary_section") or "").strip().lower()
+    if section in {"news", "technical", "paper"}:
+        return section
+    content_type = str(item.get("content_type") or "").strip().lower()
+    if content_type == "paper":
+        return "paper"
+    if content_type in {"project", "open_source", "opensource"}:
+        return "technical"
+    return "news"
+
+
+def _v11_item_identity(item: Dict[str, Any]) -> str:
+    url = str(item.get("canonical_url") or item.get("url") or "").strip()
+    if url:
+        return CodexResearchInboxCollector._url_identity(url)
+    return str(item.get("title_cn") or item.get("title") or f"article:{item.get('id', '')}").strip().lower()
+
+
+def _v11_sample_quality(item: Dict[str, Any], section: str) -> list[str]:
+    facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+    evidence = facts.get("evidence") or item.get("evidence_points") or []
+    if isinstance(evidence, str):
+        evidence = [evidence]
+    source_excerpt = str(item.get("source_excerpt") or facts.get("source_excerpt") or "").strip()
+    evidence_locator = str(
+        item.get("evidence_locator") or facts.get("evidence_locator") or ""
+    ).strip()
+    publish_date = str(item.get("publish_date") or "").strip()
+    claim_type = str(item.get("claim_type") or facts.get("claim_type") or "").strip()
+    title = str(item.get("title_cn") or item.get("title") or "").strip()
+    issues = []
+    if str(item.get("analysis_version") or "") not in SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS:
+        issues.append("analysis_version_outdated")
+    if not title:
+        issues.append("title_missing")
+    elif contains_mojibake(title) or "…" in title or "..." in title:
+        issues.append("title_not_publishable")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}", publish_date):
+        issues.append("publish_date_missing")
+    if claim_type not in {
+        "verified_fact",
+        "official_claim",
+        "interview_opinion",
+        "analysis",
+        "research_result",
+    }:
+        issues.append("claim_type_missing")
+    if not all(str(facts.get(key) or "").strip() for key in ("who", "action", "target")):
+        issues.append("structured_facts_missing")
+    if not source_excerpt:
+        issues.append("source_excerpt_missing")
+    if not evidence_locator:
+        issues.append("evidence_locator_missing")
+    try:
+        evidence_quality = float(item.get("evidence_quality", 0) or 0)
+        information_density = float(
+            item.get("information_density", item.get("evidence_quality", 0)) or 0
+        )
+    except (TypeError, ValueError):
+        evidence_quality = 0.0
+        information_density = 0.0
+    if evidence_quality < 0.45:
+        issues.append("evidence_quality_low")
+    if information_density < 0.45:
+        issues.append("information_density_low")
+    if section == "paper":
+        body = " ".join(
+            str(item.get(key) or "").strip()
+            for key in ("paper_plain_summary", "paper_technical_intro")
+            if str(item.get(key) or "").strip()
+        )
+        minimum_chars = 160
+        maximum_chars = 500
+        if not paper_plain_summary_passes(item.get("paper_plain_summary")):
+            issues.append("paper_plain_summary_failed")
+        if not paper_technical_intro_passes(item.get("paper_technical_intro")):
+            issues.append("paper_technical_intro_failed")
+    else:
+        body = str(item.get("analysis_body") or item.get("summary") or "").strip()
+        content_type = str(item.get("content_type") or "").strip().lower()
+        minimum_chars = 300 if content_type in {"interview", "podcast", "video"} else (220 if section == "technical" else 180)
+        maximum_chars = 500 if content_type in {"interview", "podcast", "video"} else (380 if section == "technical" else 300)
+        if (
+            content_type in {"interview", "podcast", "video"}
+            and not re.search(r"\d{1,2}:\d{2}|文字稿|transcript|章节", evidence_locator, re.IGNORECASE)
+        ):
+            issues.append("interview_locator_imprecise")
+    compact_body = re.sub(r"\s+", "", body)
+    if len(compact_body) < minimum_chars:
+        issues.append(f"body_too_short={len(compact_body)}/{minimum_chars}")
+    if len(compact_body) > maximum_chars:
+        issues.append(f"body_too_long={len(compact_body)}/{maximum_chars}")
+    if not evidence:
+        issues.append("evidence_points_missing")
+    if len(re.findall(r"[。！？.!?]", body)) < 2:
+        issues.append("body_lacks_sentence_structure")
+    matched_phrases = [phrase for phrase in V11_GENERIC_PHRASES if phrase in body]
+    if matched_phrases:
+        issues.append(f"generic_phrase={matched_phrases[0]}")
+    return issues
+
+
+def _v11_editorial_review_result(
+    review: Dict[str, Any],
+    *,
+    report_id: str,
+    slot_id: str,
+    expected_samples: list[Dict[str, Any]],
+    require_client_rendering: bool = False,
+) -> Dict[str, Any]:
+    issues: list[str] = []
+    review_samples = list(review.get("samples") or []) if isinstance(review, dict) else []
+    if not review:
+        issues.append("editorial_review_missing")
+    if int(review.get("schema_version", 0) or 0) < 1:
+        issues.append("editorial_review_schema_invalid")
+    if str(review.get("report_id") or "") != report_id:
+        issues.append("editorial_review_report_mismatch")
+    if str(review.get("slot_id") or "") != slot_id:
+        issues.append("editorial_review_slot_mismatch")
+    if str(review.get("status") or "") != "passed":
+        issues.append(f"editorial_review_status={review.get('status') or 'missing'}")
+    if not str(review.get("reviewer") or "").strip():
+        issues.append("editorial_review_reviewer_missing")
+    reviewed_at = str(review.get("reviewed_at") or "").strip()
+    if _parse_status_datetime(reviewed_at) is None:
+        issues.append("editorial_review_timestamp_missing")
+
+    client_rendering = (
+        dict(review.get("client_rendering") or {})
+        if isinstance(review, dict)
+        else {}
+    )
+    if require_client_rendering:
+        failed_client_checks = [
+            key
+            for key in ("qq_desktop", "qq_mobile", "no_clipping", "spacing_readable")
+            if client_rendering.get(key) is not True
+        ]
+        if failed_client_checks:
+            issues.append("client_rendering_failed=" + ",".join(failed_client_checks))
+        if len(str(client_rendering.get("notes") or "").strip()) < 8:
+            issues.append("client_rendering_notes_missing")
+
+    review_by_key = {
+        (
+            str(sample.get("section") or "").strip(),
+            str(sample.get("url") or "").strip(),
+        ): sample
+        for sample in review_samples
+        if isinstance(sample, dict)
+    }
+    section_counts = {section: 0 for section in ("news", "technical", "paper")}
+    passed_sample_count = 0
+    for expected in expected_samples:
+        section = str(expected.get("section") or "").strip()
+        url = str(expected.get("url") or "").strip()
+        sample = review_by_key.get((section, url))
+        if not sample:
+            issues.append(f"editorial_review_sample_missing={section}:{url}")
+            continue
+        section_counts[section] = section_counts.get(section, 0) + 1
+        failed_dimensions = [
+            dimension
+            for dimension in ("accuracy", "specificity", "readability")
+            if sample.get(dimension) is not True
+        ]
+        if failed_dimensions:
+            issues.append(
+                f"editorial_review_sample_failed={section}:{url}:"
+                + ",".join(failed_dimensions)
+            )
+            continue
+        if len(str(sample.get("notes") or "").strip()) < 8:
+            issues.append(f"editorial_review_notes_missing={section}:{url}")
+            continue
+        passed_sample_count += 1
+
+    return {
+        "status": "passed" if not issues else "failed",
+        "reviewer": str(review.get("reviewer") or ""),
+        "reviewed_at": reviewed_at,
+        "sample_count": len(review_samples),
+        "expected_sample_count": len(expected_samples),
+        "passed_sample_count": passed_sample_count,
+        "section_counts": section_counts,
+        "client_rendering_required": require_client_rendering,
+        "client_rendering_passed": not require_client_rendering or not any(
+            issue.startswith("client_rendering_") for issue in issues
+        ),
+        "issues": issues,
+    }
+
+
+def build_v11_production_acceptance(
+    scheduler_config: Dict[str, Any],
+    *,
+    required_days: int = 3,
+    reports_per_day: int = 2,
+    minimum_news: int = 20,
+    minimum_technical: int = 20,
+    minimum_papers: int = 15,
+    minimum_discovery_candidates: int = 160,
+    minimum_discovered_by_section: Optional[Dict[str, int]] = None,
+    technical_primary_source_ratio_min: float = 0.80,
+    overlap_max: float = 0.10,
+    sample_size: int = 3,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    required_days = max(1, int(required_days or 3))
+    reports_per_day = max(1, int(reports_per_day or 2))
+    sample_size = max(1, int(sample_size or 3))
+    technical_primary_source_ratio_min = max(
+        0.0,
+        min(1.0, float(technical_primary_source_ratio_min or 0.80)),
+    )
+    minimum_discovery_candidates = max(0, int(minimum_discovery_candidates or 0))
+    minimum_discovered_by_section = {
+        section: max(0, int(minimum or 0))
+        for section, minimum in dict(
+            minimum_discovered_by_section
+            or {"news": 50, "technical": 50, "paper": 40}
+        ).items()
+        if section in {"news", "technical", "paper"}
+    }
+    required_report_count = required_days * reports_per_day
+    slot_dir = Path(str(scheduler_config.get("send_slot_dir", ROOT / "logs/send_slots")))
+    if not slot_dir.is_absolute():
+        slot_dir = ROOT / slot_dir
+    configured_slot_ids = [
+        str(slot.get("id") or "").strip()
+        for slot in scheduler_config.get("send_slots", DEFAULT_SCHEDULER_CONFIG["send_slots"])
+        if str(slot.get("id") or "").strip()
+    ][:reports_per_day]
+    if len(configured_slot_ids) < reports_per_day:
+        configured_slot_ids = ["1300", "2100"][:reports_per_day]
+
+    sent_slots = []
+    for path in slot_dir.glob("*.json") if slot_dir.exists() else []:
+        payload = read_json(path)
+        slot_id = str(payload.get("slot_id") or path.stem or "").strip()
+        if str(payload.get("status") or "") != "sent" or slot_id in {"", "__report_only__", "__dry_run__"}:
+            continue
+        finished_at = _parse_status_datetime(payload.get("finished_at"))
+        if finished_at is None:
+            continue
+        payload["_finished_at"] = finished_at
+        payload["_slot_id"] = slot_id
+        sent_slots.append(payload)
+    sent_slots.sort(key=lambda item: item["_finished_at"])
+
+    reports: list[Dict[str, Any]] = []
+    seen_report_ids: set[str] = set()
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path or resolve_database_path(None, ROOT)))
+        conn.row_factory = sqlite3.Row
+        for slot in sent_slots:
+            run_id = str(slot.get("run_id") or "")
+            html_path = str(slot.get("html_report_path") or "")
+            row = (
+                conn.execute(
+                    "SELECT * FROM report_runs WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if run_id
+                else conn.execute(
+                    "SELECT * FROM report_runs WHERE html_report_path = ? ORDER BY created_at DESC LIMIT 1",
+                    (html_path,),
+                ).fetchone()
+            )
+            if row is None:
+                continue
+            report = dict(row)
+            report_id = str(report.get("report_id") or "")
+            report_html = str(report.get("html_report_path") or "").replace("\\", "/")
+            if (
+                not report_id
+                or report_id in seen_report_ids
+                or str(report.get("delivery_status") or "") != "sent"
+                or "/validation/" in report_html
+            ):
+                continue
+            try:
+                diagnostics = json.loads(report.get("quality_diagnostics") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                diagnostics = {}
+            if str(diagnostics.get("report_product_mode") or "") != V11_PRODUCT_MODE:
+                continue
+            if str(diagnostics.get("report_design_version") or "") != V11_DESIGN_VERSION:
+                continue
+            item_rows = conn.execute(
+                "SELECT rank, section, snapshot_json FROM report_items WHERE report_id = ? ORDER BY rank",
+                (report_id,),
+            ).fetchall()
+            items = []
+            for item_row in item_rows:
+                try:
+                    item = json.loads(item_row["snapshot_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                item.setdefault("report_rank", item_row["rank"])
+                item.setdefault("report_section", item_row["section"])
+                items.append(item)
+            report["_items"] = items
+            report["_diagnostics"] = diagnostics
+            report["_finished_at"] = slot["_finished_at"]
+            report["_slot_id"] = str(report.get("slot_id") or slot["_slot_id"])
+            report["_slot_payload"] = slot
+            reports.append(report)
+            seen_report_ids.add(report_id)
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "status": "pending",
+            "required_days": required_days,
+            "required_report_count": required_report_count,
+            "verified_days": 0,
+            "verified_report_count": 0,
+            "reports": [],
+            "error": str(exc),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+    contract_start_index = next(
+        (
+            index
+            for index, report in enumerate(reports)
+            if int(
+                report.get("_diagnostics", {}).get("v11_acceptance_contract_version", 0)
+                or 0
+            ) >= V11_ACCEPTANCE_CONTRACT_VERSION
+        ),
+        None,
+    )
+    pre_contract_report_count = (
+        len(reports) if contract_start_index is None else contract_start_index
+    )
+    contract_started_at = ""
+    if contract_start_index is None:
+        reports = []
+    else:
+        reports = reports[contract_start_index:]
+        contract_started_at = reports[0]["_finished_at"].isoformat()
+
+    available_days = sorted({report["_finished_at"].date() for report in reports}, reverse=True)
+    consecutive_days = []
+    if available_days:
+        available_set = set(available_days)
+        day = available_days[0]
+        while day in available_set and len(consecutive_days) < required_days:
+            consecutive_days.append(day)
+            day -= timedelta(days=1)
+    selected_day_strings = {day.isoformat() for day in consecutive_days}
+    selected_reports = [
+        report for report in reports if report["_finished_at"].date().isoformat() in selected_day_strings
+    ]
+    selected_reports.sort(key=lambda report: report["_finished_at"])
+
+    rows = []
+    previous_papers: list[Dict[str, Any]] = []
+    paper_history: list[tuple[datetime, Dict[str, Any]]] = []
+    for report in selected_reports:
+        items = report["_items"]
+        by_section = {
+            section: [item for item in items if _v11_primary_section(item) == section]
+            for section in ("news", "technical", "paper")
+        }
+        technical_primary_source_count = sum(
+            1
+            for item in by_section["technical"]
+            if infer_source_tier(item).lower()
+            in {"official", "research", "primary"}
+        )
+        technical_primary_source_ratio = (
+            round(
+                technical_primary_source_count / len(by_section["technical"]),
+                3,
+            )
+            if by_section["technical"]
+            else 0.0
+        )
+        identities = [_v11_item_identity(item) for item in items if _v11_item_identity(item)]
+        duplicate_count = len(identities) - len(set(identities))
+        event_identities = [
+            CodexResearchInboxCollector._event_identity(item)
+            for item in items
+            if CodexResearchInboxCollector._event_identity(item)
+        ]
+        duplicate_event_count = len(event_identities) - len(set(event_identities))
+        within_report_paper_duplicates = []
+        for index, paper in enumerate(by_section["paper"]):
+            if any(_paper_snapshots_match(paper, prior) for prior in by_section["paper"][:index]):
+                within_report_paper_duplicates.append(_paper_snapshot_key(paper))
+        overlap_items = [
+            paper
+            for paper in by_section["paper"]
+            if any(_paper_snapshots_match(paper, prior) for prior in previous_papers)
+        ]
+        overlap_rate = len(overlap_items) / max(1, len(by_section["paper"]))
+        cooldown_items = [
+            prior
+            for timestamp, prior in paper_history
+            if report["_finished_at"] - timestamp <= timedelta(days=7)
+        ]
+        unjustified = []
+        for paper in by_section["paper"]:
+            matches = [prior for prior in cooldown_items if _paper_snapshots_match(paper, prior)]
+            if matches and not _paper_reappearance_is_supported(paper, matches):
+                unjustified.append(_paper_snapshot_key(paper))
+
+        sample_rows = []
+        for section in ("news", "technical", "paper"):
+            for item in by_section[section][:sample_size]:
+                sample_issues = _v11_sample_quality(item, section)
+                sample_rows.append({
+                    "article_id": item.get("id"),
+                    "section": section,
+                    "title": str(item.get("title_cn") or item.get("title") or ""),
+                    "url": str(item.get("canonical_url") or item.get("url") or ""),
+                    "publish_date": str(item.get("publish_date") or ""),
+                    "claim_type": str(
+                        item.get("claim_type")
+                        or (item.get("facts") or {}).get("claim_type")
+                        or ""
+                    ),
+                    "body_chars": len(
+                        re.sub(
+                            r"\s+",
+                            "",
+                            " ".join(
+                                str(item.get(key) or "")
+                                for key in (
+                                    ("paper_plain_summary", "paper_technical_intro")
+                                    if section == "paper"
+                                    else ("analysis_body",)
+                                )
+                            ),
+                        )
+                    ),
+                    "source_evidence_present": bool(
+                        str(
+                            item.get("source_excerpt")
+                            or (item.get("facts") or {}).get("source_excerpt")
+                            or ""
+                        ).strip()
+                        and str(
+                            item.get("evidence_locator")
+                            or (item.get("facts") or {}).get("evidence_locator")
+                            or ""
+                        ).strip()
+                    ),
+                    "passed": not sample_issues,
+                    "issues": sample_issues,
+                })
+        sample_counts = {
+            section: sum(1 for sample in sample_rows if sample["section"] == section)
+            for section in ("news", "technical", "paper")
+        }
+        issues = []
+        minimums = {"news": minimum_news, "technical": minimum_technical, "paper": minimum_papers}
+        for section, minimum in minimums.items():
+            if len(by_section[section]) < minimum:
+                issues.append(f"{section}_count_below_min={len(by_section[section])}/{minimum}")
+            if sample_counts[section] < sample_size:
+                issues.append(f"{section}_sample_underfilled={sample_counts[section]}/{sample_size}")
+        if duplicate_count:
+            issues.append(f"cross_section_duplicates={duplicate_count}")
+        if duplicate_event_count:
+            issues.append(f"cross_section_event_duplicates={duplicate_event_count}")
+        if within_report_paper_duplicates:
+            issues.append(f"paper_within_report_duplicates={len(within_report_paper_duplicates)}")
+        if previous_papers and overlap_rate >= overlap_max:
+            issues.append(f"adjacent_paper_overlap={overlap_rate:.3f}")
+        if unjustified:
+            issues.append(f"unjustified_7d_repeats={len(set(unjustified))}")
+        failed_samples = [sample for sample in sample_rows if not sample["passed"]]
+        if failed_samples:
+            issues.append(f"sample_quality_failures={len(failed_samples)}")
+        if technical_primary_source_ratio < technical_primary_source_ratio_min:
+            issues.append(
+                "technical_primary_source_ratio="
+                f"{technical_primary_source_ratio:.3f}/{technical_primary_source_ratio_min:.3f}"
+            )
+        editorial_review_required = bool(
+            scheduler_config.get("v11_editorial_review_required", False)
+        )
+        editorial_review_path = ""
+        editorial_review_result = {
+            "status": "disabled",
+            "sample_count": 0,
+            "expected_sample_count": len(sample_rows),
+            "passed_sample_count": 0,
+            "section_counts": {},
+            "issues": [],
+        }
+        if editorial_review_required:
+            review_dir = Path(
+                str(
+                    scheduler_config.get("v11_editorial_review_dir")
+                    or ROOT / "data/v11_editorial_reviews"
+                )
+            )
+            if not review_dir.is_absolute():
+                review_dir = ROOT / review_dir
+            review_path = review_dir / f"{report['_slot_id']}.json"
+            editorial_review_path = review_path.as_posix()
+            editorial_review_result = _v11_editorial_review_result(
+                read_json(review_path),
+                report_id=str(report.get("report_id") or ""),
+                slot_id=str(report.get("_slot_id") or ""),
+                expected_samples=sample_rows,
+                require_client_rendering=bool(
+                    scheduler_config.get("v11_client_render_review_required", False)
+                ),
+            )
+            issues.extend(editorial_review_result["issues"])
+        if str(report.get("quality_status") or "") != "passed":
+            issues.append(f"report_quality_status={report.get('quality_status') or 'unknown'}")
+        quality_gate = dict(report.get("_diagnostics", {}).get("quality_gate") or {})
+        final_html_quality_status = str(
+            quality_gate.get("final_html_quality_status") or "missing"
+        )
+        inline_style_count = int(quality_gate.get("v11_inline_style_count", 0) or 0)
+        inline_style_required_count = len(items) * 3 + 10
+        generic_phrase_count = int(quality_gate.get("generic_phrase_count", 0) or 0)
+        mixed_language_title_count = int(
+            quality_gate.get("mixed_language_title_count", 0) or 0
+        )
+        attribution_opener_repeat_count = int(
+            quality_gate.get("max_attribution_opener_repeat_count", 0) or 0
+        )
+        attribution_opener_run = int(
+            quality_gate.get("max_attribution_opener_run", 0) or 0
+        )
+        supplemental_expected_count = max(
+            int(quality_gate.get("v11_supplemental_expected_count", 0) or 0),
+            sum(
+                1
+                for item in items
+                if "supplemental_older_source" in set(item.get("quality_flags") or [])
+            ),
+        )
+        supplemental_label_count = int(
+            quality_gate.get("v11_supplemental_label_count", 0) or 0
+        )
+        supplemental_items = [
+            item
+            for item in items
+            if "supplemental_older_source" in set(item.get("quality_flags") or [])
+        ]
+        supplemental_counts_by_section: Dict[str, int] = {}
+        for item in supplemental_items:
+            section = _v11_primary_section(item)
+            supplemental_counts_by_section[section] = (
+                supplemental_counts_by_section.get(section, 0) + 1
+            )
+        supplemental_limits = {"news": 5, "technical": 5, "paper": 3}
+        supplemental_limit_exceeded = {
+            section: {"count": count, "max": supplemental_limits[section]}
+            for section, count in supplemental_counts_by_section.items()
+            if section in supplemental_limits and count > supplemental_limits[section]
+        }
+        supplemental_max_age_days = {"news": 7, "technical": 30, "paper": 30}
+        supplemental_age_violations = []
+        for item in supplemental_items:
+            section = _v11_primary_section(item)
+            published_at = _parse_status_datetime(item.get("publish_date"))
+            if published_at is None or section not in supplemental_max_age_days:
+                continue
+            age_days = (report["_finished_at"] - published_at).total_seconds() / 86400
+            if age_days > supplemental_max_age_days[section]:
+                supplemental_age_violations.append({
+                    "section": section,
+                    "url": str(item.get("canonical_url") or item.get("url") or ""),
+                    "publish_date": str(item.get("publish_date") or ""),
+                    "age_days": round(age_days, 2),
+                    "max_age_days": supplemental_max_age_days[section],
+                })
+        content_fidelity_missing_count = int(
+            quality_gate.get("v11_content_fidelity_missing_count", 0) or 0
+        )
+        claim_label_expected_count = int(
+            quality_gate.get("v11_claim_label_expected_count", 0) or 0
+        )
+        claim_label_visible_count = int(
+            quality_gate.get("v11_claim_label_visible_count", 0) or 0
+        )
+        if final_html_quality_status != "passed":
+            issues.append(f"final_html_quality_status={final_html_quality_status}")
+        if inline_style_count < inline_style_required_count:
+            issues.append(
+                f"v11_inline_style_count={inline_style_count}/{inline_style_required_count}"
+            )
+        if generic_phrase_count:
+            issues.append(f"generic_phrase_count={generic_phrase_count}")
+        if mixed_language_title_count:
+            issues.append(f"mixed_language_title_count={mixed_language_title_count}")
+        if "max_attribution_opener_repeat_count" not in quality_gate:
+            issues.append("max_attribution_opener_repeat_count=missing")
+        elif attribution_opener_repeat_count > 8:
+            issues.append(
+                "max_attribution_opener_repeat_count="
+                f"{attribution_opener_repeat_count}/8"
+            )
+        if "max_attribution_opener_run" not in quality_gate:
+            issues.append("max_attribution_opener_run=missing")
+        elif attribution_opener_run > 1:
+            issues.append(f"max_attribution_opener_run={attribution_opener_run}/1")
+        if supplemental_label_count < supplemental_expected_count:
+            issues.append(
+                "v11_supplemental_label_count="
+                f"{supplemental_label_count}/{supplemental_expected_count}"
+            )
+        if supplemental_limit_exceeded:
+            issues.append("v11_supplemental_limit_exceeded")
+        if supplemental_age_violations:
+            issues.append(
+                "v11_supplemental_age_violation_count="
+                f"{len(supplemental_age_violations)}"
+            )
+        if content_fidelity_missing_count:
+            issues.append(
+                f"v11_content_fidelity_missing_count={content_fidelity_missing_count}"
+            )
+        if claim_label_expected_count != len(items):
+            issues.append(
+                f"v11_claim_label_expected_count={claim_label_expected_count}/{len(items)}"
+            )
+        if claim_label_visible_count != claim_label_expected_count:
+            issues.append(
+                "v11_claim_label_visible_count="
+                f"{claim_label_visible_count}/{claim_label_expected_count}"
+            )
+        research_inbox = dict(report.get("_diagnostics", {}).get("codex_research_inbox") or {})
+        research_schema_version = str(research_inbox.get("schema_version") or "")
+        if research_schema_version != "codex-research-v3":
+            issues.append(
+                f"codex_research_schema_version={research_schema_version or 'missing'}"
+            )
+        sent_history_overlap_count = int(
+            research_inbox.get("sent_history_overlap_count", 0) or 0
+        )
+        sent_history_overlap_by_section = dict(
+            research_inbox.get("sent_history_overlap_by_section") or {}
+        )
+        if str(research_inbox.get("quality_status") or "missing") != "passed":
+            issues.append(f"codex_research_quality_status={research_inbox.get('quality_status') or 'missing'}")
+        if "attribution_opener_overuse_count" not in research_inbox:
+            issues.append("codex_research_attribution_opener_overuse_count=missing")
+        elif int(research_inbox.get("attribution_opener_overuse_count", 0) or 0):
+            issues.append(
+                "codex_research_attribution_opener_overuse_count="
+                f"{int(research_inbox.get('attribution_opener_overuse_count', 0) or 0)}"
+            )
+        if "cross_item_template_repeat_count" not in research_inbox:
+            issues.append("codex_research_cross_item_template_repeat_count=missing")
+        elif int(research_inbox.get("cross_item_template_repeat_count", 0) or 0):
+            issues.append(
+                "codex_research_cross_item_template_repeat_count="
+                f"{int(research_inbox.get('cross_item_template_repeat_count', 0) or 0)}"
+            )
+        if sent_history_overlap_count:
+            issues.append(
+                f"sent_history_overlap_count={sent_history_overlap_count}"
+            )
+        for metric in (
+            "discovery_quota_status",
+            "submission_quota_status",
+            "technical_quota_status",
+            "news_format_quota_status",
+            "paper_domain_quota_status",
+            "freshness_quota_status",
+            "key_number_quota_status",
+        ):
+            if str(research_inbox.get(metric) or "missing") != "passed":
+                issues.append(f"codex_research_{metric}={research_inbox.get(metric) or 'missing'}")
+        discovery_candidate_count = int(
+            research_inbox.get("discovery_candidate_count", 0) or 0
+        )
+        discovery_section_counts = dict(
+            research_inbox.get("discovery_section_counts") or {}
+        )
+        inbox_sha256 = str(research_inbox.get("inbox_sha256") or "")
+        discovery_manifest_sha256 = str(
+            research_inbox.get("discovery_manifest_sha256") or ""
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", inbox_sha256):
+            issues.append("codex_research_inbox_sha256_missing")
+        if not re.fullmatch(r"[0-9a-f]{64}", discovery_manifest_sha256):
+            issues.append("codex_research_discovery_manifest_sha256_missing")
+        if discovery_candidate_count < minimum_discovery_candidates:
+            issues.append(
+                "codex_research_discovery_candidate_count="
+                f"{discovery_candidate_count}/{minimum_discovery_candidates}"
+            )
+        for section, minimum in minimum_discovered_by_section.items():
+            count = int(discovery_section_counts.get(section, 0) or 0)
+            if count < minimum:
+                issues.append(
+                    f"codex_research_discovery_{section}_count={count}/{minimum}"
+                )
+        for metric in (
+            "discovery_duplicate_url_count",
+            "discovery_invalid_row_count",
+            "submitted_not_in_discovery_count",
+            "key_number_contract_missing_count",
+            "key_number_evidence_missing_count",
+            "key_number_public_copy_missing_count",
+        ):
+            count = int(research_inbox.get(metric, 0) or 0)
+            if count:
+                issues.append(f"codex_research_{metric}={count}")
+        research_technical_primary_ratio = float(
+            research_inbox.get("technical_primary_source_ratio", 0.0) or 0.0
+        )
+        if research_technical_primary_ratio < technical_primary_source_ratio_min:
+            issues.append(
+                "codex_research_technical_primary_source_ratio="
+                f"{research_technical_primary_ratio:.3f}/{technical_primary_source_ratio_min:.3f}"
+            )
+        if bool(quality_gate.get("email_clipping_risk", False)):
+            issues.append(f"email_clipping_risk={int(quality_gate.get('html_size_bytes', 0) or 0)}")
+        slot_payload = dict(report.get("_slot_payload") or {})
+        email_split_applied = bool(quality_gate.get("email_split_applied", False))
+        email_volume_count = int(quality_gate.get("email_delivery_volume_count", 1) or 1)
+        email_volume_sizes = [
+            int(value or 0) for value in (quality_gate.get("email_delivery_volume_sizes") or [])
+        ]
+        volume_editorial_decision_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_editorial_decision_counts") or []
+            )
+        ]
+        volume_editorial_decision_visible_source_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_editorial_decision_visible_source_counts") or []
+            )
+        ]
+        volume_editorial_decision_source_missing_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_editorial_decision_source_missing_counts") or []
+            )
+        ]
+        volume_editorial_decision_duplicate_source_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_editorial_decision_duplicate_source_counts") or []
+            )
+        ]
+        volume_claim_label_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_claim_label_counts") or []
+            )
+        ]
+        volume_item_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get("email_delivery_volume_item_counts") or []
+            )
+        ]
+        volume_nav_mismatch_count = int(
+            quality_gate.get("email_delivery_volume_nav_mismatch_count", 0) or 0
+        )
+        volume_preheader_mismatch_count = int(
+            quality_gate.get("email_delivery_volume_preheader_mismatch_count", 0) or 0
+        )
+        volume_content_fidelity_missing_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get(
+                    "email_delivery_volume_content_fidelity_missing_counts"
+                )
+                or []
+            )
+        ]
+        volume_content_fidelity_missing_count = int(
+            quality_gate.get(
+                "email_delivery_volume_content_fidelity_missing_count",
+                sum(volume_content_fidelity_missing_counts),
+            )
+            or 0
+        )
+        volume_key_number_fidelity_missing_counts = [
+            int(value or 0)
+            for value in (
+                quality_gate.get(
+                    "email_delivery_volume_key_number_fidelity_missing_counts"
+                )
+                or []
+            )
+        ]
+        volume_key_number_fidelity_missing_count = int(
+            quality_gate.get(
+                "email_delivery_volume_key_number_fidelity_missing_count",
+                sum(volume_key_number_fidelity_missing_counts),
+            )
+            or 0
+        )
+        email_volume_paths = [
+            str(value or "").strip()
+            for value in (
+                quality_gate.get("email_delivery_volume_paths")
+                or slot_payload.get("email_volume_paths")
+                or []
+            )
+            if str(value or "").strip()
+        ]
+        resolved_volume_paths = [
+            path if path.is_absolute() else ROOT / path
+            for path in (Path(value) for value in email_volume_paths)
+        ]
+        archived_volume_sizes = [
+            path.stat().st_size if path.exists() and path.is_file() else 0
+            for path in resolved_volume_paths
+        ]
+        if email_split_applied and email_volume_count < 2:
+            issues.append(f"email_split_volume_count={email_volume_count}")
+        if any(size > 104448 for size in email_volume_sizes):
+            issues.append(f"email_volume_oversize={max(email_volume_sizes)}")
+        if len(email_volume_paths) != email_volume_count:
+            issues.append(
+                f"email_volume_archive_count={len(email_volume_paths)}/{email_volume_count}"
+            )
+        elif any(size <= 0 for size in archived_volume_sizes):
+            issues.append("email_volume_archive_missing")
+        elif (
+            len(email_volume_sizes) == email_volume_count
+            and archived_volume_sizes != email_volume_sizes
+        ):
+            issues.append(
+                "email_volume_archive_size_mismatch="
+                + ",".join(str(size) for size in archived_volume_sizes)
+                + "/"
+                + ",".join(str(size) for size in email_volume_sizes)
+            )
+        if len(volume_editorial_decision_counts) != email_volume_count:
+            issues.append(
+                "email_volume_editorial_decision_count_rows="
+                f"{len(volume_editorial_decision_counts)}/{email_volume_count}"
+            )
+        elif any(not 5 <= count <= 7 for count in volume_editorial_decision_counts):
+            issues.append(
+                "email_volume_editorial_decision_counts="
+                + ",".join(str(count) for count in volume_editorial_decision_counts)
+            )
+        if volume_editorial_decision_visible_source_counts != volume_editorial_decision_counts:
+            issues.append(
+                "email_volume_editorial_decision_visible_sources="
+                + ",".join(str(count) for count in volume_editorial_decision_visible_source_counts)
+                + "/"
+                + ",".join(str(count) for count in volume_editorial_decision_counts)
+            )
+        if any(volume_editorial_decision_source_missing_counts):
+            issues.append(
+                "email_volume_editorial_decision_source_missing_counts="
+                + ",".join(str(count) for count in volume_editorial_decision_source_missing_counts)
+            )
+        if any(volume_editorial_decision_duplicate_source_counts):
+            issues.append(
+                "email_volume_editorial_decision_duplicate_source_counts="
+                + ",".join(str(count) for count in volume_editorial_decision_duplicate_source_counts)
+            )
+        if (
+            len(volume_claim_label_counts) != email_volume_count
+            or len(volume_item_counts) != email_volume_count
+        ):
+            issues.append(
+                "email_volume_claim_label_rows="
+                f"{len(volume_claim_label_counts)}/{len(volume_item_counts)}/{email_volume_count}"
+            )
+        elif volume_claim_label_counts != volume_item_counts:
+            issues.append(
+                "email_volume_claim_label_counts="
+                + ",".join(str(count) for count in volume_claim_label_counts)
+                + "/"
+                + ",".join(str(count) for count in volume_item_counts)
+            )
+        if volume_nav_mismatch_count:
+            issues.append(f"email_delivery_volume_nav_mismatch_count={volume_nav_mismatch_count}")
+        if volume_preheader_mismatch_count:
+            issues.append(
+                "email_delivery_volume_preheader_mismatch_count="
+                f"{volume_preheader_mismatch_count}"
+            )
+        if volume_content_fidelity_missing_count:
+            issues.append(
+                "email_delivery_volume_content_fidelity_missing_count="
+                f"{volume_content_fidelity_missing_count}"
+            )
+        if volume_key_number_fidelity_missing_count:
+            issues.append(
+                "email_delivery_volume_key_number_fidelity_missing_count="
+                f"{volume_key_number_fidelity_missing_count}"
+            )
+        sent_volume_count = int(slot_payload.get("email_volume_sent_count", 0) or 0)
+        expected_subjects = [str(value or "") for value in (slot_payload.get("email_subjects") or [])]
+        delivery_verification = dict(slot_payload.get("delivery_verification") or {})
+        delivery_arrival_status = str(delivery_verification.get("status") or "missing")
+        if sent_volume_count != email_volume_count:
+            issues.append(f"email_volume_sent_count={sent_volume_count}/{email_volume_count}")
+        if delivery_arrival_status != "found":
+            issues.append(f"delivery_arrival_status={delivery_arrival_status}")
+        verification_rows = list(delivery_verification.get("volumes") or [])
+        if not verification_rows and delivery_verification:
+            verification_rows = [delivery_verification]
+        matched_subjects = [str(value.get("matched_subject") or "") for value in verification_rows]
+        if len(verification_rows) != email_volume_count:
+            issues.append(f"delivery_verified_volume_count={len(verification_rows)}/{email_volume_count}")
+        elif expected_subjects and (
+            len(set(matched_subjects)) != email_volume_count
+            or set(matched_subjects) != set(expected_subjects)
+        ):
+            issues.append("delivery_volume_subject_mismatch")
+        post_send_scan = dict(slot_payload.get("post_send_quality_scan") or {})
+        post_send_focus_issue_count = int(post_send_scan.get("focus_issue_count", 0) or 0)
+        if post_send_focus_issue_count:
+            issues.append(f"post_send_focus_issue_count={post_send_focus_issue_count}")
+        ui_audit = dict(slot_payload.get("ui_audit") or {})
+        ui_audit_status = str(ui_audit.get("status") or "missing")
+        ui_audit_render_count = int(ui_audit.get("render_count", 0) or 0)
+        ui_audit_failed_render_count = int(ui_audit.get("failed_render_count", 0) or 0)
+        expected_ui_audit_render_count = email_volume_count * 4
+        if ui_audit_status != "passed":
+            issues.append(f"ui_audit_status={ui_audit_status}")
+        if ui_audit_render_count != expected_ui_audit_render_count:
+            issues.append(
+                f"ui_audit_render_count={ui_audit_render_count}/{expected_ui_audit_render_count}"
+            )
+        if ui_audit_failed_render_count:
+            issues.append(f"ui_audit_failed_render_count={ui_audit_failed_render_count}")
+        if str(quality_gate.get("paper_domain_quota_status") or "passed") == "failed":
+            issues.append("paper_domain_quota_status=failed")
+        editorial_decision_count = int(quality_gate.get("editorial_decision_count", 0) or 0)
+        if not 5 <= editorial_decision_count <= 7:
+            issues.append(f"editorial_decision_count={editorial_decision_count}/5-7")
+        for metric in (
+            "editorial_decision_source_missing_count",
+            "editorial_decision_duplicate_source_count",
+        ):
+            if int(quality_gate.get(metric, 0) or 0) > 0:
+                issues.append(f"{metric}={int(quality_gate.get(metric, 0) or 0)}")
+        for metric in (
+            "body_under_min_count",
+            "publish_date_missing_count",
+            "source_evidence_missing_count",
+            "claim_type_missing_count",
+            "paper_full_text_missing_count",
+            "analysis_version_mismatch_count",
+            "v11_external_item_count",
+            "v11_key_number_fidelity_missing_count",
+            "v11_editorial_source_hash_missing_count",
+            "v11_editorial_source_mismatch_count",
+        ):
+            if int(quality_gate.get(metric, 0) or 0) > 0:
+                issues.append(f"{metric}={int(quality_gate.get(metric, 0) or 0)}")
+        rows.append({
+            "date": report["_finished_at"].date().isoformat(),
+            "slot_id": report["_slot_id"],
+            "email_split_applied": email_split_applied,
+            "email_delivery_volume_count": email_volume_count,
+            "email_delivery_volume_sizes": email_volume_sizes,
+            "email_delivery_volume_paths": email_volume_paths,
+            "email_delivery_volume_archive_sizes": archived_volume_sizes,
+            "email_delivery_volume_editorial_decision_counts": volume_editorial_decision_counts,
+            "email_delivery_volume_editorial_decision_visible_source_counts": volume_editorial_decision_visible_source_counts,
+            "email_delivery_volume_editorial_decision_source_missing_counts": volume_editorial_decision_source_missing_counts,
+            "email_delivery_volume_editorial_decision_duplicate_source_counts": volume_editorial_decision_duplicate_source_counts,
+            "email_delivery_volume_claim_label_counts": volume_claim_label_counts,
+            "email_delivery_volume_item_counts": volume_item_counts,
+            "email_delivery_volume_nav_mismatch_count": volume_nav_mismatch_count,
+            "email_delivery_volume_preheader_mismatch_count": volume_preheader_mismatch_count,
+            "email_delivery_volume_content_fidelity_missing_counts": (
+                volume_content_fidelity_missing_counts
+            ),
+            "email_delivery_volume_content_fidelity_missing_count": (
+                volume_content_fidelity_missing_count
+            ),
+            "email_delivery_volume_key_number_fidelity_missing_counts": (
+                volume_key_number_fidelity_missing_counts
+            ),
+            "email_delivery_volume_key_number_fidelity_missing_count": (
+                volume_key_number_fidelity_missing_count
+            ),
+            "email_volume_sent_count": sent_volume_count,
+            "delivery_arrival_status": delivery_arrival_status,
+            "delivery_verified_volume_count": len(verification_rows),
+            "post_send_focus_issue_count": post_send_focus_issue_count,
+            "ui_audit_status": ui_audit_status,
+            "ui_audit_render_count": ui_audit_render_count,
+            "ui_audit_expected_render_count": expected_ui_audit_render_count,
+            "ui_audit_failed_render_count": ui_audit_failed_render_count,
+            "finished_at": report["_finished_at"].isoformat(),
+            "report_id": report.get("report_id", ""),
+            "html_report_path": report.get("html_report_path", ""),
+            "news_count": len(by_section["news"]),
+            "technical_count": len(by_section["technical"]),
+            "technical_primary_source_count": technical_primary_source_count,
+            "technical_primary_source_ratio": technical_primary_source_ratio,
+            "paper_count": len(by_section["paper"]),
+            "cross_section_duplicate_count": duplicate_count,
+            "cross_section_event_duplicate_count": duplicate_event_count,
+            "paper_within_report_duplicate_count": len(within_report_paper_duplicates),
+            "adjacent_report_paper_overlap_rate": round(overlap_rate, 3),
+            "unjustified_7d_repeat_count": len(set(unjustified)),
+            "html_size_bytes": int(quality_gate.get("html_size_bytes", 0) or 0),
+            "email_clipping_warning": bool(quality_gate.get("email_clipping_warning", False)),
+            "email_clipping_risk": bool(quality_gate.get("email_clipping_risk", False)),
+            "final_html_quality_status": final_html_quality_status,
+            "v11_inline_style_count": inline_style_count,
+            "v11_inline_style_required_count": inline_style_required_count,
+            "generic_phrase_count": generic_phrase_count,
+            "mixed_language_title_count": mixed_language_title_count,
+            "v11_supplemental_expected_count": supplemental_expected_count,
+            "v11_supplemental_label_count": supplemental_label_count,
+            "v11_supplemental_counts_by_section": supplemental_counts_by_section,
+            "v11_supplemental_limit_exceeded": supplemental_limit_exceeded,
+            "v11_supplemental_age_violation_count": len(supplemental_age_violations),
+            "v11_supplemental_age_violation_examples": supplemental_age_violations[:5],
+            "v11_content_fidelity_missing_count": content_fidelity_missing_count,
+            "v11_claim_label_expected_count": claim_label_expected_count,
+            "v11_claim_label_visible_count": claim_label_visible_count,
+            "v11_external_item_count": int(
+                quality_gate.get("v11_external_item_count", 0) or 0
+            ),
+            "v11_editorial_source_hash_missing_count": int(
+                quality_gate.get("v11_editorial_source_hash_missing_count", 0) or 0
+            ),
+            "v11_editorial_source_mismatch_count": int(
+                quality_gate.get("v11_editorial_source_mismatch_count", 0) or 0
+            ),
+            "sample_quality_pass_count": sum(1 for sample in sample_rows if sample["passed"]),
+            "sample_quality_required_count": sample_size * 3,
+            "sample_quality": sample_rows,
+            "editorial_review_required": editorial_review_required,
+            "editorial_review_path": editorial_review_path,
+            "editorial_review_status": editorial_review_result["status"],
+            "editorial_review_pass_count": editorial_review_result["passed_sample_count"],
+            "editorial_review_required_count": editorial_review_result["expected_sample_count"],
+            "editorial_review": editorial_review_result,
+            "codex_research_quality_status": str(research_inbox.get("quality_status") or "missing"),
+            "codex_research_discovery_quota_status": str(
+                research_inbox.get("discovery_quota_status") or "missing"
+            ),
+            "codex_research_discovery_candidate_count": discovery_candidate_count,
+            "codex_research_discovery_section_counts": discovery_section_counts,
+            "codex_research_inbox_sha256": inbox_sha256,
+            "codex_research_discovery_manifest_sha256": discovery_manifest_sha256,
+            "codex_research_discovery_duplicate_url_count": int(
+                research_inbox.get("discovery_duplicate_url_count", 0) or 0
+            ),
+            "codex_research_discovery_invalid_row_count": int(
+                research_inbox.get("discovery_invalid_row_count", 0) or 0
+            ),
+            "codex_research_submitted_not_in_discovery_count": int(
+                research_inbox.get("submitted_not_in_discovery_count", 0) or 0
+            ),
+            "codex_research_submission_quota_status": str(
+                research_inbox.get("submission_quota_status") or "missing"
+            ),
+            "codex_research_submitted_section_counts": dict(
+                research_inbox.get("submitted_section_counts") or {}
+            ),
+            "codex_research_rejected_section_counts": dict(
+                research_inbox.get("rejected_section_counts") or {}
+            ),
+            "codex_research_rejection_reason_counts_by_section": dict(
+                research_inbox.get("rejection_reason_counts_by_section") or {}
+            ),
+            "codex_research_accepted_section_rates": dict(
+                research_inbox.get("accepted_section_rates") or {}
+            ),
+            "codex_research_fresh_counts": dict(research_inbox.get("fresh_source_counts") or {}),
+            "codex_research_news_format_counts": dict(research_inbox.get("news_format_counts") or {}),
+            "codex_research_schema_version": research_schema_version,
+            "codex_research_key_number_contract_missing_count": int(
+                research_inbox.get("key_number_contract_missing_count", 0) or 0
+            ),
+            "codex_research_key_number_evidence_missing_count": int(
+                research_inbox.get("key_number_evidence_missing_count", 0) or 0
+            ),
+            "codex_research_key_number_public_copy_missing_count": int(
+                research_inbox.get("key_number_public_copy_missing_count", 0) or 0
+            ),
+            "codex_research_key_number_item_counts": dict(
+                research_inbox.get("key_number_item_counts") or {}
+            ),
+            "codex_research_key_number_underfilled": list(
+                research_inbox.get("key_number_underfilled") or []
+            ),
+            "sent_history_overlap_count": sent_history_overlap_count,
+            "sent_history_overlap_by_section": sent_history_overlap_by_section,
+            "codex_research_technical_primary_source_count": int(
+                research_inbox.get("technical_primary_source_count", 0) or 0
+            ),
+            "codex_research_technical_primary_source_ratio": research_technical_primary_ratio,
+            "passed": not issues,
+            "issues": issues,
+        })
+        previous_papers = by_section["paper"]
+        paper_history.extend((report["_finished_at"], paper) for paper in by_section["paper"])
+
+    slots_by_day: Dict[str, set[str]] = {}
+    for row in rows:
+        day_slots = slots_by_day.setdefault(row["date"], set())
+        for slot_name in configured_slot_ids:
+            if row["slot_id"].endswith(f"_{slot_name}"):
+                day_slots.add(slot_name)
+    missing_slots = {
+        day: [slot_name for slot_name in configured_slot_ids if slot_name not in slots_by_day.get(day, set())]
+        for day in sorted(selected_day_strings)
+    }
+    missing_slots = {day: values for day, values in missing_slots.items() if values}
+    verified_days = len({row["date"] for row in rows})
+    if any(not row["passed"] for row in rows):
+        status = "failed"
+    elif verified_days >= required_days and len(rows) >= required_report_count and not missing_slots:
+        status = "passed"
+    else:
+        status = "pending"
+    return {
+        "status": status,
+        "required_days": required_days,
+        "reports_per_day": reports_per_day,
+        "required_report_count": required_report_count,
+        "technical_primary_source_ratio_min": technical_primary_source_ratio_min,
+        "minimum_discovery_candidates": minimum_discovery_candidates,
+        "minimum_discovered_by_section": minimum_discovered_by_section,
+        "verified_days": verified_days,
+        "verified_report_count": len(rows),
+        "passed_report_count": sum(1 for row in rows if row["passed"]),
+        "expected_slot_ids": configured_slot_ids,
+        "acceptance_contract_version": V11_ACCEPTANCE_CONTRACT_VERSION,
+        "contract_started_at": contract_started_at,
+        "pre_contract_report_count": pre_contract_report_count,
+        "missing_slots": missing_slots,
+        "reports": sorted(rows, key=lambda row: row["finished_at"], reverse=True),
+        "error": "",
+    }
+
+
 def build_product_diagnostics(
     config: Dict[str, Any],
     last_run: Dict[str, Any],
@@ -988,6 +2202,13 @@ def build_product_diagnostics(
     db = Database(database_path)
     latest_report = db.get_latest_report_run(exclude_validation=True)
     latest_quality = dict(latest_report.get("quality_diagnostics") or {})
+    latest_research_inbox = dict(latest_quality.get("codex_research_inbox") or {})
+    history_overlap_recorded = "sent_history_overlap_count" in latest_research_inbox
+    sent_history_overlap_count = (
+        int(latest_research_inbox.get("sent_history_overlap_count", 0) or 0)
+        if history_overlap_recorded
+        else None
+    )
     latest_collection_report = db.get_latest_report_run_with_collection()
     latest_collection_quality = dict(latest_collection_report.get("quality_diagnostics") or {})
     latest_collection = dict(latest_collection_quality.get("collection") or {})
@@ -1006,10 +2227,17 @@ def build_product_diagnostics(
             collection_age_hours = None
     report_quality = latest_report.get("quality_status") or last_run.get("quality_status") or last_success.get("quality_status") or "unknown"
     post_send_quality_scan = dict(last_run.get("post_send_quality_scan") or last_success.get("post_send_quality_scan") or {})
+    ui_audit = dict(last_run.get("ui_audit") or last_success.get("ui_audit") or {})
     raw_model_path_breakdown = dict(
         latest_quality.get("model_path_breakdown")
         or last_run.get("model_path_breakdown")
         or last_success.get("model_path_breakdown")
+        or {}
+    )
+    llm_health = dict(
+        latest_quality.get("llm_health")
+        or last_run.get("llm_health")
+        or last_success.get("llm_health")
         or {}
     )
     configured_design_version = str((config.get("report") or {}).get("design_version") or "")
@@ -1021,6 +2249,7 @@ def build_product_diagnostics(
         "v8-editorial-reader",
         "v9-continuous-learning",
         "v10-learning-digest",
+        "v11-editorial-library",
     }
     report_structure = dict(latest_quality.get("report_structure") or {})
     quality_gate = dict(latest_quality.get("quality_gate") or {})
@@ -1116,6 +2345,11 @@ def build_product_diagnostics(
     )
     return {
         "report_design_version": latest_design_version or configured_design_version,
+        "report_product_mode": str(
+            latest_quality.get("report_product_mode")
+            or report_config.get("product_mode")
+            or ""
+        ),
         "latest_report_design_version": latest_design_version,
         "configured_report_design_version": configured_design_version,
         "source_health": dict(latest_quality.get("source_health") or last_run.get("source_health") or last_success.get("source_health") or {}),
@@ -1144,6 +2378,17 @@ def build_product_diagnostics(
                 quality_gate.get("paper_within_report_duplicate_count", 0),
             )
             or 0
+        ),
+        "sent_history_overlap_count": sent_history_overlap_count,
+        "sent_history_overlap_status": (
+            "not_recorded"
+            if not history_overlap_recorded
+            else "passed"
+            if sent_history_overlap_count == 0
+            else "failed"
+        ),
+        "sent_history_overlap_by_section": dict(
+            latest_research_inbox.get("sent_history_overlap_by_section") or {}
         ),
         "adjacent_report_history_count": int(
             paper_freshness.get("adjacent_report_history_count", 0) or 0
@@ -1187,6 +2432,11 @@ def build_product_diagnostics(
             latest_collection.get("arxiv_fallback_recovery_count", 0) or 0
         ),
         "arxiv_retry_paths": list(latest_collection.get("arxiv_retry_paths") or []),
+        "gpt_search_request_count": int(latest_collection.get("gpt_search_request_count", 0) or 0),
+        "gpt_search_success_count": int(latest_collection.get("gpt_search_success_count", 0) or 0),
+        "gpt_search_schema_error_count": int(
+            latest_collection.get("gpt_search_schema_error_count", 0) or 0
+        ),
         "arxiv_collection_report_id": str(latest_collection_report.get("report_id") or ""),
         "arxiv_collection_created_at": collection_created_at,
         "arxiv_collection_age_hours": collection_age_hours,
@@ -1255,6 +2505,10 @@ def build_product_diagnostics(
         "appendix_body_overlap_count": int(quality_gate.get("appendix_body_overlap_count", 0) or 0),
         "truncated_focus_text_count": int(quality_gate.get("truncated_focus_text_count", 0) or 0),
         "visible_text_chars": int(quality_gate.get("visible_text_chars", 0) or 0),
+        "html_size_bytes": int(quality_gate.get("html_size_bytes", 0) or 0),
+        "html_size_kb": float(quality_gate.get("html_size_kb", 0.0) or 0.0),
+        "email_clipping_warning": bool(quality_gate.get("email_clipping_warning", False)),
+        "email_clipping_risk": bool(quality_gate.get("email_clipping_risk", False)),
         "focus_source_concentration": float(quality_gate.get("focus_source_concentration", 0.0) or 0.0),
         "memory_item_count": int(quality_gate.get("memory_item_count", 0) or 0),
         "featured_paper_count": int(quality_gate.get("featured_paper_count", 0) or 0),
@@ -1268,6 +2522,34 @@ def build_product_diagnostics(
             quality_gate.get("deepseek_key_field_missing_count", report_structure.get("deepseek_key_field_missing_count", 0)) or 0
         ),
         "deepseek_health_hint": quality_gate.get("deepseek_health_hint") or report_structure.get("deepseek_health_hint") or "",
+        "gpt_schema_valid_count": int(
+            quality_gate.get("gpt_schema_valid_count", report_structure.get("gpt_schema_valid_count", 0)) or 0
+        ),
+        "gpt_empty_facts_count": int(
+            quality_gate.get("gpt_empty_facts_count", report_structure.get("gpt_empty_facts_count", 0)) or 0
+        ),
+        "gpt_key_field_missing_count": int(
+            quality_gate.get("gpt_key_field_missing_count", report_structure.get("gpt_key_field_missing_count", 0)) or 0
+        ),
+        "gpt_health_hint": quality_gate.get("gpt_health_hint") or report_structure.get("gpt_health_hint") or "",
+        "llm_schema_valid_count": int(
+            quality_gate.get("llm_schema_valid_count", report_structure.get("llm_schema_valid_count", 0)) or 0
+        ),
+        "llm_health_hint": quality_gate.get("llm_health_hint") or report_structure.get("llm_health_hint") or "",
+        "llm_health": llm_health,
+        "llm_health_status": str(llm_health.get("status") or "unknown"),
+        "template_fallback_count": int(
+            quality_gate.get("template_fallback_count", report_structure.get("template_fallback_count", 0)) or 0
+        ),
+        "index_only_paper_count": int(
+            quality_gate.get("index_only_paper_count", report_structure.get("index_only_paper_count", 0)) or 0
+        ),
+        "generic_fact_bundle_count": int(
+            quality_gate.get("generic_fact_bundle_count", report_structure.get("generic_fact_bundle_count", 0)) or 0
+        ),
+        "unsupported_numeric_claim_count": int(
+            quality_gate.get("unsupported_numeric_claim_count", report_structure.get("unsupported_numeric_claim_count", 0)) or 0
+        ),
         "mixed_language_title_count": int(
             quality_gate.get("mixed_language_title_count", report_structure.get("mixed_language_title_count", 0)) or 0
         ),
@@ -1314,6 +2596,20 @@ def build_product_diagnostics(
         ),
         "primary_source_ratio": float(
             quality_gate.get("primary_source_ratio", report_structure.get("primary_source_ratio", 0.0)) or 0.0
+        ),
+        "technical_primary_source_count": int(
+            quality_gate.get(
+                "technical_primary_source_count",
+                report_structure.get("technical_primary_source_count", 0),
+            )
+            or 0
+        ),
+        "technical_primary_source_ratio": float(
+            quality_gate.get(
+                "technical_primary_source_ratio",
+                report_structure.get("technical_primary_source_ratio", 0.0),
+            )
+            or 0.0
         ),
         "duplicate_event_rate": float(
             quality_gate.get("duplicate_event_rate", report_structure.get("duplicate_event_rate", 0.0)) or 0.0
@@ -1367,6 +2663,41 @@ def build_product_diagnostics(
             )
             or 0
         ),
+        "source_news_brief_count": int(
+            quality_gate.get(
+                "source_news_brief_count",
+                report_structure.get("source_news_brief_count", 0),
+            )
+            or 0
+        ),
+        "visible_news_count": int(
+            quality_gate.get(
+                "visible_news_count",
+                report_structure.get("visible_news_count", 0),
+            )
+            or 0
+        ),
+        "visible_technical_count": int(
+            quality_gate.get(
+                "visible_technical_count",
+                report_structure.get("visible_technical_count", 0),
+            )
+            or 0
+        ),
+        "cross_section_duplicate_count": int(
+            quality_gate.get(
+                "cross_section_duplicate_count",
+                report_structure.get("cross_section_duplicate_count", 0),
+            )
+            or 0
+        ),
+        "cross_section_event_duplicate_count": int(
+            quality_gate.get(
+                "cross_section_event_duplicate_count",
+                report_structure.get("cross_section_event_duplicate_count", 0),
+            )
+            or 0
+        ),
         "high_evidence_calibration_warning": bool(
             quality_gate.get(
                 "high_evidence_calibration_warning",
@@ -1374,6 +2705,7 @@ def build_product_diagnostics(
             )
         ),
         "post_send_quality_scan": post_send_quality_scan,
+        "ui_audit": ui_audit,
         "auto_rewrite_attempted_count": int(
             latest_quality.get("auto_rewrite_attempted_count", last_run.get("auto_rewrite_attempted_count", 0)) or 0
         ),
@@ -1396,6 +2728,34 @@ def build_product_diagnostics(
         ),
         "paper_freshness_production_acceptance": build_paper_freshness_production_acceptance(
             dict(scheduler_config or config.get("scheduler") or DEFAULT_SCHEDULER_CONFIG),
+            overlap_max=float((config.get("quality_gate") or {}).get("adjacent_report_paper_overlap_max", 0.10) or 0.10),
+            db_path=database_path,
+        ),
+        "v11_production_acceptance": build_v11_production_acceptance(
+            dict(scheduler_config or config.get("scheduler") or DEFAULT_SCHEDULER_CONFIG),
+            minimum_news=int(report_config.get("min_visible_news_count", 20) or 20),
+            minimum_technical=int(report_config.get("min_visible_technical_count", 20) or 20),
+            minimum_papers=int(report_config.get("min_visible_paper_count", 15) or 15),
+            minimum_discovery_candidates=int(
+                ((config.get("sources") or {}).get("codex_research_inbox") or {}).get(
+                    "minimum_discovery_candidates",
+                    160,
+                )
+                or 160
+            ),
+            minimum_discovered_by_section=dict(
+                ((config.get("sources") or {}).get("codex_research_inbox") or {}).get(
+                    "minimum_discovered_by_section"
+                )
+                or {"news": 50, "technical": 50, "paper": 40}
+            ),
+            technical_primary_source_ratio_min=float(
+                (config.get("quality_gate") or {}).get(
+                    "technical_primary_source_ratio_min",
+                    0.80,
+                )
+                or 0.80
+            ),
             overlap_max=float((config.get("quality_gate") or {}).get("adjacent_report_paper_overlap_max", 0.10) or 0.10),
             db_path=database_path,
         ),
@@ -1526,7 +2886,8 @@ def scan_report_quality(
     counts["title_fact_mismatch_count"] = sum(
         1
         for item in items
-        if title_fact_mismatch(item, item.get("facts") if isinstance(item.get("facts"), dict) else {})
+        if not item.get("_codex_research_validated")
+        and title_fact_mismatch(item, item.get("facts") if isinstance(item.get("facts"), dict) else {})
     )
     issues: list[Dict[str, Any]] = []
     for item in items:
@@ -1540,7 +2901,7 @@ def scan_report_quality(
         if information_density_value(item) < 0.35:
             issue_types.append("low_density")
         facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
-        if title_fact_mismatch(item, facts):
+        if not item.get("_codex_research_validated") and title_fact_mismatch(item, facts):
             issue_types.append("title_fact_mismatch")
         if not issue_types:
             continue
@@ -1670,6 +3031,76 @@ def refresh_report_quality_after_run(
             "section_issue_counts": {},
             "error": str(exc),
         }
+    return status
+
+
+def run_email_ui_audit(
+    volume_paths: list[str],
+    *,
+    output_dir: Path,
+    timeout_seconds: int = 180,
+) -> Dict[str, Any]:
+    return execute_email_ui_audit(
+        volume_paths,
+        output_dir=output_dir,
+        root=ROOT,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def refresh_email_ui_audit_after_run(
+    status: Dict[str, Any],
+    scheduler_config: Dict[str, Any],
+    *,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not bool(scheduler_config.get("ui_audit_enabled", True)):
+        status["ui_audit"] = {"status": "disabled", "passed": False}
+        return status
+    volume_paths = [str(value) for value in (status.get("email_volume_paths") or []) if str(value or "").strip()]
+    report_id = str(status.get("report_id") or "").strip()
+    slot_id = str((status.get("send_slot") or {}).get("slot_id") or report_id or "report")
+    safe_slot_id = re.sub(r"[^0-9A-Za-z_.-]+", "-", slot_id).strip("-") or "report"
+    output_root = Path(str(scheduler_config.get("ui_audit_output_dir") or ROOT / "artifacts/v11_production_ui_audit"))
+    if not output_root.is_absolute():
+        output_root = ROOT / output_root
+    existing_result = dict(status.get("ui_audit") or {})
+    if str(existing_result.get("status") or "") in {"passed", "failed", "error"}:
+        result = existing_result
+    else:
+        result = run_email_ui_audit(
+            volume_paths,
+            output_dir=output_root / safe_slot_id,
+            timeout_seconds=int(scheduler_config.get("ui_audit_timeout_seconds", 180) or 180),
+        )
+    status["ui_audit"] = result
+    if not report_id:
+        return status
+    db = Database(str(db_path or resolve_database_path(None, ROOT)))
+    report_run = db.get_report_run(report_id)
+    if not report_run:
+        return status
+    diagnostics = dict(report_run.get("quality_diagnostics") or {})
+    diagnostics["ui_audit"] = result
+    quality_gate = dict(diagnostics.get("quality_gate") or {})
+    quality_gate["ui_audit_status"] = result.get("status")
+    quality_gate["ui_audit_failed_render_count"] = int(result.get("failed_render_count", 0) or 0)
+    diagnostics["quality_gate"] = quality_gate
+    quality_status = str(report_run.get("quality_status") or status.get("quality_status") or "unknown")
+    if not result.get("passed", False):
+        quality_status = "failed"
+        quality_gate["status"] = "failed"
+    conn = db._get_conn()
+    try:
+        conn.execute(
+            "UPDATE report_runs SET quality_status = ?, quality_diagnostics = ? WHERE report_id = ?",
+            (quality_status, json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str), report_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status["quality_status"] = quality_status
+    status["quality_diagnostics"] = diagnostics
     return status
 
 
@@ -2243,6 +3674,164 @@ def classify_quality_warnings(warnings: list[Any]) -> Dict[str, list[str]]:
     return {"info": informational, "warn": actionable}
 
 
+def build_codex_research_candidate_check(
+    config: Dict[str, Any],
+    inbox_config: Dict[str, Any],
+    *,
+    root: Path = ROOT,
+    sent_history: Optional[list[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    configured_paths = dict(
+        inbox_config.get("candidate_paths")
+        or {
+            "1300": "data/codex_research/candidate_1300.json",
+            "2100": "data/codex_research/candidate_2100.json",
+        }
+    )
+    production_collector = build_codex_research_inbox_collector(
+        inbox_config,
+        root=root,
+    )
+    production_path = production_collector.inbox_path
+    production_mtime_ns = (
+        production_path.stat().st_mtime_ns if production_path.exists() else 0
+    )
+    rows: list[Dict[str, Any]] = []
+    pending_rows: list[Dict[str, Any]] = []
+    history = sent_history
+
+    for slot_id, raw_path in configured_paths.items():
+        candidate_path = Path(str(raw_path))
+        if not candidate_path.is_absolute():
+            candidate_path = root / candidate_path
+        row: Dict[str, Any] = {
+            "slot_id": str(slot_id),
+            "path": candidate_path.as_posix(),
+            "exists": candidate_path.exists(),
+            "newer_than_production": False,
+            "status": "missing",
+        }
+        if not candidate_path.exists():
+            rows.append(row)
+            continue
+
+        stat = candidate_path.stat()
+        row.update(
+            {
+                "size_bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    tz=timezone.utc,
+                ).astimezone().isoformat(timespec="seconds"),
+                "newer_than_production": stat.st_mtime_ns > production_mtime_ns,
+            }
+        )
+        if not row["newer_than_production"]:
+            row["status"] = "superseded"
+            rows.append(row)
+            continue
+
+        candidate_collector = build_codex_research_inbox_collector(
+            inbox_config,
+            root=root,
+            inbox_path_override=candidate_path,
+        )
+        items = candidate_collector.collect()
+        if items:
+            if history is None:
+                history = Database(resolve_database_path(config, root)).get_recent_report_items(
+                    days=int(inbox_config.get("history_dedupe_days", 7) or 7),
+                    limit=int(inbox_config.get("history_dedupe_limit", 5000) or 5000),
+                    sent_only=True,
+                )
+            candidate_collector.fetch_diagnostics.update(
+                evaluate_sent_history_overlap(items, history)
+            )
+        readiness = build_codex_research_readiness_summary(
+            candidate_collector.fetch_diagnostics,
+            inbox_config,
+        )
+        candidate_diagnostics = candidate_collector.fetch_diagnostics
+        row.update(
+            {
+                "status": (
+                    "ready_not_promoted"
+                    if readiness.get("ready_for_dry_run")
+                    else "blocked"
+                ),
+                "quality_status": str(
+                    candidate_collector.fetch_diagnostics.get("quality_status")
+                    or "unknown"
+                ),
+                "schema_version": str(
+                    candidate_collector.fetch_diagnostics.get("schema_version") or ""
+                ),
+                "inbox_sha256": str(
+                    candidate_collector.fetch_diagnostics.get("inbox_sha256") or ""
+                ),
+                "accepted_counts": dict(readiness.get("accepted_counts") or {}),
+                "blockers": list(readiness.get("blockers") or []),
+                "top_rejection_reasons": list(
+                    readiness.get("top_rejection_reasons") or []
+                ),
+                "discovery_candidate_count": int(
+                    candidate_diagnostics.get("discovery_candidate_count", 0) or 0
+                ),
+                "discovery_section_counts": dict(
+                    candidate_diagnostics.get("discovery_section_counts") or {}
+                ),
+                "submitted_section_counts": dict(
+                    candidate_diagnostics.get("submitted_section_counts") or {}
+                ),
+                "attribution_opener_counts": dict(
+                    candidate_diagnostics.get("attribution_opener_counts") or {}
+                ),
+                "attribution_opener_overuse_count": int(
+                    candidate_diagnostics.get("attribution_opener_overuse_count", 0)
+                    or 0
+                ),
+                "attribution_opener_overuse_examples": list(
+                    candidate_diagnostics.get("attribution_opener_overuse_examples")
+                    or []
+                ),
+                "cross_item_template_repeat_count": int(
+                    candidate_diagnostics.get("cross_item_template_repeat_count", 0)
+                    or 0
+                ),
+                "cross_item_template_repeat_examples": list(
+                    candidate_diagnostics.get("cross_item_template_repeat_examples")
+                    or []
+                ),
+            }
+        )
+        rows.append(row)
+        pending_rows.append(row)
+
+    if not pending_rows:
+        return _doctor_item(
+            "codex_research_candidates",
+            "ok",
+            "No unpromoted Codex research candidate is newer than the production inbox.",
+            {
+                "production_path": production_path.as_posix(),
+                "candidates": rows,
+            },
+        )
+
+    status_text = ", ".join(
+        f"{row['slot_id']}={row['status']}" for row in pending_rows
+    )
+    return _doctor_item(
+        "codex_research_candidates",
+        "warn",
+        f"Unpromoted Codex research candidate(s) found: {status_text}.",
+        {
+            "production_path": production_path.as_posix(),
+            "candidates": rows,
+        },
+    )
+
+
 def build_doctor_payload() -> Dict[str, Any]:
     config, scheduler_config = load_runtime_config()
     load_dotenv(ROOT / ".env")
@@ -2287,6 +3876,7 @@ def build_doctor_payload() -> Dict[str, Any]:
                 {"present": email_vars},
             )
         )
+
     else:
         checks.append(
             _doctor_item(
@@ -2296,6 +3886,84 @@ def build_doctor_payload() -> Dict[str, Any]:
                 {"present": email_vars},
             )
         )
+
+    llm_config = dict(config.get("llm") or {})
+    if llm_config:
+        llm_key_env = str(llm_config.get("api_key_env") or "OPENAI_API_KEY")
+        llm_provider = str(llm_config.get("provider") or "openai")
+        llm_model = str(llm_config.get("model") or "")
+        if llm_provider == "codex_automation":
+            inbox_config = dict((config.get("sources") or {}).get("codex_research_inbox") or {})
+            collector = build_codex_research_inbox_collector(inbox_config, root=ROOT)
+            items = collector.collect()
+            if items:
+                history_metrics = evaluate_sent_history_overlap(
+                    items,
+                    Database(resolve_database_path(config, ROOT)).get_recent_report_items(
+                        days=int(inbox_config.get("history_dedupe_days", 7) or 7),
+                        limit=int(inbox_config.get("history_dedupe_limit", 5000) or 5000),
+                        sent_only=True,
+                    ),
+                )
+                collector.fetch_diagnostics.update(history_metrics)
+            inbox_status = str(collector.fetch_diagnostics.get("quality_status") or "unknown")
+            inbox_ok = (
+                inbox_status == "passed"
+                and str(collector.fetch_diagnostics.get("production_ready_status") or "missing") == "passed"
+            )
+            inbox_failure = (
+                inbox_status
+                if inbox_status != "passed"
+                else f"production_{collector.fetch_diagnostics.get('production_ready_status') or 'missing'}"
+            )
+            inbox_diagnostics = {
+                "provider": llm_provider,
+                "model": llm_model,
+                "api_mode": str(llm_config.get("api_mode") or ""),
+                **collector.fetch_diagnostics,
+            }
+            inbox_diagnostics["readiness_summary"] = build_codex_research_readiness_summary(
+                inbox_diagnostics,
+                inbox_config,
+            )
+            checks.append(
+                _doctor_item(
+                    "codex_research_inbox",
+                    "ok" if inbox_ok else "fail",
+                    (
+                        "Fresh Codex research is ready for report generation."
+                        if inbox_ok
+                        else f"Codex research inbox is not ready: {inbox_failure}."
+                    ),
+                    inbox_diagnostics,
+                )
+            )
+            checks.append(
+                build_codex_research_candidate_check(
+                    config,
+                    inbox_config,
+                )
+            )
+        else:
+            llm_key_present = bool(os.getenv(llm_key_env))
+            checks.append(
+                _doctor_item(
+                    "llm_env",
+                    "ok" if llm_key_present else "fail",
+                    (
+                        f"{llm_provider} model {llm_model} is configured and {llm_key_env} is present."
+                        if llm_key_present
+                        else f"{llm_provider} model {llm_model} is configured but {llm_key_env} is missing."
+                    ),
+                    {
+                        "provider": llm_provider,
+                        "model": llm_model,
+                        "api_mode": str(llm_config.get("api_mode") or ""),
+                        "api_key_env": llm_key_env,
+                        "api_key_present": llm_key_present,
+                    },
+                )
+            )
 
     log_dir = Path(scheduler_config["log_dir"])
     if log_dir.exists():
@@ -2501,11 +4169,24 @@ def build_doctor_payload() -> Dict[str, Any]:
                 "appendix_body_overlap_count": product_diagnostics.get("appendix_body_overlap_count", 0),
                 "truncated_focus_text_count": product_diagnostics.get("truncated_focus_text_count", 0),
                 "visible_text_chars": product_diagnostics.get("visible_text_chars", 0),
+                "html_size_bytes": product_diagnostics.get("html_size_bytes", 0),
+                "html_size_kb": product_diagnostics.get("html_size_kb", 0.0),
+                "email_clipping_warning": product_diagnostics.get("email_clipping_warning", False),
+                "email_clipping_risk": product_diagnostics.get("email_clipping_risk", False),
                 "focus_source_concentration": product_diagnostics.get("focus_source_concentration", 0.0),
                 "memory_item_count": product_diagnostics.get("memory_item_count", 0),
                 "featured_paper_count": product_diagnostics.get("featured_paper_count", 0),
                 "deepseek_health_hint": product_diagnostics.get("deepseek_health_hint", ""),
                 "deepseek_schema_valid_count": product_diagnostics.get("deepseek_schema_valid_count", 0),
+                "gpt_health_hint": product_diagnostics.get("gpt_health_hint", ""),
+                "gpt_schema_valid_count": product_diagnostics.get("gpt_schema_valid_count", 0),
+                "gpt_empty_facts_count": product_diagnostics.get("gpt_empty_facts_count", 0),
+                "gpt_key_field_missing_count": product_diagnostics.get("gpt_key_field_missing_count", 0),
+                "gpt_search_request_count": product_diagnostics.get("gpt_search_request_count", 0),
+                "gpt_search_success_count": product_diagnostics.get("gpt_search_success_count", 0),
+                "gpt_search_schema_error_count": product_diagnostics.get("gpt_search_schema_error_count", 0),
+                "llm_health_hint": product_diagnostics.get("llm_health_hint", ""),
+                "llm_schema_valid_count": product_diagnostics.get("llm_schema_valid_count", 0),
                 "mixed_language_title_count": product_diagnostics.get("mixed_language_title_count", 0),
                 "field_label_leak_count": product_diagnostics.get("field_label_leak_count", 0),
                 "low_info_expanded_count": product_diagnostics.get("low_info_expanded_count", 0),
@@ -2622,7 +4303,7 @@ def build_doctor_payload() -> Dict[str, Any]:
     arxiv_stale_hours = float((config.get("observability") or {}).get("arxiv_collection_stale_hours", 36) or 36)
     arxiv_stale = arxiv_collection_age is None or float(arxiv_collection_age) > arxiv_stale_hours
     arxiv_retry_path_text = format_arxiv_retry_paths(arxiv_retry_paths)
-    if str(product_diagnostics.get("report_design_version") or "") == "v10-learning-digest":
+    if is_learning_digest_design(product_diagnostics.get("report_design_version")):
         arxiv_level = "fail" if arxiv_parse_errors else (
             "warn" if arxiv_http_errors or arxiv_zero_warnings or arxiv_stale else "ok"
         )
@@ -2654,7 +4335,11 @@ def build_doctor_payload() -> Dict[str, Any]:
             )
         )
     freshness_acceptance = dict(product_diagnostics.get("paper_freshness_production_acceptance") or {})
-    if freshness_acceptance and str(product_diagnostics.get("report_design_version") or "") == "v10-learning-digest":
+    if (
+        freshness_acceptance
+        and is_learning_digest_design(product_diagnostics.get("report_design_version"))
+        and str(product_diagnostics.get("report_product_mode") or "") != V11_PRODUCT_MODE
+    ):
         acceptance_status = str(freshness_acceptance.get("status", "pending") or "pending")
         verified_days = int(freshness_acceptance.get("verified_days", 0) or 0)
         required_days = int(freshness_acceptance.get("required_days", 3) or 3)
@@ -2693,6 +4378,33 @@ def build_doctor_payload() -> Dict[str, Any]:
                     )
                 ),
                 v8_acceptance,
+            )
+        )
+    v11_acceptance = dict(product_diagnostics.get("v11_production_acceptance") or {})
+    if v11_acceptance and str(product_diagnostics.get("report_product_mode") or "") == V11_PRODUCT_MODE:
+        acceptance_status = str(v11_acceptance.get("status", "pending") or "pending")
+        verified_days = int(v11_acceptance.get("verified_days", 0) or 0)
+        required_days = int(v11_acceptance.get("required_days", 3) or 3)
+        verified_reports = int(v11_acceptance.get("verified_report_count", 0) or 0)
+        required_reports = int(v11_acceptance.get("required_report_count", 6) or 6)
+        checks.append(
+            _doctor_item(
+                "v11_production_acceptance",
+                "ok" if acceptance_status == "passed" else "warn",
+                (
+                    f"V11 production acceptance passed: {verified_days}/{required_days} days, "
+                    f"{verified_reports}/{required_reports} sent reports."
+                    if acceptance_status == "passed"
+                    else (
+                        "V11 production acceptance failed; inspect per-report quota, freshness, duplicate, and sample-quality issues."
+                        if acceptance_status == "failed"
+                        else (
+                            f"V11 production acceptance is pending: {verified_days}/{required_days} days, "
+                            f"{verified_reports}/{required_reports} sent reports."
+                        )
+                    )
+                ),
+                v11_acceptance,
             )
         )
     report_structure = dict(product_diagnostics.get("report_structure") or {})
@@ -2814,6 +4526,26 @@ def build_doctor_payload() -> Dict[str, Any]:
                 post_send_quality_scan,
             )
         )
+    ui_audit = dict(product_diagnostics.get("ui_audit") or {})
+    if ui_audit:
+        ui_audit_status = str(ui_audit.get("status") or "unknown")
+        ui_audit_render_count = int(ui_audit.get("render_count", 0) or 0)
+        ui_audit_failed_render_count = int(ui_audit.get("failed_render_count", 0) or 0)
+        checks.append(
+            _doctor_item(
+                "email_ui_audit",
+                "ok" if ui_audit_status == "passed" and ui_audit_failed_render_count == 0 else "warn",
+                (
+                    f"Email UI audit passed all {ui_audit_render_count} render(s)."
+                    if ui_audit_status == "passed" and ui_audit_failed_render_count == 0
+                    else (
+                        f"Email UI audit status={ui_audit_status}, "
+                        f"failed renders={ui_audit_failed_render_count}/{ui_audit_render_count}."
+                    )
+                ),
+                ui_audit,
+            )
+        )
     model_path_breakdown = dict(product_diagnostics.get("model_path_breakdown") or {})
     legacy_pending_count = int(model_path_breakdown.get("legacy_pending_backfill", 0) or 0)
     if legacy_pending_count:
@@ -2899,7 +4631,7 @@ def build_doctor_payload() -> Dict[str, Any]:
             )
         elif last_success:
             verification = dict(last_success.get("delivery_verification") or {})
-            if verification.get("verified", False):
+            if delivery_verification_passed(verification):
                 checks.append(_doctor_item("delivery_arrival", "ok", "Mailbox arrival was verified for the last successful send.", verification))
             else:
                 checks.append(
@@ -2939,7 +4671,11 @@ def build_doctor_payload() -> Dict[str, Any]:
             )
         )
 
-    source_health = dict(last_run.get("source_health") or last_success.get("source_health") or {})
+    source_health = (
+        {}
+        if latest_source_health
+        else dict(last_run.get("source_health") or last_success.get("source_health") or {})
+    )
     risky_source_count = int(source_health.get("risky_source_count", 0) or 0)
     if source_health:
         checks.append(
@@ -4436,6 +6172,13 @@ def finalize_send_slot(slot_info: Dict[str, Any], status: Dict[str, Any]) -> Non
                 "run_id": status.get("run_id", ""),
                 "html_report_path": status.get("html_report_path", ""),
                 "markdown_report_path": status.get("markdown_report_path", ""),
+                "quality_status": status.get("quality_status", ""),
+                "email_subjects": list(status.get("email_subjects") or []),
+                "email_volume_sent_count": int(status.get("email_volume_sent_count", 0) or 0),
+                "email_volume_paths": list(status.get("email_volume_paths") or []),
+                "delivery_verification": dict(status.get("delivery_verification") or {}),
+                "post_send_quality_scan": dict(status.get("post_send_quality_scan") or {}),
+                "ui_audit": dict(status.get("ui_audit") or {}),
             }
         )
         write_json(slot_path, payload)
@@ -4709,6 +6452,7 @@ def build_last_success_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
         "new_articles_count": status.get("new_articles_count", 0),
         "quality_status": status.get("quality_status", ""),
         "post_send_quality_scan": status.get("post_send_quality_scan", {}),
+        "ui_audit": status.get("ui_audit", {}),
         "quality_diagnostics": status.get("quality_diagnostics", {}),
         "source_health": status.get("source_health", {}),
         "source_weight_adjustments": status.get("source_weight_adjustments", {}),
@@ -5283,6 +7027,7 @@ def main(validate_run: bool = False, dry_run: bool = False, report_only: bool = 
                 final_status["cleanup_summary"] = cleanup_summary
                 if final_status.get("success", False):
                     final_status = refresh_report_quality_after_run(final_status)
+                    final_status = refresh_email_ui_audit_after_run(final_status, scheduler_config)
                 if send_slot_info:
                     finalize_send_slot(send_slot_info, final_status)
                 write_scheduler_status(status_path, final_status, scheduler_config)

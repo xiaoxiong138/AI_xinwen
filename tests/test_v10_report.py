@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from main import (
+    compact_email_html,
     effective_fresh_paper_minimum,
     evaluate_report_quality,
     evaluate_paper_domain_quotas,
@@ -10,11 +11,16 @@ from main import (
     filter_recently_sent_papers,
     item_quality_flags,
     repair_v10_paper_title,
+    repair_v10_paper_titles_in_layers,
+    should_preserve_existing_paper_analysis,
     select_papers_by_domain_quota,
     select_papers_with_strict_freshness,
     paper_quota_domain,
+    prepare_v11_email_delivery_volumes,
+    scan_final_html_quality,
     title_fact_mismatch,
     title_looks_bad,
+    v10_paper_is_ai_relevant,
     v10_has_concrete_news_evidence,
 )
 from src.collectors.arxiv_collector import ArxivCollector
@@ -36,6 +42,7 @@ def rich_paper(article_id: int, *, section: str = "featured_papers"):
         "evidence_quality": 0.86,
         "information_density": 0.84,
         "facts": {
+            "claim_type": "research_result",
             "who": "AheadWM",
             "action": "提出",
             "target": "动态场景中的机器人操作",
@@ -71,6 +78,7 @@ def rich_news(article_id: int):
         "evidence_quality": 0.82,
         "information_density": 0.78,
         "facts": {
+            "claim_type": "official_claim",
             "who": "OpenAI",
             "action": "发布",
             "target": "企业智能体的工作流权限控制",
@@ -88,6 +96,532 @@ def arxiv_list_html(paper_id: str = "2608.01234"):
 
 
 class V10ReportTests(unittest.TestCase):
+    def test_v11_card_shows_publish_date_and_marks_older_supplemental_sources(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"news_body_char_limit": 320},
+        )
+        item = rich_news(6999)
+        item.update({
+            "publish_date": "2026-09-12T08:30:00+00:00",
+            "quality_flags": ["supplemental_older_source"],
+            "summary": "这是一段可以直接阅读的新闻整理正文。" * 12,
+            "title_cn": "OpenAI在企业智能体工作流中加入审批权限、工具白名单与完整运行记录",
+            "model_used": "codex-automation",
+            "claim_type": "official_claim",
+        })
+
+        card = generator._v8_card(item)
+
+        self.assertEqual(card["v11_date_label"], "补充阅读 · 2026-09-12")
+        self.assertEqual(card["v11_claim_label"], "发布方声明")
+        self.assertEqual(card["title_cn"], item["title_cn"])
+
+    def test_v12_card_preserves_curated_body_and_avoids_duplicate_deck(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"news_body_char_limit": 300},
+        )
+        item = rich_news(7001)
+        body = "第一句直接交代具体变化。第二句保留实现机制、证据位置和限制条件，不在模板阶段重写。"
+        item.update({
+            "model_used": "codex-automation",
+            "analysis_body": body,
+            "summary": body,
+            "summary_preview": "第一句直接交代具体变化",
+        })
+
+        card = generator._v8_card(item)
+
+        self.assertEqual(card["v11_body"], body)
+        self.assertEqual(card["v12_deck"], "")
+
+    def test_v12_card_preserves_long_validated_codex_title(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"news_body_char_limit": 300},
+        )
+        title = (
+            "Google DeepMind 公开机器人策略训练流水线，说明视觉编码、动作分块、"
+            "离线数据混合和真实环境评测之间的具体连接方式，以及跨硬件部署时采用的约束"
+        )
+        item = rich_news(7004)
+        item.update({
+            "model_used": "codex-automation",
+            "title_cn": title,
+            "editorial_title": title,
+            "analysis_body": "团队解释训练流水线中的模块连接、数据来源和真实环境评测边界。",
+        })
+
+        card = generator._v8_card(item)
+
+        self.assertGreater(len(title), 72)
+        self.assertEqual(card["title_cn"], title)
+
+    def test_v12_card_hides_deck_that_repeats_the_title(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"news_body_char_limit": 300},
+        )
+        item = rich_news(7002)
+        item.update({
+            "model_used": "codex-automation",
+            "title_cn": "Google 用提交前代理审查补充基础设施安全检查",
+            "summary_preview": "Google 用提交前代理审查补充基础设施安全检查",
+            "analysis_body": "Google 介绍了在代码提交前运行多角色代理审查的具体流程和边界。",
+        })
+
+        card = generator._v8_card(item)
+
+        self.assertEqual(card["v12_deck"], "")
+
+    def test_v12_card_never_rewrites_curated_title_after_validation(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"news_body_char_limit": 300},
+        )
+        item = rich_news(7003)
+        item.update({
+            "model_used": "codex-automation",
+            "title_cn": "霍夫曼与帕蒂尔复盘创作者资助计划：增加，也保留人的判断",
+            "editorial_title": "霍夫曼与帕蒂尔复盘创作者资助计划：增加，也保留人的判断",
+            "summary_preview": "霍夫曼与帕蒂尔复盘创作者资助计划：增加尝试，也保留人的判断",
+            "analysis_body": "两位嘉宾复盘创作者资助计划，并解释为什么仍需保留人工判断。",
+        })
+
+        card = generator._v8_card(item)
+
+        self.assertEqual(card["title_cn"], item["title_cn"])
+        self.assertEqual(card["v12_deck"], "")
+
+    def test_v11_context_keeps_news_and_non_paper_technical_sections_independent(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={
+                "news_section_limit": 24,
+                "technical_section_limit": 24,
+                "news_body_char_limit": 320,
+                "technical_body_char_limit": 400,
+            },
+        )
+        news = []
+        technical = []
+        for index in range(20):
+            item = rich_news(7000 + index)
+            item["summary"] = "这是一条经过原文核验的新闻正文。" * 12
+            item["analysis_body"] = item["summary"]
+            item["quality_tier"] = "focus"
+            item["facts"]["primary_section"] = "news"
+            news.append(item)
+
+            tech = rich_news(8000 + index)
+            tech["content_type"] = "project"
+            tech["summary"] = "这项非论文技术解释了系统模块、输入输出、部署约束和可复现实验。" * 10
+            tech["analysis_body"] = tech["summary"]
+            tech["quality_tier"] = "focus"
+            tech["facts"]["primary_section"] = "technical"
+            technical.append(tech)
+
+        context = generator._v10_reader_context(
+            {
+                "must_read": news[:8],
+                "physical_ai": [],
+                "watch": news[8:] + technical,
+                "featured_papers": [],
+                "paper_appendix": [],
+                "brief": [],
+            }
+        )
+
+        self.assertEqual(context["news_count"], 20)
+        self.assertEqual(context["technical_count"], 20)
+        self.assertEqual(context["news_items"][0]["v11_position"], 1)
+        self.assertEqual(context["news_items"][-1]["v11_position"], 20)
+        self.assertEqual(context["news_items"][-1]["v11_total"], 20)
+        self.assertEqual(context["technical_items"][-1]["v11_position"], 20)
+        self.assertEqual(context["technical_items"][-1]["v11_total"], 20)
+        self.assertFalse(
+            {item["url"] for item in context["news_items"]}
+            & {item["url"] for item in context["technical_items"]}
+        )
+        self.assertGreater(len(context["news_items"][0]["v11_body"]), 180)
+
+    def test_v11_html_renders_twenty_news_twenty_technical_and_fifteen_papers(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={
+                "product_mode": "intelligence_v11_editorial_library",
+                "news_section_limit": 24,
+                "technical_section_limit": 24,
+                "paper_featured_limit": 10,
+                "paper_appendix_limit": 15,
+                "editorial_decision_limit": 6,
+            },
+        )
+        news = []
+        technical = []
+        for index in range(20):
+            item = enrich_editorial_fields(rich_news(9000 + index))
+            item["facts"]["primary_section"] = "news"
+            news.append(item)
+
+            tech = rich_news(9100 + index)
+            tech["content_type"] = "project"
+            tech["facts"]["primary_section"] = "technical"
+            technical.append(enrich_editorial_fields(tech))
+        papers = [enrich_editorial_fields(rich_paper(9200 + index)) for index in range(15)]
+        layers = {
+            "must_read": news[:8],
+            "physical_ai": [],
+            "watch": news[8:] + technical,
+            "featured_papers": papers[:10],
+            "paper_appendix": papers[10:],
+            "brief": [],
+        }
+
+        decorated = generator._decorate_layers(layers)
+        context = generator._v10_reader_context(decorated)
+        html = generator.generate_html(
+            papers=papers,
+            updates=news + technical,
+            mixed_items=news + technical + papers,
+            report_summary={},
+            layered_updates=layers,
+        )
+
+        self.assertEqual(context["news_count"], 20)
+        self.assertEqual(context["technical_count"], 20)
+        self.assertEqual(context["paper_count"], 15)
+        self.assertEqual(len(context["editorial_decisions"]), 6)
+        self.assertEqual(
+            len({item["source_identity"] for item in context["editorial_decisions"]}),
+            6,
+        )
+        self.assertTrue(
+            all(item["source_identity"].startswith("url:") for item in context["editorial_decisions"])
+        )
+        self.assertIn("新闻、博客与访谈", html)
+        self.assertIn("AI 前沿情报日报", html)
+        self.assertIn("世界模型", html)
+        self.assertIn("技术方法、方向与架构", html)
+        self.assertIn("论文精读", html)
+        self.assertIn("20 / 20", html)
+        self.assertIn("15 / 15", html)
+        self.assertEqual(html.count('class="v10-paper-plain"') + html.count('class="v10-more-plain"'), 15)
+        self.assertEqual(html.count('class="v10-paper-tech"') + html.count('class="v10-more-tech"'), 15)
+        self.assertIn('name="color-scheme" content="light dark"', html)
+        self.assertIn("@media (prefers-color-scheme: dark)", html)
+        self.assertNotIn("<img", html.lower())
+        self.assertEqual(html.count('class="v10-entry"'), 50)
+        self.assertEqual(html.count('class="v10-decision"'), 6)
+        self.assertEqual(html.count('data-source-key="'), 6)
+        self.assertEqual(html.count('class="v11-claim-label"'), 55)
+        self.assertEqual(html.count('data-v11-item-key="'), 55)
+        self.assertGreaterEqual(html.count(' style="'), 55 * 3 + 10)
+        self.assertIn('class="v10-body" style="', html)
+        self.assertIn('class="v10-paper-tech" style="', html)
+        self.assertGreater(len(compact_email_html(html).encode("utf-8")), 72000)
+
+        def render_volume(index, volume):
+            volume_items = volume["items"]
+            return generator.generate_html(
+                papers=[item for item in volume_items if item.get("content_type") == "paper"],
+                updates=[item for item in volume_items if item.get("content_type") != "paper"],
+                mixed_items=volume_items,
+                report_summary={},
+                layered_updates=volume["layers"],
+                title=f"V11 第 {index} 卷",
+            )
+
+        volumes, split_applied = prepare_v11_email_delivery_volumes(
+            compact_email_html(html),
+            decorated,
+            {
+                "product_mode": "intelligence_v11_editorial_library",
+                "email_split_enabled": True,
+                "email_html_max_bytes": 80000,
+            },
+            render_volume,
+        )
+        self.assertTrue(split_applied)
+        self.assertEqual(len(volumes), 3)
+        self.assertTrue(all(volume["size_bytes"] <= 80000 for volume in volumes))
+        self.assertTrue(
+            all(
+                5 <= volume["html"].count('class="v10-decision"') <= 7
+                for volume in volumes
+            )
+        )
+        expected_anchors = {
+            "news": "news-and-voices",
+            "technical": "technical-trends",
+            "paper": "paper-deep-reads",
+        }
+        for volume in volumes:
+            live_anchors = {
+                anchor
+                for anchor in expected_anchors.values()
+                if f'href="#{anchor}"' in volume["html"]
+            }
+            self.assertEqual(live_anchors, {expected_anchors[volume["primary_section"]]})
+            self.assertEqual(
+                volume["html"].count('class="v11-claim-label"'),
+                volume["item_count"],
+            )
+            self.assertEqual(
+                volume["html"].count('data-source-key="'),
+                volume["html"].count('class="v10-decision"'),
+            )
+            fidelity_metrics = scan_final_html_quality(
+                volume["html"],
+                volume["layers"],
+                quality_config={},
+                report_config={
+                    "product_mode": "intelligence_v11_editorial_library",
+                    "design_version": "v11-editorial-library",
+                    "min_visible_news_count": 0,
+                    "min_visible_technical_count": 0,
+                    "min_visible_paper_count": 0,
+                    "paper_technical_intro_min_count": 0,
+                    "total_visible_chars_min": 0,
+                    "total_visible_chars_max": 100000,
+                },
+            )
+            self.assertEqual(
+                fidelity_metrics["v11_content_fidelity_missing_count"],
+                0,
+                fidelity_metrics["v11_content_fidelity_missing_examples"],
+            )
+
+    def test_v11_split_volume_shows_edition_totals_and_only_live_section_links(self):
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={"product_mode": "intelligence_v11_editorial_library"},
+        )
+        news = enrich_editorial_fields(rich_news(9991))
+        news["facts"]["primary_section"] = "news"
+        html = generator.generate_html(
+            papers=[],
+            updates=[news],
+            mixed_items=[news],
+            report_summary={"edition_counts": {"news": 20, "technical": 20, "paper": 15}},
+            layered_updates={
+                "must_read": [news],
+                "physical_ai": [],
+                "watch": [],
+                "featured_papers": [],
+                "paper_appendix": [],
+                "brief": [],
+            },
+            title="AI Frontier Intelligence Daily · 第 1 卷：新闻、博客与访谈",
+        )
+
+        self.assertIn("AI 前沿情报日报", html)
+        self.assertIn("第 1 卷：新闻、博客与访谈", html)
+        self.assertIn("AI 前沿日报：20 条新闻与观点、20 条技术内容、15 篇论文", html)
+        self.assertIn("本期共 55 条独立内容", html)
+        self.assertIn('href="#news-and-voices"', html)
+        self.assertNotIn('href="#technical-trends"', html)
+        self.assertNotIn('href="#paper-deep-reads"', html)
+
+    def test_v11_html_escapes_technical_symbols_without_losing_approved_copy(self):
+        generator = ReportGenerator(
+            design_version="v11-editorial-library",
+            report_config={"product_mode": "intelligence_v11_editorial_library"},
+        )
+        item = rich_news(9992)
+        item.update(
+            {
+                "title_cn": "A&B 团队公开上下文限制",
+                "title": "A&B 团队公开上下文限制",
+                "analysis_body": "运行时把单次输入限制为 <8K token，并要求缓存命中率 >90%。",
+                "summary": "运行时把单次输入限制为 <8K token，并要求缓存命中率 >90%。",
+            }
+        )
+        item["facts"]["primary_section"] = "news"
+        item = enrich_editorial_fields(item)
+        layers = {
+            "must_read": [item],
+            "physical_ai": [],
+            "watch": [],
+            "featured_papers": [],
+            "paper_appendix": [],
+            "brief": [],
+        }
+
+        html = generator.generate_html(
+            papers=[],
+            updates=[item],
+            mixed_items=[item],
+            report_summary={"edition_counts": {"news": 1, "technical": 0, "paper": 0}},
+            layered_updates=layers,
+        )
+
+        self.assertIn("A&amp;B", html)
+        self.assertIn("&lt;8K token", html)
+        self.assertIn("&gt;90%", html)
+        self.assertNotIn("<8K token", html)
+        metrics = scan_final_html_quality(
+            html,
+            layers,
+            quality_config={},
+            report_config={
+                "product_mode": "intelligence_v11_editorial_library",
+                "design_version": "v11-editorial-library",
+                "min_visible_news_count": 0,
+                "min_visible_technical_count": 0,
+                "min_visible_paper_count": 0,
+                "paper_technical_intro_min_count": 0,
+                "total_visible_chars_min": 0,
+                "total_visible_chars_max": 100000,
+            },
+        )
+        self.assertEqual(metrics["v11_content_fidelity_missing_count"], 0)
+
+    def test_v11_curated_paper_keeps_approved_paragraph_breaks(self):
+        generator = ReportGenerator(
+            design_version="v11-editorial-library",
+            report_config={"product_mode": "intelligence_v11_editorial_library"},
+        )
+        paper = enrich_editorial_fields(rich_paper(9993))
+        paper["model_used"] = "codex-automation"
+        plain = "第一段先说明机器人为什么会依据过时画面做动作。\n第二段说明作者先预测未来状态，再交给动作模型。"
+        technical = "方法把状态预测器放在动作模型之前。\n实验与直接动作预测基线比较，并报告动态任务成功率。"
+        paper["paper_plain_summary"] = plain
+        paper["paper_technical_intro"] = technical
+
+        card = generator._v8_card(paper)
+
+        self.assertEqual(card["v10_plain_summary"], plain)
+        self.assertEqual(card["v10_technical_intro"], technical)
+        self.assertIn("white-space:pre-line", generator.V11_INLINE_CLASS_STYLES["v10-paper-plain"])
+        self.assertIn("white-space:pre-line", generator.V11_INLINE_CLASS_STYLES["v10-paper-tech"])
+        self.assertIn("font-size:16px", generator.V11_INLINE_CLASS_STYLES["v10-paper-tech"])
+        self.assertIn("font-size:16px", generator.V11_INLINE_CLASS_STYLES["v10-more-title"])
+        self.assertIn("font-size:16px", generator.V11_INLINE_CLASS_STYLES["v10-more-plain"])
+        self.assertIn("font-size:16px", generator.V11_INLINE_CLASS_STYLES["v10-more-tech"])
+
+    def test_template_fallback_does_not_replace_displayable_paper_analysis(self):
+        paper = enrich_editorial_fields(rich_paper(2999))
+
+        self.assertTrue(should_preserve_existing_paper_analysis(
+            paper,
+            {"model_used": "template_fallback", "facts": {"target": "机器人"}},
+        ))
+        self.assertFalse(should_preserve_existing_paper_analysis(
+            paper,
+            {"model_used": "deepseek-chat", "facts": {"target": "机器人"}},
+        ))
+
+    def test_paper_title_repair_uses_specific_topic_when_facts_are_generic(self):
+        repaired = repair_v10_paper_title({
+            "content_type": "paper",
+            "title": "Cooperative Risk-Aware Multi-Robot Planning in Dynamic Scenes",
+            "title_cn": "Cooperative Risk-Aware Multi-Robot Planning in Dynamic Scenes",
+            "domain_key": "physical_ai",
+            "facts": {"who": "研究团队", "target": "机器人"},
+        })
+
+        self.assertIn("多机器人协作方法与实验", repaired["title_cn"])
+        self.assertFalse(title_looks_bad(repaired))
+
+    def test_paper_title_repair_preserves_verified_codex_title(self):
+        item = rich_paper(2998)
+        item.update({
+            "title_cn": "AHEAD先预测动态物体位置，再让冻结VLA选择动作",
+            "model_used": "codex-automation",
+        })
+
+        repaired = repair_v10_paper_title(item)
+
+        self.assertEqual(repaired["title_cn"], item["title_cn"])
+
+    def test_paper_title_repair_replaces_generic_experiment_title(self):
+        repaired = repair_v10_paper_title({
+            "content_type": "paper",
+            "title": "DexPolicy: Learning Dexterous Manipulation from Demonstrations",
+            "title_cn": "具身智能的新方法与实验",
+            "domain_key": "physical_ai",
+            "facts": {"who": "研究团队", "target": "具身智能"},
+        })
+
+        self.assertEqual(repaired["title_cn"], "DexPolicy：机器人操作与抓取方法")
+
+    def test_paper_title_repair_replaces_repeated_model_name_target(self):
+        repaired = repair_v10_paper_title({
+            "content_type": "paper",
+            "title": "SLIM-0.5B: Efficient Vision-Language-Action Policies",
+            "title_cn": "SLIM-0.5B：SLIM-0",
+            "domain_key": "physical_ai",
+            "facts": {
+                "who": "SLIM-0.5B",
+                "target": "SLIM-0",
+            },
+        })
+
+        self.assertEqual(repaired["title_cn"], "SLIM-0.5B：视觉语言动作模型训练与评测")
+
+    def test_paper_title_repair_replaces_repeated_domain_title(self):
+        repaired = repair_v10_paper_title({
+            "content_type": "paper",
+            "title": "Beyond Data Scaling: Continued Pre-training for Vision-Language-Action Models",
+            "title_cn": "具身智能具身智能",
+            "domain_key": "physical_ai",
+            "facts": {
+                "who": "要解决的是具身智能 核心动作是开源",
+                "target": "具身智能",
+            },
+        })
+
+        self.assertEqual(repaired["title_cn"], "Beyond Data Scaling：视觉语言动作模型继续预训练方法")
+
+        layered = repair_v10_paper_titles_in_layers({"paper_appendix": [repaired]})
+        self.assertEqual(
+            layered["paper_appendix"][0]["title_cn"],
+            "视觉语言动作模型继续预训练方法",
+        )
+
+    def test_layer_title_repair_keeps_entity_after_editorial_enrichment(self):
+        paper = {
+            "content_type": "paper",
+            "title": "JEPA-WAM: Learning Vision-Language-Action Policies with Joint-Embedding World Modeling",
+            "title_cn": "模型，一种在预训练空间中构建的潜在世界动作模型",
+            "domain_key": "world_model",
+            "facts": {
+                "who": "JEPA-WAM",
+                "action": "提出",
+                "target": "在预训练V-JEPA空间中构建的潜在世界动作模型",
+                "method": "联合训练潜在状态转换预测器与动作生成器",
+                "metric_result": "在LIBERO-Plus上达到79.2%",
+                "evidence": ["在LIBERO-Plus上达到79.2%"],
+            },
+            "evidence_quality": 0.9,
+            "information_density": 0.9,
+        }
+
+        layered = repair_v10_paper_titles_in_layers({"featured_papers": [paper]})
+        repaired = layered["featured_papers"][0]
+
+        self.assertTrue(repaired["title_cn"].startswith("JEPA-WAM："))
+        self.assertFalse(title_fact_mismatch(repaired, repaired["facts"]))
+
+    def test_world_model_term_without_ai_context_is_not_relevant(self):
+        self.assertFalse(v10_paper_is_ai_relevant({
+            "topic": "World Model",
+            "title": "A classical world model for quantum qutrit alignment",
+            "content": "A mathematical construction for exact quantum states.",
+        }))
+        self.assertTrue(v10_paper_is_ai_relevant({
+            "topic": "World Model",
+            "title": "A latent world model for robot planning",
+            "content": "The policy predicts future robot states before control.",
+        }))
+        self.assertTrue(v10_paper_is_ai_relevant({
+            "topic": "World Model",
+            "title": "交互式世界模型压缩到单卡流式运行",
+            "content": "模型预测后续视频状态，并把结果用于机器人策略规划。",
+        }))
+
     def test_parse_datetime_normalizes_aware_values_to_utc(self):
         from main import parse_datetime
 
@@ -154,9 +688,9 @@ class V10ReportTests(unittest.TestCase):
         context = generator._v10_reader_context(generator._decorate_layers(layers))
 
         self.assertIn('data-design-version="v10-learning-digest"', html)
-        self.assertIn("15 分钟技术学习版", html)
+        self.assertIn("30 分钟深度编辑版", html)
         self.assertIn("今日编辑判断", html)
-        self.assertIn("今日重点情报", html)
+        self.assertIn("新闻、博客与访谈", html)
         self.assertIn("论文精读", html)
         self.assertIn("更多论文", html)
         self.assertIn("本期新增论文 2 篇", html)
@@ -185,6 +719,53 @@ class V10ReportTests(unittest.TestCase):
             "快讯 / 待确认",
         ):
             self.assertNotIn(forbidden, html)
+
+    def test_v10_html_renders_source_grounded_news_section(self):
+        news = {
+            "id": 1010,
+            "url": "https://aws.amazon.com/blogs/security/agentcore-oauth-consent/",
+            "title": "Amazon Bedrock AgentCore adds OAuth consent for enterprise agents",
+            "content_type": "news",
+            "source_detail": "AWS News Blog",
+            "source_tier": "official",
+            "source_grounded_brief": True,
+            "source_display_title": "Amazon Bedrock AgentCore adds OAuth consent for enterprise agents",
+            "source_excerpt": (
+                "Administrators can require approval before an agent accesses connected applications, "
+                "and AgentCore records the authorization decision for later audit."
+            ),
+            "brief_line": "Administrators can require approval before an agent accesses connected applications.",
+            "quality_tier": "brief",
+            "report_section": "brief",
+        }
+        layers = {
+            "must_read": [],
+            "physical_ai": [],
+            "watch": [],
+            "featured_papers": [],
+            "paper_appendix": [],
+            "brief": [news],
+        }
+        generator = ReportGenerator(
+            design_version="v10-learning-digest",
+            report_config={
+                "design_version": "v10-learning-digest",
+                "source_news_brief_limit": 12,
+            },
+        )
+
+        html = generator.generate_html(
+            papers=[],
+            updates=[news],
+            mixed_items=[news],
+            report_summary={},
+            layered_updates=layers,
+        )
+
+        self.assertIn("新闻、博客与访谈", html)
+        self.assertIn("AgentCore", html)
+        self.assertIn("AgentCore records the authorization decision", html)
+        self.assertIn('id="news-and-voices"', html)
 
     def test_v10_quality_gate_rejects_featured_paper_without_plain_summary(self):
         weak = rich_paper(1005)
@@ -635,6 +1216,24 @@ class V10ReportTests(unittest.TestCase):
         self.assertIn("86%", selected[0]["paper_change_reason"])
         self.assertEqual(metrics["reappeared_paper_with_update_count"], 1)
 
+    def test_v10_drops_reappeared_update_with_truncated_english_reason(self):
+        previous = rich_paper(1023)
+        previous["url"] = "https://arxiv.org/abs/2609.00908v1"
+        previous["facts"]["metric_result"] = "旧版尚未报告真实任务结果"
+        current = rich_paper(1024)
+        current["url"] = "https://arxiv.org/abs/2609.00908v2"
+        current["arxiv_version"] = 2
+        current["facts"]["metric_result"] = (
+            "Evaluations on pi-0.5 and X-VLA across RoboTwin 2.0, LIBERO, "
+            "and three real-world manipula..."
+        )
+
+        selected, metrics = filter_recently_sent_papers([current], [previous])
+
+        self.assertEqual(selected, [])
+        self.assertEqual(metrics["paper_repeat_filtered_count"], 1)
+        self.assertEqual(metrics["reappeared_paper_with_update_count"], 0)
+
     def test_v10_domain_quota_preserves_cross_domain_coverage(self):
         papers = []
         for index, domain in enumerate(
@@ -672,6 +1271,25 @@ class V10ReportTests(unittest.TestCase):
         self.assertGreaterEqual(counts["agent_models"], 3)
         self.assertGreaterEqual(counts["infra_open_source"], 2)
         self.assertGreaterEqual(counts["other"], 2)
+
+    def test_v10_minimum_paper_count_can_overflow_a_concentrated_domain(self):
+        papers = []
+        for index in range(15):
+            item = rich_paper(3500 + index)
+            item["domain_key"] = "physical_ai"
+            item["title"] = f"Distinct robot manipulation method {index}"
+            item["title_cn"] = f"机器人操作方法 {index}"
+            item["facts"]["target"] = f"机器人操作任务 {index}"
+            papers.append(item)
+
+        selected = select_papers_by_domain_quota(
+            papers,
+            {"physical_ai": {"min": 5, "max": 8}},
+            total_limit=25,
+            minimum_count=15,
+        )
+
+        self.assertEqual(len(selected), 15)
 
     def test_v10_paper_topic_locks_domain_through_editorial_enrichment(self):
         agent = rich_paper(3991)
@@ -1081,7 +1699,7 @@ class V10ReportTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("更多技术动态", html)
+        self.assertIn("新闻、博客与访谈", html)
         self.assertEqual(html.count('class="v10-entry"'), 25)
 
     def test_v10_arxiv_topics_and_candidate_pool_are_active(self):

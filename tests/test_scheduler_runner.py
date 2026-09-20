@@ -16,7 +16,9 @@ from scheduler_runner import (
     acquire_send_slot,
     archive_old_logs,
     build_doctor_payload,
+    build_codex_research_candidate_check,
     build_doctor_alert_html,
+    build_codex_research_readiness_summary,
     build_email_arrival_check,
     build_legacy_cleanup_payload,
     build_legacy_cleanup_text,
@@ -31,8 +33,11 @@ from scheduler_runner import (
     build_send_calendar_text,
     build_task_repair_commands,
     build_v8_production_acceptance,
+    build_v11_production_acceptance,
     build_paper_freshness_production_acceptance,
     _parse_status_datetime,
+    _v11_sample_quality,
+    _v11_editorial_review_result,
     _paper_reappearance_is_supported,
     _paper_snapshots_match,
     get_report_model_path_backfill_candidates,
@@ -57,6 +62,7 @@ from scheduler_runner import (
     cleanup_validation_reports,
     collect_task_self_heal_candidates,
     describe_task_result,
+    delivery_verification_passed,
     export_scheduled_task_xml,
     is_interactive_task,
     parse_worker_result_line,
@@ -71,6 +77,8 @@ from scheduler_runner import (
     print_task_restore_report,
     release_run_lock,
     refresh_report_quality_after_run,
+    refresh_email_ui_audit_after_run,
+    run_email_ui_audit,
     recover_committed_send_slot,
     resolve_send_slot,
     finalize_send_slot,
@@ -89,6 +97,455 @@ from src.notifier import resolve_imap_server
 
 
 class SchedulerRunnerTests(unittest.TestCase):
+    def test_codex_research_readiness_summary_exposes_blockers(self):
+        summary = build_codex_research_readiness_summary(
+            {
+                "fresh": False,
+                "age_minutes": 510.0,
+                "quality_status": "stale_inbox",
+                "submission_quota_status": "not_loaded",
+                "submitted_section_counts": {},
+                "rejection_reason_counts_by_section": {},
+            },
+            {
+                "minimum_news": 20,
+                "minimum_technical": 20,
+                "minimum_papers": 15,
+            },
+        )
+
+        self.assertFalse(summary["ready_for_dry_run"])
+        self.assertEqual(summary["status"], "blocked")
+        self.assertEqual(summary["accepted_counts"], {"news": 0, "technical": 0, "paper": 0})
+        self.assertIn("stale_inbox", summary["blockers"])
+        self.assertIn("accepted_section_minimums", summary["blockers"])
+
+    def test_codex_research_readiness_summary_passes_complete_package(self):
+        summary = build_codex_research_readiness_summary(
+            {
+                "fresh": True,
+                "age_minutes": 8.0,
+                "quality_status": "passed",
+                "production_ready_status": "passed",
+                "discovery_quota_status": "passed",
+                "discovery_candidate_count": 160,
+                "discovery_section_counts": {"news": 50, "technical": 50, "paper": 60},
+                "submission_quota_status": "passed",
+                "submitted_section_counts": {"news": 30, "technical": 27, "paper": 20},
+                "news_count": 21,
+                "technical_count": 20,
+                "paper_count": 16,
+                "rejected_item_count": 20,
+                "rejection_reason_counts_by_section": {
+                    "news": {"claim_language_mismatch": 4},
+                    "technical": {"unsupported_summary_numeric": 2},
+                },
+                "sent_history_overlap_count": 0,
+            },
+            {
+                "minimum_news": 20,
+                "minimum_technical": 20,
+                "minimum_papers": 15,
+            },
+        )
+
+        self.assertTrue(summary["ready_for_dry_run"])
+        self.assertEqual(summary["status"], "ready")
+        self.assertEqual(summary["accepted_rates"]["news"], 0.7)
+        self.assertEqual(
+            summary["top_rejection_reasons"][0],
+            {"section": "news", "reason": "claim_language_mismatch", "count": 4},
+        )
+        self.assertEqual(summary["blockers"], [])
+
+    @staticmethod
+    def _record_v11_report(
+        db,
+        slot_dir,
+        *,
+        day,
+        slot,
+        news_count=20,
+        technical_count=20,
+        paper_count=15,
+        quality_status="passed",
+        arrival_status="found",
+        research_quality_status="passed",
+        final_html_quality_status="passed",
+        inline_style_count=200,
+        generic_phrase_count=0,
+        mixed_language_title_count=0,
+        design_version="v11-editorial-library",
+        acceptance_contract_version=12,
+        supplemental_item_count=0,
+        supplemental_age_days=0,
+        supplemental_label_count=None,
+        include_supplemental_gate_metrics=True,
+        volume_editorial_decision_counts=None,
+        volume_nav_mismatch_count=0,
+        volume_preheader_mismatch_count=0,
+        volume_content_fidelity_missing_count=0,
+        content_fidelity_missing_count=0,
+        volume_key_number_fidelity_missing_count=0,
+        key_number_fidelity_missing_count=0,
+        claim_label_expected_count=None,
+        claim_label_visible_count=None,
+        v11_external_item_count=0,
+        editorial_source_hash_missing_count=0,
+        editorial_source_mismatch_count=0,
+        ui_audit_status="passed",
+        ui_audit_failed_render_count=0,
+        volume_archive_present=True,
+        technical_primary_source_count=None,
+        sent_history_overlap_count=0,
+        sent_history_overlap_by_section=None,
+        discovery_quota_status="passed",
+        discovery_candidate_count=160,
+        discovery_section_counts=None,
+        discovery_duplicate_url_count=0,
+        discovery_invalid_row_count=0,
+        submitted_not_in_discovery_count=0,
+        inbox_sha256="a" * 64,
+        discovery_manifest_sha256="b" * 64,
+        max_attribution_opener_repeat_count=1,
+        max_attribution_opener_run=1,
+        attribution_opener_overuse_count=0,
+        cross_item_template_repeat_count=0,
+    ):
+        slot_id = f"{day.replace('-', '')}_{slot}"
+        report_id = f"v11-{slot_id}"
+        run_id = f"run-{slot_id}"
+        items = []
+        body = "这段编辑说明解释具体机制、原始证据、对照结果、部署条件和已知限制，并保留可核验的来源位置。" * 5
+        paper_plain = "这项研究先解释任务为什么困难，以及旧方法为什么容易失败。作者随后提出具体方法，把输入拆成中间状态和决策两个步骤。系统先学习状态变化，再把预测结果交给决策模块。实验最后给出与基线的对照结果，并说明真实部署仍然存在边界。"
+        paper_intro = "方法采用两阶段约束训练，先学习中间状态，再将结果交给决策模块。实验在公开基准上与基线比较，报告成功率提高十二个百分点。结果支持该机制有效，但真实部署和长期稳定性仍需验证。"
+        evidence = ["原始来源报告了具体测量结果，并说明实现机制和对照条件。"]
+        if technical_primary_source_count is None:
+            technical_primary_source_count = technical_count
+        for section, count in (("news", news_count), ("technical", technical_count)):
+            for index in range(count):
+                items.append({
+                    "id": f"{slot_id}-{section}-{index}",
+                    "title": f"{section} item {slot_id} {index}",
+                    "url": (
+                        f"https://techcrunch.com/{slot_id}/{section}/{index}"
+                        if section == "technical" and index >= technical_primary_source_count
+                        else f"https://example.com/{slot_id}/{section}/{index}"
+                    ),
+                    "content_type": "news" if section == "news" else "project",
+                    "platform": "Website",
+                    "model_used": "codex-automation",
+                    "analysis_version": "codex-research-v3",
+                    "primary_section": section,
+                    # Deliberately untrusted: acceptance must recompute from URL.
+                    "source_tier": "official",
+                    "analysis_body": body,
+                    "summary": body,
+                    "evidence_quality": 0.82,
+                    "information_density": 0.8,
+                    "publish_date": (
+                        (
+                            datetime.strptime(day, "%Y-%m-%d")
+                            - timedelta(days=supplemental_age_days)
+                        ).date().isoformat()
+                        if section == "news" and index < supplemental_item_count
+                        else day
+                    ),
+                    "facts": {
+                        "primary_section": section,
+                        "claim_type": "official_claim",
+                        "who": "测试团队",
+                        "action": "发布",
+                        "target": f"{section} 测试内容 {index}",
+                        "evidence": evidence,
+                        "source_excerpt": evidence[0],
+                        "evidence_locator": "官方文档第 2 节",
+                    },
+                    "report_section": "must_read",
+                    "quality_flags": (
+                        ["supplemental_older_source"]
+                        if section == "news" and index < supplemental_item_count
+                        else []
+                    ),
+                })
+        for index in range(paper_count):
+            items.append({
+                "id": f"{slot_id}-paper-{index}",
+                "title": f"paper item {slot_id} {index}",
+                "url": f"https://arxiv.org/abs/{day.replace('-', '')}.{slot}{index:03d}",
+                "content_type": "paper",
+                "model_used": "codex-automation",
+                "analysis_version": "codex-research-v3",
+                "primary_section": "paper",
+                "summary": body,
+                "paper_plain_summary": paper_plain,
+                "paper_technical_intro": paper_intro,
+                "evidence_quality": 0.85,
+                "information_density": 0.82,
+                "publish_date": day,
+                "facts": {
+                    "primary_section": "paper",
+                    "claim_type": "research_result",
+                    "who": "测试论文团队",
+                    "action": "提出",
+                    "target": f"两阶段约束训练方法 {index}",
+                    "method": "two-stage constrained training",
+                    "metric_result": "12 percent improvement over the baseline",
+                    "evidence": evidence,
+                    "source_excerpt": evidence[0],
+                    "evidence_locator": "论文方法与实验章节",
+                },
+                "report_section": "featured_papers",
+            })
+        volume_path = slot_dir.parent / f"{report_id}_volume1.html"
+        if volume_archive_present:
+            volume_path.write_text(
+                "<html><body>archived email volume</body></html>",
+                encoding="utf-8",
+            )
+        volume_size = volume_path.stat().st_size if volume_path.exists() else 48
+        db.record_report_run(
+            report_id,
+            run_id,
+            slot_id=slot_id,
+            html_report_path=f"archive/{report_id}.html",
+            quality_status=quality_status,
+            quality_diagnostics={
+                "report_design_version": design_version,
+                "report_product_mode": "intelligence_v11_editorial_library",
+                "v11_acceptance_contract_version": acceptance_contract_version,
+                "quality_gate": {
+                    "editorial_decision_count": 6,
+                    "final_html_quality_status": final_html_quality_status,
+                    "v11_inline_style_count": inline_style_count,
+                    "generic_phrase_count": generic_phrase_count,
+                    "mixed_language_title_count": mixed_language_title_count,
+                    "max_attribution_opener_repeat_count": (
+                        max_attribution_opener_repeat_count
+                    ),
+                    "max_attribution_opener_run": max_attribution_opener_run,
+                    "v11_supplemental_expected_count": supplemental_item_count,
+                    "v11_supplemental_label_count": (
+                        supplemental_item_count
+                        if supplemental_label_count is None
+                        else supplemental_label_count
+                    ),
+                    "v11_supplemental_counts_by_section": (
+                        {"news": supplemental_item_count}
+                        if include_supplemental_gate_metrics and supplemental_item_count
+                        else {}
+                    ),
+                    "v11_supplemental_limit_exceeded": (
+                        {"news": {"count": supplemental_item_count, "max": 5}}
+                        if include_supplemental_gate_metrics and supplemental_item_count > 5
+                        else {}
+                    ),
+                    "email_delivery_volume_editorial_decision_counts": (
+                        [6]
+                        if volume_editorial_decision_counts is None
+                        else volume_editorial_decision_counts
+                    ),
+                    "email_delivery_volume_editorial_decision_visible_source_counts": (
+                        [6]
+                        if volume_editorial_decision_counts is None
+                        else volume_editorial_decision_counts
+                    ),
+                    "email_delivery_volume_editorial_decision_source_missing_counts": [0],
+                    "email_delivery_volume_editorial_decision_duplicate_source_counts": [0],
+                    "editorial_decision_source_missing_count": 0,
+                    "editorial_decision_duplicate_source_count": 0,
+                    "email_delivery_volume_nav_mismatch_count": volume_nav_mismatch_count,
+                    "email_delivery_volume_preheader_mismatch_count": volume_preheader_mismatch_count,
+                    "email_delivery_volume_content_fidelity_missing_counts": [
+                        volume_content_fidelity_missing_count
+                    ],
+                    "email_delivery_volume_content_fidelity_missing_count": (
+                        volume_content_fidelity_missing_count
+                    ),
+                    "v11_content_fidelity_missing_count": content_fidelity_missing_count,
+                    "v11_key_number_fidelity_missing_count": key_number_fidelity_missing_count,
+                    "email_delivery_volume_key_number_fidelity_missing_counts": [
+                        volume_key_number_fidelity_missing_count
+                    ],
+                    "email_delivery_volume_key_number_fidelity_missing_count": (
+                        volume_key_number_fidelity_missing_count
+                    ),
+                    "v11_claim_label_expected_count": (
+                        len(items)
+                        if claim_label_expected_count is None
+                        else claim_label_expected_count
+                    ),
+                    "v11_claim_label_visible_count": (
+                        len(items)
+                        if claim_label_visible_count is None
+                        else claim_label_visible_count
+                    ),
+                    "v11_external_item_count": v11_external_item_count,
+                    "v11_editorial_source_hash_missing_count": editorial_source_hash_missing_count,
+                    "v11_editorial_source_mismatch_count": editorial_source_mismatch_count,
+                    "technical_primary_source_count": technical_primary_source_count,
+                    "technical_primary_source_ratio": round(
+                        technical_primary_source_count / max(1, technical_count),
+                        3,
+                    ),
+                    "email_delivery_volume_claim_label_counts": [len(items)],
+                    "email_delivery_volume_item_counts": [len(items)],
+                    "email_delivery_volume_count": 1,
+                    "email_delivery_volume_sizes": [volume_size],
+                    "email_delivery_volume_paths": [volume_path.as_posix()],
+                },
+                "codex_research_inbox": {
+                    "schema_version": "codex-research-v3",
+                    "quality_status": research_quality_status,
+                    "attribution_opener_overuse_count": (
+                        attribution_opener_overuse_count
+                    ),
+                    "cross_item_template_repeat_count": (
+                        cross_item_template_repeat_count
+                    ),
+                    "discovery_quota_status": discovery_quota_status,
+                    "discovery_candidate_count": discovery_candidate_count,
+                    "discovery_section_counts": discovery_section_counts
+                    or {"news": 50, "technical": 50, "paper": 60},
+                    "inbox_sha256": inbox_sha256,
+                    "discovery_manifest_sha256": discovery_manifest_sha256,
+                    "discovery_duplicate_url_count": discovery_duplicate_url_count,
+                    "discovery_invalid_row_count": discovery_invalid_row_count,
+                    "submitted_not_in_discovery_count": submitted_not_in_discovery_count,
+                    "submission_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "submitted_section_counts": {"news": 30, "technical": 27, "paper": 20},
+                    "rejected_section_counts": {"news": 10, "technical": 7, "paper": 5},
+                    "rejection_reason_counts_by_section": {
+                        "news": {"stale_source": 10},
+                        "technical": {"content_schema_error": 7},
+                        "paper": {"duplicate_url": 5},
+                    },
+                    "accepted_section_rates": {"news": 0.667, "technical": 0.741, "paper": 0.75},
+                    "technical_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "news_format_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "paper_domain_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "freshness_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "key_number_quota_status": "passed" if research_quality_status == "passed" else "failed",
+                    "key_number_item_counts": {"news": 8, "technical": 10, "paper": 10},
+                    "key_number_underfilled": [],
+                    "fresh_source_counts": {"news": 15, "technical": 15, "paper": 12},
+                    "news_format_counts": {"interview_or_podcast": 2, "blog": 5},
+                    "sent_history_overlap_count": sent_history_overlap_count,
+                    "sent_history_overlap_by_section": (
+                        sent_history_overlap_by_section or {}
+                    ),
+                    "technical_primary_source_count": technical_primary_source_count,
+                    "technical_primary_source_ratio": round(
+                        technical_primary_source_count / max(1, technical_count),
+                        3,
+                    ),
+                    "technical_primary_source_status": (
+                        "passed"
+                        if technical_primary_source_count / max(1, technical_count) >= 0.8
+                        else "failed"
+                    ),
+                },
+            },
+            delivery_status="sent",
+        )
+        db.record_report_items(report_id, items)
+        hour = slot[:2]
+        write_json(slot_dir / f"{slot_id}.json", {
+            "slot_id": slot_id,
+            "status": "sent",
+            "run_id": run_id,
+            "finished_at": f"{day}T{hour}:05:00",
+            "html_report_path": f"archive/{report_id}.html",
+            "email_subjects": [f"[{day} {hour}:00] AI Frontier Intelligence Daily"],
+            "email_volume_sent_count": 1,
+            "email_volume_paths": [volume_path.as_posix()],
+            "delivery_verification": {
+                "status": arrival_status,
+                "matched_subject": f"[{day} {hour}:00] AI Frontier Intelligence Daily",
+            },
+            "post_send_quality_scan": {"focus_issue_count": 0},
+            "ui_audit": {
+                "status": ui_audit_status,
+                "passed": ui_audit_status == "passed",
+                "report_count": 1,
+                "render_count": 4,
+                "failed_render_count": ui_audit_failed_render_count,
+            },
+        })
+
+    def test_v11_production_acceptance_requires_archived_delivery_volumes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-20",
+                slot="1300",
+                volume_archive_present=False,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("email_volume_archive_missing", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_ignores_legacy_design_reports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-20",
+                slot="1300",
+                design_version="v10-learning-digest",
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["verified_report_count"], 0)
+
+    def test_v11_sample_quality_requires_date_claim_and_precise_interview_locator(self):
+        item = {
+            "title_cn": "访谈嘉宾解释智能体权限边界",
+            "content_type": "interview",
+            "analysis_body": "嘉宾具体解释系统如何分配权限、记录工具调用并保留人工审批。" * 12,
+            "evidence_quality": 0.8,
+            "information_density": 0.8,
+            "facts": {
+                "who": "访谈嘉宾",
+                "action": "解释",
+                "target": "智能体权限边界",
+                "evidence": ["文字稿记录了权限配置和人工审批流程。"],
+                "source_excerpt": "文字稿记录了权限配置和人工审批流程。",
+                "evidence_locator": "节目简介",
+            },
+        }
+
+        issues = _v11_sample_quality(item, "news")
+
+        self.assertIn("publish_date_missing", issues)
+        self.assertIn("claim_type_missing", issues)
+        self.assertIn("interview_locator_imprecise", issues)
+
     def test_last_success_snapshot_preserves_fresh_and_reappeared_paper_counts(self):
         snapshot = build_last_success_snapshot({
             "paper_count": 22,
@@ -581,11 +1038,22 @@ class SchedulerRunnerTests(unittest.TestCase):
                     "finished_at": "2026-04-28T21:08:41",
                     "run_id": "20260428_210002",
                     "html_report_path": "archive/report.html",
+                    "email_subjects": ["[2026-04-28 21:00] AI Frontier Intelligence Daily"],
+                    "email_volume_sent_count": 1,
+                    "email_volume_paths": ["archive/report.html"],
+                    "delivery_verification": {"status": "found"},
+                    "post_send_quality_scan": {"focus_issue_count": 0},
+                    "ui_audit": {"status": "passed", "render_count": 4},
                 },
             )
             persisted = json.loads(Path(slot_info["slot_path"]).read_text(encoding="utf-8-sig"))
             self.assertEqual(persisted["status"], "sent")
             self.assertEqual(persisted["run_id"], "20260428_210002")
+            self.assertEqual(persisted["email_volume_sent_count"], 1)
+            self.assertEqual(persisted["email_volume_paths"], ["archive/report.html"])
+            self.assertEqual(persisted["delivery_verification"]["status"], "found")
+            self.assertEqual(persisted["post_send_quality_scan"]["focus_issue_count"], 0)
+            self.assertEqual(persisted["ui_audit"]["status"], "passed")
 
     def test_acquire_send_slot_reclaims_dead_pid_after_grace_period(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -809,6 +1277,646 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["verified_count"], 3)
         self.assertEqual(result["passed_count"], 3)
+
+    def test_v11_production_acceptance_requires_three_days_and_six_clean_reports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            for day in ("2026-09-17", "2026-09-18", "2026-09-19"):
+                for slot in ("1300", "2100"):
+                    self._record_v11_report(db, slot_dir, day=day, slot=slot)
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}, {"id": "2100"}]},
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["verified_days"], 3)
+        self.assertEqual(result["verified_report_count"], 6)
+        self.assertEqual(result["passed_report_count"], 6)
+        self.assertTrue(all(row["sample_quality_pass_count"] == 9 for row in result["reports"]))
+
+    def test_v11_production_acceptance_requires_completed_editorial_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            review_dir = root / "editorial_reviews"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-20",
+                slot="1300",
+            )
+            scheduler_config = {
+                "send_slot_dir": str(slot_dir),
+                "send_slots": [{"id": "1300"}],
+                "v11_editorial_review_required": True,
+                "v11_client_render_review_required": True,
+                "v11_editorial_review_dir": str(review_dir),
+            }
+
+            missing = build_v11_production_acceptance(
+                scheduler_config,
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+            self.assertEqual(missing["status"], "failed")
+            self.assertIn("editorial_review_missing", missing["reports"][0]["issues"])
+            self.assertIn(
+                "client_rendering_failed=qq_desktop,qq_mobile,no_clipping,spacing_readable",
+                missing["reports"][0]["issues"],
+            )
+
+            samples = []
+            slot_id = "20260920_1300"
+            for section in ("news", "technical"):
+                for index in range(3):
+                    samples.append(
+                        {
+                            "section": section,
+                            "url": f"https://example.com/{slot_id}/{section}/{index}",
+                            "accuracy": True,
+                            "specificity": True,
+                            "readability": True,
+                            "notes": "已逐条核对原文证据与中文表述。",
+                        }
+                    )
+            for index in range(3):
+                samples.append(
+                    {
+                        "section": "paper",
+                        "url": f"https://arxiv.org/abs/20260920.1300{index:03d}",
+                        "accuracy": True,
+                        "specificity": True,
+                        "readability": True,
+                        "notes": "已核对方法、实验结果和限制条件。",
+                    }
+                )
+            write_json(
+                review_dir / f"{slot_id}.json",
+                {
+                    "schema_version": 2,
+                    "slot_id": slot_id,
+                    "report_id": f"v11-{slot_id}",
+                    "status": "passed",
+                    "reviewer": "editorial-reviewer",
+                    "reviewed_at": "2026-09-20T14:00:00",
+                    "client_rendering": {
+                        "qq_desktop": True,
+                        "qq_mobile": True,
+                        "no_clipping": True,
+                        "spacing_readable": True,
+                        "notes": "已检查 QQ 桌面端和移动端的完整显示。",
+                    },
+                    "samples": samples,
+                },
+            )
+            passed = build_v11_production_acceptance(
+                scheduler_config,
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(passed["reports"][0]["editorial_review_status"], "passed")
+        self.assertEqual(passed["reports"][0]["editorial_review_pass_count"], 9)
+        self.assertTrue(
+            passed["reports"][0]["editorial_review"]["client_rendering_passed"]
+        )
+
+    def test_v11_production_acceptance_fails_an_underfilled_section(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                technical_count=19,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("technical_count_below_min=19/20", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_rejects_low_technical_primary_source_ratio(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                technical_primary_source_count=15,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        report = result["reports"][0]
+        self.assertEqual(report["technical_primary_source_count"], 15)
+        self.assertEqual(report["technical_primary_source_ratio"], 0.75)
+        self.assertIn("technical_primary_source_ratio=0.750/0.800", report["issues"])
+        self.assertIn(
+            "codex_research_technical_primary_source_ratio=0.750/0.800",
+            report["issues"],
+        )
+
+    def test_v11_production_acceptance_requires_verified_delivery_arrival(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="2100",
+                arrival_status="not_found",
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "2100"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("delivery_arrival_status=not_found", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_requires_current_research_quality_gates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                research_quality_status="underfilled",
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("codex_research_quality_status=underfilled", result["reports"][0]["issues"])
+        self.assertIn("codex_research_submission_quota_status=failed", result["reports"][0]["issues"])
+        self.assertIn("codex_research_freshness_quota_status=failed", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_rejects_repetitive_attribution_openers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                max_attribution_opener_repeat_count=12,
+                max_attribution_opener_run=4,
+                attribution_opener_overuse_count=1,
+                cross_item_template_repeat_count=3,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        issues = result["reports"][0]["issues"]
+        self.assertIn("max_attribution_opener_repeat_count=12/8", issues)
+        self.assertIn("max_attribution_opener_run=4/1", issues)
+        self.assertIn(
+            "codex_research_attribution_opener_overuse_count=1",
+            issues,
+        )
+        self.assertIn(
+            "codex_research_cross_item_template_repeat_count=3",
+            issues,
+        )
+
+    def test_v11_production_acceptance_requires_discovery_manifest_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                discovery_quota_status="failed",
+                discovery_candidate_count=142,
+                discovery_section_counts={"news": 50, "technical": 47, "paper": 45},
+                discovery_duplicate_url_count=3,
+                submitted_not_in_discovery_count=2,
+                inbox_sha256="",
+                discovery_manifest_sha256="",
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        report = result["reports"][0]
+        self.assertIn("codex_research_discovery_quota_status=failed", report["issues"])
+        self.assertIn("codex_research_discovery_candidate_count=142/160", report["issues"])
+        self.assertIn("codex_research_discovery_technical_count=47/50", report["issues"])
+        self.assertIn("codex_research_discovery_duplicate_url_count=3", report["issues"])
+        self.assertIn("codex_research_submitted_not_in_discovery_count=2", report["issues"])
+        self.assertIn("codex_research_inbox_sha256_missing", report["issues"])
+        self.assertIn("codex_research_discovery_manifest_sha256_missing", report["issues"])
+
+    def test_v11_production_acceptance_rejects_any_cross_section_history_overlap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                sent_history_overlap_count=2,
+                sent_history_overlap_by_section={"news": 1, "technical": 1},
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        report = result["reports"][0]
+        self.assertEqual(report["sent_history_overlap_count"], 2)
+        self.assertEqual(
+            report["sent_history_overlap_by_section"],
+            {"news": 1, "technical": 1},
+        )
+        self.assertIn("sent_history_overlap_count=2", report["issues"])
+
+    def test_v11_production_acceptance_rejects_external_batch_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                v11_external_item_count=1,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("v11_external_item_count=1", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_rejects_changed_ingested_editorial_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                editorial_source_mismatch_count=1,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "v11_editorial_source_mismatch_count=1",
+            result["reports"][0]["issues"],
+        )
+
+    def test_v11_production_acceptance_requires_ui_audit_pass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                ui_audit_status="failed",
+                ui_audit_failed_render_count=1,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("ui_audit_status=failed", result["reports"][0]["issues"])
+        self.assertIn("ui_audit_failed_render_count=1", result["reports"][0]["issues"])
+
+    def test_v11_production_acceptance_requires_final_visible_email_quality(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                final_html_quality_status="failed",
+                inline_style_count=20,
+                generic_phrase_count=1,
+                mixed_language_title_count=2,
+                volume_editorial_decision_counts=[0],
+                volume_nav_mismatch_count=1,
+                volume_preheader_mismatch_count=1,
+                volume_content_fidelity_missing_count=2,
+                content_fidelity_missing_count=1,
+                volume_key_number_fidelity_missing_count=2,
+                key_number_fidelity_missing_count=1,
+                claim_label_expected_count=54,
+                claim_label_visible_count=53,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        report = result["reports"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("final_html_quality_status=failed", report["issues"])
+        self.assertIn("v11_inline_style_count=20/175", report["issues"])
+        self.assertIn("generic_phrase_count=1", report["issues"])
+        self.assertIn("mixed_language_title_count=2", report["issues"])
+        self.assertIn("email_volume_editorial_decision_counts=0", report["issues"])
+        self.assertIn("email_delivery_volume_nav_mismatch_count=1", report["issues"])
+        self.assertIn("email_delivery_volume_preheader_mismatch_count=1", report["issues"])
+        self.assertIn(
+            "email_delivery_volume_content_fidelity_missing_count=2",
+            report["issues"],
+        )
+        self.assertIn("v11_content_fidelity_missing_count=1", report["issues"])
+        self.assertIn(
+            "email_delivery_volume_key_number_fidelity_missing_count=2",
+            report["issues"],
+        )
+        self.assertIn("v11_key_number_fidelity_missing_count=1", report["issues"])
+        self.assertIn("v11_claim_label_expected_count=54/55", report["issues"])
+        self.assertIn("v11_claim_label_visible_count=53/54", report["issues"])
+        self.assertEqual(report["v11_inline_style_required_count"], 175)
+
+    def test_v11_production_acceptance_requires_supplemental_labels_in_email(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                supplemental_item_count=2,
+                supplemental_label_count=1,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        report = result["reports"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("v11_supplemental_label_count=1/2", report["issues"])
+
+    def test_v11_production_acceptance_rejects_too_many_supplemental_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                supplemental_item_count=6,
+                include_supplemental_gate_metrics=False,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        report = result["reports"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("v11_supplemental_limit_exceeded", report["issues"])
+        self.assertEqual(
+            report["v11_supplemental_limit_exceeded"],
+            {"news": {"count": 6, "max": 5}},
+        )
+
+    def test_v11_production_acceptance_rejects_overage_supplemental_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+                supplemental_item_count=1,
+                supplemental_age_days=8,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        report = result["reports"][0]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("v11_supplemental_age_violation_count=1", report["issues"])
+        self.assertEqual(report["v11_supplemental_age_violation_count"], 1)
+        self.assertEqual(
+            report["v11_supplemental_age_violation_examples"][0]["max_age_days"],
+            7,
+        )
+
+    def test_v11_production_acceptance_stays_pending_when_a_daily_slot_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(db, slot_dir, day="2026-09-19", slot="1300")
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}, {"id": "2100"}]},
+                required_days=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["verified_report_count"], 1)
+        self.assertEqual(result["missing_slots"], {"2026-09-19": ["2100"]})
+
+    def test_v11_production_acceptance_ignores_reports_before_contract_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-18",
+                slot="2100",
+                acceptance_contract_version=0,
+                inline_style_count=0,
+            )
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="1300",
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "1300"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["pre_contract_report_count"], 1)
+        self.assertEqual(result["verified_report_count"], 1)
+        self.assertEqual(result["reports"][0]["date"], "2026-09-19")
+
+    def test_v11_production_acceptance_is_pending_before_contract_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            slot_dir = root / "send_slots"
+            slot_dir.mkdir()
+            db_path = root / "reports.db"
+            db = Database(str(db_path))
+            self._record_v11_report(
+                db,
+                slot_dir,
+                day="2026-09-19",
+                slot="2100",
+                acceptance_contract_version=0,
+                inline_style_count=0,
+            )
+
+            result = build_v11_production_acceptance(
+                {"send_slot_dir": str(slot_dir), "send_slots": [{"id": "2100"}]},
+                required_days=1,
+                reports_per_day=1,
+                db_path=str(db_path),
+            )
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["pre_contract_report_count"], 1)
+        self.assertEqual(result["verified_report_count"], 0)
+        self.assertEqual(result["reports"], [])
 
     def test_paper_freshness_acceptance_requires_three_clean_production_days(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1763,10 +2871,41 @@ class SchedulerRunnerTests(unittest.TestCase):
         )
 
     def test_classify_quality_warnings_treats_dedupe_as_info(self):
-        classified = classify_quality_warnings(["dedupe_removed_updates:2", "selected_papers_below_minimum:8/10"])
+        classified = classify_quality_warnings([
+            "dedupe_removed_updates:2",
+            "fresh_paper_target_underfilled:15/18",
+            "selected_papers_below_minimum:8/10",
+        ])
 
-        self.assertEqual(classified["info"], ["dedupe_removed_updates:2"])
+        self.assertEqual(
+            classified["info"],
+            ["dedupe_removed_updates:2", "fresh_paper_target_underfilled:15/18"],
+        )
         self.assertEqual(classified["warn"], ["selected_papers_below_minimum:8/10"])
+
+    def test_delivery_verification_passes_when_every_split_volume_arrived(self):
+        verification = {
+            "status": "found",
+            "volume_count": 3,
+            "volumes": [
+                {"status": "found", "verified": True, "matched_subject": f"part {index}"}
+                for index in range(1, 4)
+            ],
+        }
+
+        self.assertTrue(delivery_verification_passed(verification))
+
+    def test_delivery_verification_rejects_incomplete_split_arrival(self):
+        verification = {
+            "status": "found",
+            "volume_count": 3,
+            "volumes": [
+                {"status": "found", "verified": True, "matched_subject": "part 1"},
+                {"status": "not_found", "verified": False, "matched_subject": ""},
+            ],
+        }
+
+        self.assertFalse(delivery_verification_passed(verification))
 
     def test_resolve_imap_server_infers_common_smtp_hosts(self):
         self.assertEqual(resolve_imap_server("smtp.qq.com"), "imap.qq.com")
@@ -1952,6 +3091,35 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(latest["quality_diagnostics"]["title_repair"]["bad_title_unresolved_count"], 0)
         self.assertEqual(latest["quality_diagnostics"]["warnings"], ["dedupe_removed_updates:1"])
 
+    def test_scan_report_quality_respects_validated_codex_editorial_title(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "ai_news.db")
+            db = Database(db_path)
+            db.insert_article({"title": "Original English source title", "url": "https://example.com/codex-item"})
+            article = db.get_articles_for_run("", processed_only=False)[0]
+            db.record_report_run("report-1", "run-1", quality_status="passed")
+            db.record_report_items(
+                "report-1",
+                [
+                    {
+                        "id": article["id"],
+                        "report_rank": 1,
+                        "report_section": "must_read",
+                        "title_cn": "编辑标题准确概括了已经核验的原文变化",
+                        "summary": "正文保留了原文机制、证据、适用范围与限制。",
+                        "facts": {"who": "Original Team", "action": "发布", "target": "Different Product Name"},
+                        "evidence_quality": 0.8,
+                        "information_density": 0.8,
+                        "_codex_research_validated": True,
+                    }
+                ],
+            )
+
+            result = scan_report_quality(report_id="report-1", persist=True, db_path=db_path)
+
+        self.assertEqual(result["counts"]["title_fact_mismatch_count"], 0)
+        self.assertEqual(result["issue_count"], 0)
+
     def test_scan_report_quality_never_overrides_v8_final_html_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "ai_news.db")
@@ -2092,6 +3260,61 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(status["post_send_quality_scan"]["focus_issue_count"], 0)
         self.assertEqual(status["quality_diagnostics"]["quality_gate"]["status"], "passed")
 
+    def test_email_ui_audit_rejects_missing_delivery_volume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_email_ui_audit(
+                [str(Path(temp_dir) / "missing.html")],
+                output_dir=Path(temp_dir) / "audit",
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failures"], ["missing_email_volume_paths"])
+
+    def test_refresh_email_ui_audit_persists_failure_and_blocks_acceptance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = str(root / "ai_news.db")
+            volume_path = root / "report_part1.html"
+            volume_path.write_text("<html><body>report</body></html>", encoding="utf-8")
+            db = Database(db_path)
+            db.record_report_run(
+                "report-1",
+                "run-1",
+                quality_status="passed",
+                quality_diagnostics={"quality_gate": {"status": "passed"}},
+            )
+            audit_result = {
+                "status": "failed",
+                "passed": False,
+                "report_count": 1,
+                "render_count": 4,
+                "failed_render_count": 1,
+                "failures": [{"mode": "mobile", "failures": ["horizontal_overflow"]}],
+                "error": "",
+            }
+            with patch("scheduler_runner.run_email_ui_audit", return_value=audit_result):
+                status = refresh_email_ui_audit_after_run(
+                    {
+                        "report_id": "report-1",
+                        "quality_status": "passed",
+                        "email_volume_paths": [str(volume_path)],
+                        "send_slot": {"slot_id": "20260920_1300"},
+                    },
+                    {
+                        "ui_audit_enabled": True,
+                        "ui_audit_output_dir": str(root / "audit"),
+                        "ui_audit_timeout_seconds": 30,
+                    },
+                    db_path=db_path,
+                )
+            persisted = db.get_report_run("report-1")
+
+        self.assertEqual(status["quality_status"], "failed")
+        self.assertEqual(status["ui_audit"]["failed_render_count"], 1)
+        self.assertEqual(persisted["quality_status"], "failed")
+        self.assertEqual(persisted["quality_diagnostics"]["quality_gate"]["ui_audit_status"], "failed")
+
     def test_fix_report_bad_titles_only_updates_title_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "ai_news.db")
@@ -2193,6 +3416,66 @@ class SchedulerRunnerTests(unittest.TestCase):
             diagnostics["title_repair"]["examples"][0]["new_title"],
             "AgentWatch展示了主动式AWS监控的新进展",
         )
+
+    def test_product_diagnostics_expose_cross_section_history_overlap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            db = Database(str(temp_root / "ai_news.db"))
+            db.record_report_run(
+                "report-history-overlap",
+                "run-history-overlap",
+                quality_status="failed",
+                quality_diagnostics={
+                    "report_design_version": "v11-editorial-library",
+                    "codex_research_inbox": {
+                        "sent_history_overlap_count": 3,
+                        "sent_history_overlap_by_section": {
+                            "news": 1,
+                            "technical": 2,
+                        },
+                    },
+                },
+            )
+
+            with patch("scheduler_runner.ROOT", temp_root):
+                diagnostics = build_product_diagnostics(
+                    {
+                        "feedback": {"enabled": False},
+                        "report": {"design_version": "v11-editorial-library"},
+                    },
+                    {},
+                    {},
+                )
+
+        self.assertEqual(diagnostics["sent_history_overlap_count"], 3)
+        self.assertEqual(diagnostics["sent_history_overlap_status"], "failed")
+        self.assertEqual(
+            diagnostics["sent_history_overlap_by_section"],
+            {"news": 1, "technical": 2},
+        )
+
+    def test_product_diagnostics_do_not_treat_missing_overlap_evidence_as_zero(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            db = Database(str(temp_root / "ai_news.db"))
+            db.record_report_run(
+                "legacy-report-without-history-metric",
+                "legacy-run-without-history-metric",
+                quality_status="passed",
+                quality_diagnostics={
+                    "report_design_version": "v10-learning-digest",
+                },
+            )
+
+            with patch("scheduler_runner.ROOT", temp_root):
+                diagnostics = build_product_diagnostics(
+                    {"feedback": {"enabled": False}},
+                    {},
+                    {},
+                )
+
+        self.assertIsNone(diagnostics["sent_history_overlap_count"])
+        self.assertEqual(diagnostics["sent_history_overlap_status"], "not_recorded")
 
     def test_product_diagnostics_include_post_send_quality_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2403,7 +3686,11 @@ class SchedulerRunnerTests(unittest.TestCase):
 
             with patch("scheduler_runner.ROOT", temp_root):
                 diagnostics = build_product_diagnostics(
-                    {"feedback": {"enabled": False}, "report": {"design_version": "v10-learning-digest"}},
+                    {
+                        "feedback": {"enabled": False},
+                        "report": {"design_version": "v10-learning-digest"},
+                        "quality_gate": {"technical_primary_source_ratio_min": 0.9},
+                    },
                     {},
                     {},
                 )
@@ -2413,6 +3700,10 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(diagnostics["arxiv_zero_result_warning_count"], 1)
         self.assertEqual(diagnostics["arxiv_http_error_count"], 2)
         self.assertEqual(diagnostics["arxiv_fallback_recovery_count"], 2)
+        self.assertEqual(
+            diagnostics["v11_production_acceptance"]["technical_primary_source_ratio_min"],
+            0.9,
+        )
 
     def test_product_diagnostics_preserve_v8_final_html_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2438,6 +3729,8 @@ class SchedulerRunnerTests(unittest.TestCase):
                         "focus_source_concentration": 0.2,
                         "memory_item_count": 3,
                         "featured_paper_count": 6,
+                        "technical_primary_source_count": 17,
+                        "technical_primary_source_ratio": 0.85,
                     },
                 },
             )
@@ -2460,6 +3753,8 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(diagnostics["visible_text_chars"], 6400)
         self.assertEqual(diagnostics["memory_item_count"], 3)
         self.assertEqual(diagnostics["featured_paper_count"], 6)
+        self.assertEqual(diagnostics["technical_primary_source_count"], 17)
+        self.assertEqual(diagnostics["technical_primary_source_ratio"], 0.85)
 
     def test_source_health_summary_marks_unstable_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2481,6 +3776,85 @@ class SchedulerRunnerTests(unittest.TestCase):
 
         self.assertEqual(summary["unstable_source_count"], 1)
         self.assertEqual(summary["unstable_rows"][0]["label"], "RSSCollector[TechCrunch AI]")
+
+    def test_source_health_summary_can_limit_history_to_active_collectors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(str(Path(temp_dir) / "ai_news.db"))
+            db.record_collector_runs(
+                "legacy-run",
+                [{
+                    "label": "WebSearchCollector[Legacy]",
+                    "status": "error",
+                    "inserted_count": 0,
+                    "collected_count": 0,
+                    "duration_seconds": 1,
+                    "error": "legacy failure",
+                }],
+            )
+            current_runs = [{
+                "label": "CodexResearchInboxCollector",
+                "status": "success",
+                "inserted_count": 0,
+                "collected_count": 55,
+                "duration_seconds": 1,
+                "error": "",
+            }]
+
+            summary = build_source_health_summary(
+                current_runs,
+                db,
+                history_limit=10,
+                active_labels={"CodexResearchInboxCollector"},
+            )
+
+        self.assertEqual(summary["source_count"], 1)
+        self.assertEqual(summary["risky_source_count"], 0)
+        self.assertEqual(summary["rows"][0]["label"], "CodexResearchInboxCollector")
+
+    def test_source_health_summary_does_not_flag_low_historical_failure_rate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Database(str(Path(temp_dir) / "ai_news.db"))
+            label = "CodexResearchInboxCollector"
+            for index in range(2):
+                db.record_collector_runs(
+                    f"failed-{index}",
+                    [{
+                        "label": label,
+                        "status": "error",
+                        "inserted_count": 0,
+                        "collected_count": 0,
+                        "duration_seconds": 1,
+                        "error": "temporary failure",
+                    }],
+                )
+            for index in range(8):
+                db.record_collector_runs(
+                    f"success-{index}",
+                    [{
+                        "label": label,
+                        "status": "success",
+                        "inserted_count": 0,
+                        "collected_count": 55,
+                        "duration_seconds": 1,
+                        "error": "",
+                    }],
+                )
+
+            summary = build_source_health_summary(
+                [{
+                    "label": label,
+                    "status": "success",
+                    "inserted_count": 0,
+                    "collected_count": 55,
+                    "duration_seconds": 1,
+                    "error": "",
+                }],
+                db,
+                history_limit=20,
+                active_labels={label},
+            )
+
+        self.assertEqual(summary["unstable_source_count"], 0)
 
     def test_collector_run_persists_arxiv_retry_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2551,6 +3925,73 @@ class SchedulerRunnerTests(unittest.TestCase):
         self.assertEqual(payload["last_validation_run"]["status"], "dry_run")
         self.assertEqual(payload["lock"]["state"], "active")
         self.assertEqual(payload["tasks"][0]["last_result_hint"], "running")
+
+    def test_codex_research_candidate_check_is_quiet_without_pending_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            production = temp_root / "latest.json"
+            production.write_text("{}", encoding="utf-8")
+
+            check = build_codex_research_candidate_check(
+                {"database": {"path": str(temp_root / "reports.sqlite3")}},
+                {
+                    "path": str(production),
+                    "candidate_paths": {
+                        "1300": str(temp_root / "candidate_1300.json"),
+                        "2100": str(temp_root / "candidate_2100.json"),
+                    },
+                },
+                root=temp_root,
+                sent_history=[],
+            )
+
+        self.assertEqual(check["level"], "ok")
+        self.assertIn("No unpromoted", check["detail"])
+        self.assertTrue(all(not row["exists"] for row in check["data"]["candidates"]))
+
+    def test_codex_research_candidate_check_reports_newer_blocked_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            production = temp_root / "latest.json"
+            candidate = temp_root / "candidate_1300.json"
+            production.write_text('{"production": true}', encoding="utf-8")
+            old_time = datetime.now().timestamp() - 30
+            os.utime(production, (old_time, old_time))
+            candidate.write_text(
+                json.dumps(
+                    {
+                        "generated_at": datetime.now().astimezone().isoformat(),
+                        "items": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            check = build_codex_research_candidate_check(
+                {"database": {"path": str(temp_root / "reports.sqlite3")}},
+                {
+                    "path": str(production),
+                    "candidate_paths": {"1300": str(candidate)},
+                    "required_schema_version": "codex-research-v3",
+                    "minimum_items": 55,
+                    "minimum_news": 20,
+                    "minimum_technical": 20,
+                    "minimum_papers": 15,
+                },
+                root=temp_root,
+                sent_history=[],
+            )
+
+        self.assertEqual(check["level"], "warn")
+        row = check["data"]["candidates"][0]
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["quality_status"], "schema_version_mismatch")
+        self.assertEqual(row["cross_item_template_repeat_count"], 0)
+        self.assertEqual(row["cross_item_template_repeat_examples"], [])
+        self.assertEqual(
+            row["blockers"],
+            ["schema_version=missing", "quality_status=schema_version_mismatch"],
+        )
 
     def test_build_doctor_payload_reports_failures_and_warnings(self):
         mocked_status = {

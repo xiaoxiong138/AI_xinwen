@@ -1,0 +1,26 @@
+{
+  "description": "Real V11 source-audit failures where accurate prose omitted the strongest quantitative evidence from the public email copy.",
+  "items": [
+    {
+      "title_cn": "月球基础模型团队详解跨仪器数据与科学评估",
+      "url": "https://newsroom.usra.edu/usra-contributes-planetary-science-expertise-to-nasa-ibm-lunar-foundation-model",
+      "source_excerpt": "月球数据集包含约200万组数据、11种模态，并由团队标注超过4.9万个陨石坑。",
+      "key_numbers": ["约200万组数据", "11种模态", "超过4.9万个陨石坑"],
+      "expected_missing_tokens": ["crater_count:49000", "group_count:2000000", "modality_count:11"]
+    },
+    {
+      "title_cn": "垂直人工智能基金扩展跨地区早期投资",
+      "url": "https://aiseedfund.com/news/ai-seed-launches-fund-ii",
+      "source_excerpt": "Fund II规模为5000万美元，计划四年投资40家公司，首笔投资通常为100万美元至200万美元。",
+      "key_numbers": ["基金规模5000万美元", "计划投资40家公司", "首笔投资100万美元至200万美元"],
+      "expected_missing_tokens": ["company_count:40", "usd:1000000", "usd:2000000", "usd:50000000"]
+    },
+    {
+      "title_cn": "按问题相关性和覆盖范围选择视觉标记，减少推理冗余",
+      "url": "https://arxiv.org/abs/2609.19990",
+      "source_excerpt": "紧视觉预算实验分别报告96.1%对93.9%，以及96.7%对92.5%的相对性能。",
+      "key_numbers": ["96.1%对93.9%", "96.7%对92.5%"],
+      "expected_missing_tokens": ["percent:92.5", "percent:93.9", "percent:96.1", "percent:96.7"]
+    }
+  ]
+}

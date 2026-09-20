@@ -70,6 +70,20 @@ class EmailArrivalVerificationTests(unittest.TestCase):
             )
         )
 
+    def test_subject_match_requires_the_same_delivery_volume(self):
+        expected = "[2026-09-19 21:00] AI Frontier Intelligence Daily [1/3] 新闻、博客与访谈"
+
+        self.assertTrue(_subject_matches(expected, expected))
+        self.assertFalse(
+            _subject_matches(
+                expected,
+                "[2026-09-19 21:00] AI Frontier Intelligence Daily [2/3] 技术方法与工程实践",
+            )
+        )
+        self.assertFalse(
+            _subject_matches(expected, "[2026-09-19 21:00] AI Frontier Intelligence Daily")
+        )
+
     def test_verify_email_arrival_skips_when_config_is_missing(self):
         result = verify_email_arrival(
             imap_server="",

@@ -1,12 +1,11 @@
 ﻿from __future__ import annotations
 
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import feedparser
 
-from .base import BaseCollector
+from .base import BaseCollector, parse_feed_entry_date
 from ..relevance import classify_paper_topic, clean_snippet, infer_platform, is_ai_web_content, is_relevant_paper
 
 
@@ -67,11 +66,7 @@ class RSSCollector(BaseCollector):
         return results
 
     def _parse_entry_date(self, entry: Any) -> datetime:
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            return datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
-        if hasattr(entry, "updated_parsed") and entry.updated_parsed:
-            return datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
-        return datetime.now(timezone.utc)
+        return parse_feed_entry_date(entry)
 
     def _extract_content(self, entry: Any) -> str:
         if hasattr(entry, "summary"):

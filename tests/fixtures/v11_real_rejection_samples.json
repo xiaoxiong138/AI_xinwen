@@ -1,0 +1,106 @@
+{
+  "description": "Real production items captured before V11. Each item documents a concrete quality failure that V11 must reject before editorial rendering.",
+  "items": [
+    {
+      "primary_section": "news",
+      "title": "How to use AI agents to prepare 3D scenes for simulation",
+      "title_cn": "NVIDIA 用 Agent 补齐机器人仿真的语义、物理和传感器配置",
+      "url": "https://developer.nvidia.com/blog/how-to-use-ai-agents-to-prepare-3d-scenes-for-simulation/",
+      "source_detail": "NVIDIA Developer Blog",
+      "platform": "Blog",
+      "content_type": "news",
+      "claim_type": "official_claim",
+      "publish_date": "2026-09-16",
+      "summary": "NVIDIA公布从Blender场景到机器人仿真资产的Agent流程：先检查场景，再补充标签、材料、传感器、碰撞体与刚体属性，最后渲染预览并运行SimReady验证。流程以The Junk Shop场景演示，使用ovphysx和ovrtx等工具，把有歧义的标签和物理行为交给人工判断。文章公开了参考流程，但没有给出相对人工制作的端到端节时或机器人训练收益。",
+      "source_excerpt": "The workflow inspects a Blender scene, adds semantic labels, materials, sensors and physics properties, then runs SimReady validation.",
+      "evidence_locator": "Workflow overview and The Junk Shop example",
+      "facts": {
+        "who": "NVIDIA",
+        "action": "公布",
+        "target": "从 Blender 场景生成机器人仿真资产的 Agent 流程",
+        "evidence": ["流程补充标签、材料、传感器、碰撞体和刚体属性"],
+        "method": "使用 Agent 检查场景并运行 SimReady 验证"
+      },
+      "quality_flags": ["supplemental_older_source"],
+      "expected_issue": "news_body_too_short"
+    },
+    {
+      "primary_section": "news",
+      "title": "Noam Brown - Agent swarms, alignment, and recursive self-improvement",
+      "title_cn": "Noam Brown 谈多 Agent 扩展：缩短等待也增加总计算",
+      "url": "https://www.dwarkesh.com/p/noam-brown",
+      "source_detail": "Dwarkesh Podcast",
+      "platform": "Interview",
+      "content_type": "interview",
+      "claim_type": "interview_opinion",
+      "publish_date": "2026-09-17",
+      "summary": "在完整访谈中，Noam Brown把多Agent解释为用额外计算换更短等待，称部分既有实验中4个Agent约能让耗时减半、总计算增加至两倍；他强调不能将小规模结果外推到万级协作。主持人追问递归改进怎样保持约束，Brown讨论真实评测环境和思维链可监控性。这些规模与效果是嘉宾陈述，未由本次研究独立复现；对齐是否解决没有确定答案。",
+      "source_excerpt": "Brown separates lower wall-clock latency from higher total compute and cautions against extrapolating small-agent experiments.",
+      "evidence_locator": "00:00 parallel efficiency; 01:08:34 chain of thought; 01:14:12 alignment measurement",
+      "facts": {
+        "who": "Noam Brown",
+        "action": "讨论",
+        "target": "多 Agent 成本、递归改进与对齐",
+        "evidence": ["嘉宾称4个Agent约能让耗时减半，同时总计算增加至两倍"],
+        "method": "完整访谈及主持人追问",
+        "limitation": "嘉宾口述结果未独立验证"
+      },
+      "quality_flags": ["supplemental_older_source"],
+      "expected_issue": "interview_body_too_short"
+    },
+    {
+      "primary_section": "technical",
+      "title": "Benchmarking LLM inference at scale with AIPerf",
+      "title_cn": "NVIDIA 详解 AIPerf：多进程推理压测与真实流量重放",
+      "url": "https://developer.nvidia.com/blog/benchmarking-llm-inference-at-scale-with-aiperf/",
+      "source_detail": "NVIDIA Developer Blog",
+      "platform": "Blog",
+      "content_type": "project",
+      "claim_type": "official_claim",
+      "technical_category": "inference_deployment",
+      "publish_date": "2026-09-18",
+      "summary": "NVIDIA发布AIPerf工程说明并提供开源工具，以独立负载进程、结果处理服务和ZMQ协调替代单进程架构。它支持15种以上端点及轨迹重放；教程先固定128输入和128输出词元建立基线，再改变并发及请求长度。首词元延迟与词元间隔必须通过流式响应测量。静态测试不能代表生产容量，文中未给出适用于所有服务器的加速倍数。",
+      "source_excerpt": "AIPerf separates load generation and result processing and coordinates workers through ZMQ.",
+      "evidence_locator": "Architecture and baseline tutorial sections",
+      "facts": {
+        "who": "NVIDIA",
+        "action": "发布",
+        "target": "AIPerf 多进程推理压测工具",
+        "evidence": ["支持15种以上端点及真实轨迹重放"],
+        "method": "独立负载进程、结果处理服务和 ZMQ 协调",
+        "architecture": "负载生成、结果处理和协调服务分离",
+        "deployment_context": "大规模 LLM 推理服务压测"
+      },
+      "quality_flags": ["supplemental_older_source"],
+      "expected_issue": "technical_body_too_short"
+    },
+    {
+      "primary_section": "paper",
+      "title": "Workspace Models for robot memory",
+      "title_cn": "把机器人历史记忆压进轻量工作区，无需在线调用视觉大模型",
+      "url": "https://arxiv.org/abs/2609.20820",
+      "source_detail": "arXiv",
+      "platform": "Paper",
+      "content_type": "paper",
+      "claim_type": "research_result",
+      "publish_date": "2026-09-17",
+      "summary": "机器人 AI 执行任务时往往需要记住已经发生的动作。Workspace Models 在训练时让视觉语言模型找出任务相关的历史信息，再把这些信息压进可供策略直接读取的工作区令牌。部署时使用批处理及 KV 缓存读取令牌，实验报告工作区方案延迟为49.2毫秒。",
+      "paper_plain_summary": "",
+      "paper_technical_intro": "",
+      "source_excerpt": "The model compresses task-relevant history into workspace tokens consumed directly by the policy.",
+      "evidence_locator": "Method and latency table",
+      "facts": {
+        "who": "Workspace Models 研究团队",
+        "action": "提出",
+        "target": "面向机器人策略的历史记忆工作区",
+        "evidence": ["工作区加批处理和 KV 缓存的延迟为49.2毫秒"],
+        "method": "把任务相关历史压缩为策略可读取的工作区令牌",
+        "dataset_or_benchmark": "3个仿真任务和1个真实任务",
+        "metric_result": "工作区方案延迟49.2毫秒",
+        "baseline": "关键帧记忆加批处理为199.5毫秒",
+        "limitation": "自回归编码器随历史长度产生二次计算开销"
+      },
+      "expected_issue": "paper_editorial_sections_missing"
+    }
+  ]
+}

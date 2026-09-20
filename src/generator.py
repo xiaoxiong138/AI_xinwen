@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.editorial_engine import (
     contains_mojibake,
@@ -13,6 +15,30 @@ from src.editorial_engine import (
     paper_plain_summary_passes,
     paper_technical_intro_passes,
 )
+
+
+def editorial_source_identity(item: Dict[str, Any]) -> str:
+    """Return the stable report identity used to trace a guide row to its body item."""
+    url = str(item.get("canonical_url") or item.get("url") or "").strip()
+    if url:
+        return f"url:{url}"
+    article_id = str(item.get("id") or item.get("article_id") or "").strip()
+    if article_id:
+        return f"article:{article_id}"
+    title = re.sub(
+        r"\W+",
+        "",
+        str(item.get("editorial_title") or item.get("title_cn") or item.get("title") or "").lower(),
+    )
+    return f"title:{title}" if title else ""
+
+
+def editorial_item_render_key(item: Dict[str, Any]) -> str:
+    """Return a compact stable key for matching a rendered card to its source item."""
+    identity = editorial_source_identity(item)
+    if not identity:
+        return ""
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
 
 class ReportGenerator:
@@ -33,6 +59,55 @@ class ReportGenerator:
         "agent_models": "Agent / Models",
         "infra_open_source": "Infra / Open Source",
         "products_business": "Products / Business",
+    }
+    V11_DOMAIN_LABELS = {
+        "world_model": "世界模型",
+        "physical_ai": "具身智能 / 机器人",
+        "agent_models": "智能体 / 模型",
+        "infra_open_source": "推理基础设施 / 开源",
+        "products_business": "产品 / 产业",
+    }
+    V11_INLINE_TAG_STYLES = {
+        "body": "margin:0;padding:10px;background:#f3f5f6;color:#17212b;font-family:Segoe UI,PingFang SC,Microsoft YaHei,Arial,sans-serif;line-height:1.62",
+        "h1": "margin:0 0 9px;font-size:24px;line-height:1.22;font-weight:800;color:#17212b",
+    }
+    V11_INLINE_CLASS_STYLES = {
+        "container": "width:100%;max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #dfe5e8;overflow:hidden",
+        "masthead": "padding:26px 18px 20px;background:#fbfcfc;border-bottom:1px solid #dfe5e8",
+        "eyebrow": "color:#0f665f;font-size:12px;font-weight:800;margin-bottom:10px",
+        "edition-title": "margin:-2px 0 9px;color:#314454;font-size:15px;line-height:1.4;font-weight:700",
+        "sub": "color:#66717f;font-size:12px",
+        "v10-lead": "margin-top:22px;padding-top:17px;border-top:2px solid #0f665f",
+        "v10-lead-title": "margin-bottom:9px;color:#17212b;font-size:15px;font-weight:800",
+        "v10-decision": "padding:10px 0;border-bottom:1px solid #e7ecee",
+        "v10-decision-domain": "color:#0f665f;font-size:11px;font-weight:800",
+        "v10-decision-text": "margin-top:2px;color:#263544;font-size:14px;line-height:1.62",
+        "v10-decision-evidence": "margin-top:4px;color:#66717f;font-size:12px;line-height:1.55",
+        "v11-counts": "width:100%;margin-top:14px;border-collapse:collapse;border-top:1px solid #dce5e3;border-bottom:1px solid #dce5e3",
+        "v11-count-value": "color:#17212b;font-size:20px;font-weight:900;line-height:1.15",
+        "v11-count-label": "margin-top:3px;color:#66717f;font-size:11px",
+        "v11-edition-total": "margin-top:8px;color:#66717f;font-size:11px;line-height:1.5",
+        "v10-nav": "margin-top:13px;font-size:12px;line-height:1.8",
+        "content": "padding:26px 18px 34px",
+        "section": "margin-top:32px",
+        "section-head": "margin-bottom:16px;border-bottom:1px solid #dfe5e8;padding-bottom:10px",
+        "v11-section-intro": "margin:-4px 0 9px;padding:11px 13px;border-left:3px solid #0f665f;background:#f5f8f7;color:#465663;font-size:13px;line-height:1.6",
+        "v10-entry": "padding:17px 0;border-bottom:1px solid #e4eaec",
+        "v10-kicker": "margin-bottom:5px;color:#0f665f;font-size:11px;font-weight:800",
+        "v11-claim-label": "color:#315d4a;font-weight:800",
+        "v10-title": "margin:0 0 9px;color:#17212b;font-size:17px;line-height:1.4;font-weight:800",
+        "v10-body": "color:#263544;font-size:16px;line-height:1.72;white-space:pre-line",
+        "v10-paper-plain": "margin:2px 0 0;padding:12px 13px 13px;border-left:4px solid #2f7d6d;background:#f2f8f6;color:#1d2a36;font-size:16px;line-height:1.78;font-weight:600;white-space:pre-line",
+        "v10-paper-tech": "margin-top:13px;padding:0 2px;color:#526170;font-size:16px;line-height:1.75;white-space:pre-line",
+        "v10-evidence": "margin-top:11px;padding:9px 11px;border-left:3px solid #82a99f;background:#f5f8f7;color:#3e514e;font-size:12px;line-height:1.58",
+        "v11-source-note": "margin-top:9px;color:#6a7580;font-size:11px;line-height:1.55",
+        "v10-actions": "margin-top:10px",
+        "v10-more-paper": "padding:13px 0;border-bottom:1px solid #e9edef",
+        "v10-more-title": "color:#244f75;font-size:16px;line-height:1.5;font-weight:800;text-decoration:none",
+        "v10-more-summary": "margin-top:4px;color:#596775;font-size:13px;line-height:1.62",
+        "v10-more-plain": "margin-top:9px;color:#263544;font-size:16px;line-height:1.72;white-space:pre-line",
+        "v10-more-tech": "margin-top:8px;color:#596775;font-size:16px;line-height:1.72;white-space:pre-line",
+        "footer": "padding:17px 18px;border-top:1px solid #dfe5e8;color:#66717f;font-size:12px;background:#fbfcfc",
     }
     PHYSICAL_AI_TERMS = (
         "physical ai",
@@ -124,6 +199,7 @@ class ReportGenerator:
     V8_DESIGN_VERSION = "v8-editorial-reader"
     V9_DESIGN_VERSION = "v9-continuous-learning"
     V10_DESIGN_VERSION = "v10-learning-digest"
+    V11_DESIGN_VERSION = "v11-editorial-library"
 
     def __init__(
         self,
@@ -132,7 +208,10 @@ class ReportGenerator:
         report_config: Optional[Dict[str, Any]] = None,
     ):
         os.makedirs(template_dir, exist_ok=True)
-        self.env = Environment(loader=FileSystemLoader(template_dir))
+        self.env = Environment(
+            loader=FileSystemLoader(template_dir),
+            autoescape=select_autoescape(enabled_extensions=("html", "xml")),
+        )
         self.design_version = design_version or self.DESIGN_VERSION
         self.report_config = dict(report_config or {})
 
@@ -140,13 +219,59 @@ class ReportGenerator:
         return self.design_version == self.CLASSIC_DESIGN_VERSION
 
     def _is_v8_reader(self) -> bool:
-        return self.design_version in {self.V8_DESIGN_VERSION, self.V9_DESIGN_VERSION, self.V10_DESIGN_VERSION}
+        return self.design_version in {
+            self.V8_DESIGN_VERSION,
+            self.V9_DESIGN_VERSION,
+            self.V10_DESIGN_VERSION,
+            self.V11_DESIGN_VERSION,
+        }
 
     def _is_v9_reader(self) -> bool:
         return self.design_version == self.V9_DESIGN_VERSION
 
     def _is_v10_reader(self) -> bool:
-        return self.design_version == self.V10_DESIGN_VERSION
+        return self.design_version in {self.V10_DESIGN_VERSION, self.V11_DESIGN_VERSION}
+
+    def _is_v11_product(self) -> bool:
+        return str(self.report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
+
+    def _v11_domain_label(self, item_or_key: Any) -> str:
+        key = str(item_or_key if isinstance(item_or_key, str) else self._domain_key(item_or_key))
+        return self.V11_DOMAIN_LABELS.get(key, "产品 / 产业")
+
+    @classmethod
+    def _inline_v11_critical_styles(cls, html: str) -> str:
+        opening_tag = re.compile(
+            r"<(?P<tag>body|div|table|h1|h2|h3|article|a)\b(?P<attrs>[^<>]*?)>",
+            re.IGNORECASE,
+        )
+
+        def apply(match: re.Match[str]) -> str:
+            tag = match.group("tag")
+            attrs = match.group("attrs") or ""
+            styles: List[str] = []
+            tag_style = cls.V11_INLINE_TAG_STYLES.get(tag.lower())
+            if tag_style:
+                styles.append(tag_style)
+            class_match = re.search(r'\bclass=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+            if class_match:
+                for class_name in class_match.group(1).split():
+                    class_style = cls.V11_INLINE_CLASS_STYLES.get(class_name)
+                    if class_style:
+                        styles.append(class_style)
+            if not styles:
+                return match.group(0)
+            inline_style = ";".join(styles).rstrip(";")
+            style_match = re.search(r'\sstyle=(["\'])(.*?)\1', attrs, re.IGNORECASE | re.DOTALL)
+            if style_match:
+                existing = style_match.group(2).strip().rstrip(";")
+                merged = f"{inline_style};{existing}" if existing else inline_style
+                attrs = attrs[: style_match.start()] + f' style="{merged}"' + attrs[style_match.end() :]
+            else:
+                attrs = f'{attrs} style="{inline_style}"'
+            return f"<{tag}{attrs}>"
+
+        return opening_tag.sub(apply, html)
 
     def _score_value(self, item: Dict[str, Any]) -> float:
         return float(item.get("selection_score", item.get("score", 0)) or 0)
@@ -1604,6 +1729,7 @@ class ReportGenerator:
                     "domain": domain,
                     "text": self._trim_reason(line, 110),
                     "url": str(item.get("url") or ""),
+                    "source_identity": editorial_source_identity(item),
                 }
             )
             seen_domains.add(domain)
@@ -1615,7 +1741,14 @@ class ReportGenerator:
                 url = str(item.get("url") or "")
                 if not line or any(existing.get("url") == url for existing in decisions):
                     continue
-                decisions.append({"domain": self._domain_label(item), "text": self._trim_reason(line, 110), "url": url})
+                decisions.append(
+                    {
+                        "domain": self._domain_label(item),
+                        "text": self._trim_reason(line, 110),
+                        "url": url,
+                        "source_identity": editorial_source_identity(item),
+                    }
+                )
                 if len(decisions) >= limit:
                     break
         return decisions[:limit]
@@ -1721,7 +1854,10 @@ class ReportGenerator:
         domain_covered = sum(1 for key in self.LEARNING_DOMAIN_ORDER if domain_counts.get(key, 0))
         paper_count = len(layers.get("featured_papers", [])) + len(layers.get("paper_appendix", []))
         return {
-            "model_path": "deepseek-v4-pro 事实抽取 + 本地编辑模板",
+            "model_path": str(
+                self.report_config.get("model_path_label")
+                or "GPT 结构化事实抽取 + 中文编辑"
+            ),
             "low_evidence_count": low_evidence_count,
             "aggregator_count": aggregator_count,
             "high_evidence_count": sum(1 for item in all_items if self._is_high_evidence(item)),
@@ -2393,10 +2529,15 @@ class ReportGenerator:
             return True
         if re.search(r"[A-Za-z]{4,}\s+[A-Za-z]{3,}\s*$", title) and len(title) > 30:
             return True
+        if re.search(
+            r"(?:增加|减少|提升|降低|扩展|优化|改进|支持|引入|采用|实现|构建|发布|更新|训练|部署)，(?:也|并|但|同时|仍)",
+            title,
+        ):
+            return True
         return False
 
     def _classic_nav_lead_title(self, item: Dict[str, Any]) -> str:
-        for key in ("editorial_title", "title_cn", "title"):
+        for key in ("editorial_title", "title_cn", "summary_preview", "title"):
             candidate = str(item.get(key) or "").strip()
             if candidate and not self._classic_nav_title_needs_repair(candidate):
                 return self._trim_reason(candidate, 46)
@@ -2487,20 +2628,35 @@ class ReportGenerator:
             return clipped[:clause_end].rstrip("，,；;：: ") + "。"
         return clipped.rstrip("，,；;：:。 ") + "。"
 
+    @staticmethod
+    def _primary_section(item: Dict[str, Any]) -> str:
+        facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+        section = str(item.get("primary_section") or facts.get("primary_section") or "").strip().lower()
+        if section in {"news", "technical", "paper"}:
+            return section
+        if str(item.get("content_type") or "").strip().lower() == "paper":
+            return "paper"
+        if str(item.get("content_type") or "").strip().lower() in {"project", "open_source", "opensource"}:
+            return "technical"
+        return "news"
+
     def _v8_card(self, item: Dict[str, Any]) -> Dict[str, Any]:
         card = dict(item)
+        card["v11_item_key"] = editorial_item_render_key(card)
         public_title = str(card.get("title_cn") or card.get("title") or "").strip()
-        if (
+        curated_copy = str(card.get("model_used") or "") == "codex-automation"
+        curated_title_limit = 56
+        if not curated_copy and (
             self._classic_nav_title_needs_repair(public_title)
             or any(marker in public_title for marker in ("…", "..."))
-            or len(public_title) > 56
+            or len(public_title) > curated_title_limit
         ):
             card["title_cn"] = self._classic_nav_lead_title(card)
         repaired_title = str(card.get("title_cn") or "").strip()
-        if (
+        if not curated_copy and (
             self._classic_nav_title_needs_repair(repaired_title)
             or any(marker in repaired_title for marker in ("…", "..."))
-            or len(repaired_title) > 56
+            or len(repaired_title) > curated_title_limit
         ):
             if card.get("content_type") == "paper":
                 facts = self._facts_for_item(card)
@@ -2519,14 +2675,94 @@ class ReportGenerator:
         if not is_paper:
             body = re.split(r"(?:。)?(?:直接证据|验证信息|公开论据)是[:：]", str(body or ""), maxsplit=1)[0].rstrip("。 ") + "。"
         card["v8_body"] = self._v8_trim(body, paper_limit if is_paper else news_limit)
+        card["v11_section"] = self._primary_section(card)
+        v11_limit = news_limit
+        if card["v11_section"] == "technical":
+            v11_limit = int(self.report_config.get("technical_body_char_limit", 400) or 400)
+        elif str(card.get("content_type") or "").lower() in {"interview", "podcast", "video"}:
+            v11_limit = int(self.report_config.get("interview_body_char_limit", 500) or 500)
+        v11_body = (
+            card.get("analysis_body")
+            or card.get("summary_display")
+            or card.get("summary")
+            or card.get("source_excerpt")
+            or card.get("brief_line")
+        )
+        if str(card.get("model_used") or "") == "codex-automation":
+            card["v11_body"] = str(v11_body or "").strip()
+        else:
+            card["v11_body"] = self._v8_trim(v11_body, v11_limit)
+        deck = self._v8_trim(card.get("summary_preview") or card.get("editorial_lead"), 110)
+        normalized_deck = re.sub(r"\W+", "", deck).lower()
+        normalized_title = re.sub(r"\W+", "", str(card.get("title_cn") or "")).lower()
+        normalized_opening = re.sub(r"\W+", "", card["v11_body"][:160]).lower()
+        deck_repeats_title = bool(
+            normalized_deck
+            and normalized_title
+            and (
+                normalized_deck in normalized_title
+                or normalized_title in normalized_deck
+                or SequenceMatcher(None, normalized_deck, normalized_title).ratio() >= 0.78
+            )
+        )
+        card["v12_deck"] = "" if normalized_deck and (
+            normalized_deck in normalized_opening or deck_repeats_title
+        ) else deck
+        raw_facts = card.get("facts") if isinstance(card.get("facts"), dict) else {}
+        source_excerpt = raw_facts.get("source_excerpt") or card.get("source_excerpt")
+        evidence_locator = raw_facts.get("evidence_locator") or card.get("evidence_locator")
+        if curated_copy:
+            card["v11_source_excerpt"] = str(source_excerpt or "").strip()
+            card["v11_evidence_locator"] = str(evidence_locator or "").strip()
+        else:
+            card["v11_source_excerpt"] = self._v8_trim(source_excerpt, 220)
+            card["v11_evidence_locator"] = self._v8_trim(evidence_locator, 100)
+        publish_date = str(card.get("publish_date") or "").strip()[:10]
+        supplemental = "supplemental_older_source" in set(card.get("quality_flags") or [])
+        card["v11_date_label"] = (
+            f"补充阅读 · {publish_date}" if supplemental and publish_date else publish_date
+        )
+        claim_type = str(card.get("claim_type") or raw_facts.get("claim_type") or "").strip().lower()
+        card["v11_claim_label"] = {
+            "verified_fact": "可核验事实",
+            "official_claim": "发布方声明",
+            "interview_opinion": "受访者观点",
+            "analysis": "分析判断",
+            "research_result": "研究结果",
+        }.get(claim_type, "")
         card["v8_evidence"] = self._v8_trim(card.get("evidence_line"), 150)
         card["v8_brief_line"] = self._v8_trim(card.get("brief_line"), 120)
-        card["v8_domain"] = self._domain_label(card)
+        card["v8_domain"] = (
+            self._v11_domain_label(card)
+            if self._is_v11_product()
+            else self._domain_label(card)
+        )
         card["v8_source"] = str(card.get("source_detail") or card.get("platform") or card.get("source_tier_label") or "来源")
         card["v8_freshness"] = str(card.get("paper_status_label") or card.get("freshness_label") or "今日新增")
         card["v10_change_reason"] = self._v8_trim(card.get("paper_change_reason"), 110)
-        card["v10_plain_summary"] = self._v8_trim(card.get("paper_plain_summary"), 180)
-        card["v10_technical_intro"] = self._v8_trim(card.get("paper_technical_intro"), 300)
+        if curated_copy:
+            card["v10_plain_summary"] = str(
+                card.get("paper_plain_summary") or ""
+            ).strip()
+            card["v10_technical_intro"] = str(
+                card.get("paper_technical_intro") or ""
+            ).strip()
+        else:
+            card["v10_plain_summary"] = self._v8_trim(
+                card.get("paper_plain_summary"), 180
+            )
+            card["v10_technical_intro"] = self._v8_trim(
+                card.get("paper_technical_intro"), 300
+            )
+        card["v10_index_only"] = str(card.get("summary_quality_tier") or "") == "index_only"
+        card["v10_source_title"] = self._v8_trim(
+            card.get("source_display_title") or card.get("title") or card.get("title_cn"),
+            180,
+        )
+        card["v10_source_excerpt"] = self._v8_trim(
+            card.get("source_excerpt") or card.get("brief_line"),
+            280,
+        )
         appendix_text = (
             card.get("paper_compact_summary")
             or card.get("paper_plain_summary")
@@ -2615,6 +2851,23 @@ class ReportGenerator:
             return result
 
         must_read_limit = max(1, int(self.report_config.get("must_read_limit", 10) or 10))
+        all_nonpaper = unique(
+            [
+                item
+                for item in (
+                    list(layers.get("must_read", []))
+                    + list(layers.get("physical_ai", []))
+                    + list(layers.get("watch", []))
+                    + list(layers.get("brief", []))
+                )
+                if item.get("content_type") != "paper"
+            ],
+            200,
+        )
+        news_limit = max(20, int(self.report_config.get("news_section_limit", 30) or 30))
+        technical_limit = max(20, int(self.report_config.get("technical_section_limit", 24) or 24))
+        news_items = [item for item in all_nonpaper if self._primary_section(item) == "news"][:news_limit]
+        technical_items = [item for item in all_nonpaper if self._primary_section(item) == "technical"][:technical_limit]
         must_read_candidates = [
             item
             for item in (
@@ -2699,6 +2952,7 @@ class ReportGenerator:
                         item.get("paper_compact_summary")
                         or item.get("paper_plain_summary")
                         or item.get("paper_technical_intro")
+                        or ("index-only" if str(item.get("summary_quality_tier") or "") == "index_only" else "")
                         or ""
                     ).strip()
                 )
@@ -2712,20 +2966,63 @@ class ReportGenerator:
         featured_papers = [item for item in featured_papers_all if not item.get("is_reappeared_update")]
         more_papers = [item for item in more_papers_all if not item.get("is_reappeared_update")]
 
+        for index, item in enumerate(news_items, start=1):
+            item["v11_position"] = index
+            item["v11_total"] = len(news_items)
+        for index, item in enumerate(technical_items, start=1):
+            item["v11_position"] = index
+            item["v11_total"] = len(technical_items)
+        ordered_papers = paper_updates + featured_papers + more_papers
+        for index, item in enumerate(ordered_papers, start=1):
+            item["v11_position"] = index
+            item["v11_total"] = len(ordered_papers)
+
+        decision_limit = min(
+            7,
+            max(5, int(self.report_config.get("editorial_decision_limit", 6) or 6)),
+        )
+        decision_candidates = unique(
+            must_read + news_items + technical_items + featured_papers + more_papers,
+            max(decision_limit * 3, decision_limit),
+        )
         decisions: List[Dict[str, Any]] = []
-        for item in must_read[:5]:
+        seen_decision_domains: set[str] = set()
+        deferred_decisions: List[Dict[str, Any]] = []
+        for item in decision_candidates:
             lead = self._v8_trim(item.get("editorial_lead") or item.get("analysis_body"), 92)
             evidence = self._v8_trim(item.get("evidence_line"), 108)
             if not lead:
                 continue
-            decisions.append(
-                {
-                    "domain": item.get("v8_domain") or self._domain_label(item),
-                    "text": lead,
-                    "evidence": evidence,
-                    "url": item.get("url", ""),
-                }
-            )
+            decision = {
+                "domain": item.get("v8_domain") or self._domain_label(item),
+                "text": lead,
+                "evidence": evidence,
+                "url": item.get("url", ""),
+                "source_identity": editorial_source_identity(item),
+            }
+            if decision["domain"] in seen_decision_domains:
+                deferred_decisions.append(decision)
+                continue
+            decisions.append(decision)
+            seen_decision_domains.add(decision["domain"])
+            if len(decisions) >= decision_limit:
+                break
+        if len(decisions) < decision_limit:
+            existing_urls = {str(item.get("url") or "") for item in decisions}
+            for decision in deferred_decisions:
+                url = str(decision.get("url") or "")
+                if url in existing_urls:
+                    continue
+                decisions.append(decision)
+                existing_urls.add(url)
+                if len(decisions) >= decision_limit:
+                    break
+
+        source_news_limit = max(0, int(self.report_config.get("source_news_brief_limit", 12) or 12))
+        source_news_briefs = unique(
+            [item for item in layers.get("brief", []) if item.get("source_grounded_brief")],
+            source_news_limit,
+        )
 
         return {
             "editorial_decisions": decisions,
@@ -2735,9 +3032,13 @@ class ReportGenerator:
             "paper_updates": paper_updates,
             "featured_papers": featured_papers,
             "more_papers": more_papers,
-            "briefs": [],
+            "briefs": source_news_briefs,
+            "news_items": news_items,
+            "technical_items": technical_items,
+            "news_count": len(news_items),
+            "technical_count": len(technical_items),
             "paper_count": len(paper_updates) + len(featured_papers) + len(more_papers),
-            "information_count": visible_information_count + len(more_updates),
+            "information_count": len(news_items) + len(technical_items),
             "paper_freshness": dict(self.report_config.get("paper_freshness_metrics") or {}),
         }
 
@@ -2820,15 +3121,36 @@ class ReportGenerator:
         classic_mixed_items = self._classic_mixed_items(all_layered_items) if classic_mode else []
         classic_learning_nav = self._classic_learning_nav(classic_mixed_items) if classic_mode else []
 
+        v11_product = self._is_v11_product()
+        display_title = "AI 前沿情报日报" if v11_product else title
+        display_subtitle = ""
+        if v11_product and "·" in title:
+            display_subtitle = title.split("·", 1)[1].strip()
+        v10_context = self._v10_reader_context(decorated_layers) if v10_mode else {}
+        edition_counts = report_summary.get("edition_counts") if isinstance(report_summary, dict) else None
+        if v10_context:
+            edition_counts = edition_counts if isinstance(edition_counts, dict) else {}
+            v10_context.update({
+                "edition_news_count": int(edition_counts.get("news", v10_context.get("news_count", 0)) or 0),
+                "edition_technical_count": int(edition_counts.get("technical", v10_context.get("technical_count", 0)) or 0),
+                "edition_paper_count": int(edition_counts.get("paper", v10_context.get("paper_count", 0)) or 0),
+            })
+            v10_context["edition_total_count"] = (
+                v10_context["edition_news_count"]
+                + v10_context["edition_technical_count"]
+                + v10_context["edition_paper_count"]
+            )
         context = {
             "title": title,
+            "display_title": display_title,
+            "display_subtitle": display_subtitle,
             "design_version": design_version,
             "classic_mode": classic_mode,
             "v8_mode": v8_mode,
             "v9_mode": v9_mode,
             "v10_mode": v10_mode,
             "v8": self._v8_reader_context(decorated_layers) if v8_mode and not v10_mode else {},
-            "v10": self._v10_reader_context(decorated_layers) if v10_mode else {},
+            "v10": v10_context,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "paper_count": len(papers),
@@ -2877,7 +3199,8 @@ class ReportGenerator:
             "archive_summary": archive_summary or {},
         }
         template = self.env.get_template("daily_report.html")
-        return template.render(**context)
+        rendered = template.render(**context)
+        return self._inline_v11_critical_styles(rendered) if v11_product else rendered
 
     def generate_markdown(
         self,

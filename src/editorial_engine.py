@@ -51,6 +51,15 @@ FIELD_LABEL_LEAKS = (
     "技术方向：",
 )
 
+ATTRIBUTION_OPENERS = (
+    "团队表示",
+    "公司称",
+    "发布方披露",
+    "官方公告显示",
+    "团队介绍",
+    "官方称",
+)
+
 MOJIBAKE_MARKERS = (
     "�",
     "Ã",
@@ -66,20 +75,51 @@ MOJIBAKE_MARKERS = (
     "瀛",
 )
 
+
+def attribution_opener_pattern(value: Any) -> str:
+    opening = re.split(r"[。！？!?]", str(value or ""), maxsplit=1)[0].strip()
+    match = re.match(
+        rf"^[^，,。！？!?]{{0,48}}({'|'.join(map(re.escape, ATTRIBUTION_OPENERS))})[，,]",
+        opening,
+    )
+    return match.group(1) if match else ""
+
 METHOD_PATTERN = re.compile(
-    r"方法|机制|框架|训练|预测|规划|控制|生成|对齐|检索|微调|蒸馏|评估|采用|使用|利用|结合|设计|引入|构建|通过|编码|分配|约束|benchmark|dataset|baseline|model",
+    r"方法|机制|框架|训练|学习|预测|规划|控制|判断|决策|生成|对齐|检索|微调|蒸馏|评估|分析|证明|构造|比较|指出|研究|采用|使用|利用|结合|设计|引入|构建|通过|编码|分配|约束|拆分|交给|benchmark|dataset|baseline|model",
     re.IGNORECASE,
 )
 RESULT_PATTERN = re.compile(
-    r"实验|指标|结果|报告|成功率|准确率|提升|降低|超过|优于|对比|基准|数据集|benchmark|result|outperform|success|%",
+    r"实验|指标|结果|报告|成功率|准确率|提升|降低|超过|优于|对比|对照|参照|基准|数据集|验证|消融|迁移|观察|差异|结论|测得|达到|保持|benchmark|result|outperform|success|%",
     re.IGNORECASE,
 )
 PAPER_OUTCOME_PATTERN = re.compile(
     r"成功率|准确率|召回率|精度|延迟|吞吐|显存|成本|百分点|厘米|毫秒|R²|F1|BLEU|mAP|AUC|FPS|TOPS|"
     r"提升|降低|超过|优于|胜过|达到|改善|"
     r"缩短|更强|更鲁棒|鲁棒性|更准确|有效|可行|一致|相当|稳定|保持|保留|区分|远未解决|缺陷|"
-    r"outperform|improv|reduc|increase|decrease|"
+    r"outperform|improv|reduc|increase|decrease|compar|evaluat|report|"
     r"faster|lower|higher|robust|competitive|%",
+    re.IGNORECASE,
+)
+
+GENERIC_FACT_VALUES = {
+    "ai",
+    "llm",
+    "vla",
+    "人工智能",
+    "模型",
+    "方法",
+    "框架",
+    "论文",
+    "论文中的方法与实验",
+    "模型/研究",
+    "世界模型",
+    "具身智能",
+    "机器人",
+    "基础模型",
+}
+
+NON_RESULT_UNIT_PATTERN = re.compile(
+    r"^\s*[\$￥]?\d+(?:[.,]\d+)?\s*(?:k|m|b|million|billion|参数|parameters?|tokens?|小时|hours?|分钟|minutes?|米|cm|mm)\s*$",
     re.IGNORECASE,
 )
 
@@ -114,7 +154,28 @@ def _clean_complete(value: Any, limit: int = 180) -> str:
 def _facts(item: Dict[str, Any]) -> Dict[str, Any]:
     facts_cn = item.get("facts_cn")
     if isinstance(facts_cn, dict) and facts_cn:
-        return facts_cn
+        raw_facts = item.get("facts")
+        merged = dict(facts_cn)
+        if isinstance(raw_facts, dict):
+            for key in (
+                "who",
+                "action",
+                "target",
+                "claim_type",
+                "source_excerpt",
+                "evidence_locator",
+                "primary_section",
+                "technical_category",
+                "paper_domain_key",
+            ):
+                if merged.get(key) in (None, "", [], {}) and raw_facts.get(key) not in (
+                    None,
+                    "",
+                    [],
+                    {},
+                ):
+                    merged[key] = raw_facts[key]
+        return merged
     facts = item.get("facts")
     return facts if isinstance(facts, dict) else {}
 
@@ -280,7 +341,132 @@ def has_field_label_leak(text: Any) -> bool:
 
 def has_bad_public_phrase(text: Any) -> bool:
     value = str(text or "")
-    return any(token in value for token in BAD_PUBLIC_PHRASES)
+    if any(token in value for token in BAD_PUBLIC_PHRASES):
+        return True
+    if re.search(
+        r"(发布|推出|上线|开源|更新)(?:产品|模型|系统|项目|功能)?\1",
+        value,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b([A-Za-z][A-Za-z0-9_.+-]{1,30})\s*"
+            r"(?:发布|推出|上线|开源|更新|release[sd]?|launch(?:es|ed)?)\s*"
+            r"\1\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _normalized_fact_value(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _generic_fact_value(value: Any) -> bool:
+    normalized = _normalized_fact_value(value)
+    if not normalized:
+        return True
+    generic = {_normalized_fact_value(item) for item in GENERIC_FACT_VALUES}
+    return normalized in generic or normalized.startswith("论文中的")
+
+
+def _claim_numbers(value: Any) -> List[str]:
+    return [
+        re.sub(r"[,\s]", "", token).lower()
+        for token in re.findall(
+            r"[\$￥]?\d+(?:[.,]\d+)?\s*(?:%|k|m|b|million|billion|万|亿|参数|parameters?|tokens?|小时|hours?|分钟|minutes?|米|cm|mm)?",
+            str(value or ""),
+            re.IGNORECASE,
+        )
+        if token.strip()
+    ]
+
+
+def _numbers_supported_by_source(value: Any, source_text: str) -> bool:
+    claim_numbers = _claim_numbers(value)
+    if not claim_numbers:
+        return True
+    normalized_source = re.sub(r"[,\s]", "", source_text.lower())
+    return all(token in normalized_source for token in claim_numbers)
+
+
+def assess_fact_publishability(item: Dict[str, Any], facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Decide whether structured facts are safe enough to expand into public prose."""
+    facts = facts if isinstance(facts, dict) else _facts(item)
+    content_type = str(item.get("content_type") or "news").lower()
+    model_used = str(item.get("model_used") or "")
+    raw_facts = _raw_facts(item)
+    has_source_body = bool(str(item.get("content") or "").strip())
+    source_text = re.sub(
+        r"\s+",
+        " ",
+        " ".join(str(item.get(key) or "") for key in ("title", "content", "source_detail")),
+    ).strip()
+    reasons: List[str] = []
+
+    if not facts or not all(str(facts.get(key) or "").strip() for key in ("who", "action", "target")):
+        reasons.append("missing_key_facts")
+    if model_used == "template_fallback":
+        reasons.append("template_fallback")
+
+    evidence = _evidence_list(facts)
+    if not evidence and not has_source_body and model_used != "template_fallback":
+        evidence = _evidence_list(raw_facts)
+    supported_evidence = [
+        point for point in evidence
+        if len(point) >= 4
+        and (
+            _numbers_supported_by_source(point, source_text)
+            or (not has_source_body and model_used != "template_fallback")
+        )
+    ]
+    if not supported_evidence:
+        reasons.append("unsupported_evidence")
+
+    unsupported_numeric = has_source_body and any(
+        str(facts.get(key) or "").strip()
+        and not _numbers_supported_by_source(facts.get(key), source_text)
+        for key in ("metric_result", "dataset_or_benchmark", "evidence")
+    )
+    if unsupported_numeric:
+        reasons.append("unsupported_numeric_claim")
+
+    strict_paper_validation = bool(
+        item.get("_strict_evidence_editor")
+        or model_used == "template_fallback"
+        or has_source_body
+    )
+    if content_type == "paper" and strict_paper_validation:
+        method = str(
+            facts.get("core_method")
+            or facts.get("method")
+            or raw_facts.get("core_method")
+            or raw_facts.get("method")
+            or ""
+        ).strip()
+        result = str(facts.get("metric_result") or raw_facts.get("metric_result") or "").strip()
+        if len(method) < 12 or _generic_fact_value(method) or not METHOD_PATTERN.search(method):
+            reasons.append("generic_method")
+        if (
+            not result
+            or _generic_fact_value(result)
+            or NON_RESULT_UNIT_PATTERN.fullmatch(result)
+            or not PAPER_OUTCOME_PATTERN.search(result)
+        ):
+            reasons.append("invalid_result")
+        elif has_source_body and not _numbers_supported_by_source(result, source_text):
+            reasons.append("unsupported_numeric_claim")
+
+    reasons = sorted(set(reasons))
+    if not reasons:
+        tier = "editorial_ready"
+    elif content_type == "paper":
+        tier = "index_only"
+    else:
+        tier = "brief_only"
+    return {"tier": tier, "reasons": reasons}
 
 
 def mixed_language_title(title: Any) -> bool:
@@ -464,7 +650,15 @@ def _compose_title(subject: str, action: str, target: str, limit: int = 56) -> s
 
 def _subject_cn(item: Dict[str, Any]) -> str:
     facts = _facts(item)
-    who = _clean(facts.get("who"), 36)
+    content_type = str(item.get("content_type") or "").strip().lower()
+    if content_type in {"project", "open_source", "opensource"}:
+        project = _clean_complete(facts.get("target") or facts.get("code_or_project"), 28)
+        if project and not contains_mojibake(project) and not has_untranslated_prose(project):
+            return project
+    raw_who = re.sub(r"\s+", " ", str(facts.get("who") or "")).strip()
+    if len(raw_who) > 36 and "；" in raw_who:
+        raw_who = raw_who.split("；", 1)[0].strip()
+    who = _clean(raw_who, 36)
     if who and who.lower() not in {"unknown", "this paper", "researchers"} and not contains_mojibake(who):
         return who
     title = _clean(item.get("title_cn") or item.get("title"), 42)
@@ -571,15 +765,34 @@ def paper_plain_summary_passes(text: Any) -> bool:
         return False
     if value.count("。") < 2:
         return False
-    result_clause = value.rsplit("。", 2)[-2] if "。" in value else value
-    if "论文报告" not in result_clause:
+    return bool(METHOD_PATTERN.search(value))
+
+
+def trusted_codex_research_item(item: Dict[str, Any], facts: Optional[Dict[str, Any]] = None) -> bool:
+    """Recognize inbox rows that already passed the strict research collector checks."""
+    if str(item.get("model_used") or "") != "codex-automation":
         return False
-    outcome_text = result_clause.split("论文报告", 1)[1]
-    return bool(
-        METHOD_PATTERN.search(value)
-        and RESULT_PATTERN.search(value)
-        and PAPER_OUTCOME_PATTERN.search(outcome_text)
-    )
+    if str(item.get("analysis_version") or "") not in {"codex-research-v2", "codex-research-v3"}:
+        return False
+    facts = facts if isinstance(facts, dict) else _facts(item)
+    raw_facts = _raw_facts(item)
+    if not all(str(raw_facts.get(key) or facts.get(key) or "").strip() for key in ("who", "action", "target")):
+        return False
+    if not (_evidence_list(raw_facts) or _evidence_list(facts)):
+        return False
+    if not str(raw_facts.get("source_excerpt") or facts.get("source_excerpt") or "").strip():
+        return False
+    if not str(raw_facts.get("evidence_locator") or facts.get("evidence_locator") or "").strip():
+        return False
+    if _safe_float(item.get("evidence_quality")) < 0.45:
+        return False
+    if _safe_float(item.get("information_density"), _safe_float(item.get("evidence_quality"))) < 0.45:
+        return False
+    if str(item.get("content_type") or "") == "paper":
+        plain = raw_facts.get("paper_plain_summary") or item.get("paper_plain_summary")
+        technical = raw_facts.get("paper_technical_intro") or item.get("paper_technical_intro")
+        return paper_plain_summary_passes(plain) and paper_technical_intro_passes(technical)
+    return True
 
 
 class EditorialEngine:
@@ -592,10 +805,33 @@ class EditorialEngine:
         content_type = str(result.get("content_type") or "").strip() or "news"
         result["facts_cn"] = normalize_facts_cn(result)
         facts = _facts(result)
+        publishability = assess_fact_publishability(result, facts)
+        trusted_codex_item = trusted_codex_research_item(result, facts)
+        if trusted_codex_item:
+            publishability = {"tier": "editorial_ready", "reasons": []}
+            result["_codex_research_validated"] = True
+        result["summary_quality_tier"] = publishability["tier"]
+        result["summary_quality_reasons"] = publishability["reasons"]
         evidence = _evidence_list(facts)
         domain_key = _domain_key(result)
         result["domain_key"] = domain_key
         result["domain_label"] = DOMAIN_LABELS.get(domain_key, "Products / Business")
+        raw_facts = _raw_facts(result)
+        curated_plain_summary = str(
+            raw_facts.get("paper_plain_summary") or result.get("paper_plain_summary") or ""
+        ).strip()
+        curated_technical_intro = str(
+            raw_facts.get("paper_technical_intro") or result.get("paper_technical_intro") or ""
+        ).strip()
+        curated_codex_paper = bool(
+            content_type == "paper"
+            and str(result.get("model_used") or "") == "codex-automation"
+            and paper_plain_summary_passes(curated_plain_summary)
+            and paper_technical_intro_passes(curated_technical_intro)
+        )
+        if content_type == "paper" and str(result.get("model_used") or "") == "codex-automation":
+            result["paper_plain_summary"] = curated_plain_summary
+            result["paper_technical_intro"] = curated_technical_intro
 
         title = self.editorial_title(result)
         result["editorial_title"] = title
@@ -604,7 +840,7 @@ class EditorialEngine:
         evidence_line = self.evidence_line(result, evidence)
         result["evidence_line"] = evidence_line
 
-        if content_type == "paper":
+        if content_type == "paper" and (publishability["tier"] == "editorial_ready" or curated_codex_paper):
             plain_summary = self.paper_plain_summary(result)
             intro = self.paper_technical_intro(result)
             compact_summary = self.paper_compact_summary(result)
@@ -614,6 +850,14 @@ class EditorialEngine:
             result["editorial_lead"] = _clean(plain_summary.split("。", 1)[0], 120)
             result["analysis_body"] = plain_summary
             result["reader_next_step"] = self.paper_next_step(result)
+        elif content_type == "paper":
+            result["paper_plain_summary"] = ""
+            result["paper_technical_intro"] = ""
+            result["paper_compact_summary"] = ""
+            result["paper_index_note"] = "仅保留原文入口，暂不生成未经来源支撑的技术总结。"
+            result["editorial_lead"] = ""
+            result["analysis_body"] = ""
+            result["reader_next_step"] = "直接阅读原文摘要、方法与实验章节。"
         else:
             result["paper_plain_summary"] = ""
             result["paper_technical_intro"] = ""
@@ -638,9 +882,10 @@ class EditorialEngine:
         facts = _facts(item)
         content_type = str(item.get("content_type") or "")
         force_fact_title = bool(item.get("_v8_force_fact_title"))
+        trusted_research_title = str(item.get("model_used") or "") == "codex-automation"
         if (
             original
-            and not force_fact_title
+            and (not force_fact_title or trusted_research_title)
             and not mixed_language_title(original)
             and not has_bad_public_phrase(original)
             and "..." not in original
@@ -677,6 +922,13 @@ class EditorialEngine:
         return bool(re.match(r"[A-Za-z0-9]", source_title[len(prefix) :]))
 
     def editorial_lead(self, item: Dict[str, Any]) -> str:
+        if (
+            str(item.get("model_used") or "") == "codex-automation"
+            and str(item.get("content_type") or "").strip().lower() in {"project", "open_source", "opensource"}
+        ):
+            curated = _clean_complete(item.get("editorial_title") or item.get("title_cn"), 110)
+            if curated:
+                return curated
         facts = _facts(item)
         subject = _subject_cn(item)
         action = _action_cn(facts.get("action"), str(item.get("content_type") or ""))
@@ -702,6 +954,31 @@ class EditorialEngine:
         return _clean_complete("；".join(clean_points[:2]), 150)
 
     def analysis_body(self, item: Dict[str, Any]) -> str:
+        raw_facts = _raw_facts(item)
+        primary_section = str(
+            item.get("primary_section") or raw_facts.get("primary_section") or ""
+        ).strip().lower()
+        if str(item.get("model_used") or "") == "codex-automation":
+            content_type = str(item.get("content_type") or "").strip().lower()
+            body_limit = 380 if primary_section == "technical" else 300
+            if content_type in {"interview", "podcast", "video"}:
+                body_limit = 500
+            original_curated = str(item.get("summary") or "").strip()
+            if (
+                120 <= len(original_curated) <= body_limit
+                and not contains_mojibake(original_curated)
+                and not has_bad_public_phrase(original_curated)
+                and not has_field_label_leak(original_curated)
+            ):
+                return original_curated
+            curated = _clean_complete(original_curated, body_limit)
+            if (
+                len(curated) >= 120
+                and not contains_mojibake(curated)
+                and not has_bad_public_phrase(curated)
+                and not has_field_label_leak(curated)
+            ):
+                return curated
         facts = _facts(item)
         evidence_line = str(item.get("evidence_line") or self.evidence_line(item))
         domain_key = str(item.get("domain_key") or _domain_key(item))
@@ -711,7 +988,13 @@ class EditorialEngine:
         target = _dedupe_subject_target(subject, target)
         if action and target.startswith(action):
             target = target[len(action) :].lstrip("，,:：- ")
-        lead = f"{subject}{action}{target}"
+        if (
+            str(item.get("model_used") or "") == "codex-automation"
+            and str(item.get("content_type") or "").strip().lower() in {"project", "open_source", "opensource"}
+        ):
+            lead = _clean_complete(item.get("editorial_title") or item.get("title_cn"), 110)
+        else:
+            lead = f"{subject}{action}{target}"
         method = _clean_complete(facts.get("core_method") or facts.get("method"), 92)
         deployment = _clean_complete(facts.get("deployment_context"), 64)
         if "（" not in deployment:
@@ -726,15 +1009,15 @@ class EditorialEngine:
         if self.quality_tier(item) == "brief":
             return self.brief_line(item)
         if "interview" in content_text or "访谈" in content_text or "观点" in content_text:
-            return _clean_complete(f"{subject}在访谈中主张{target}。这属于观点而非已验证事实，公开论据是：{evidence_line}", 180)
+            return _clean_complete(f"{subject}在访谈中主张{target}。这是受访者的判断，支撑它的公开材料包括{evidence_line}", 180)
 
         details: List[str] = []
         if method:
-            details.append(f"具体做法是{method}")
+            details.append(f"实现上，{method}")
         metric_has_number = bool(re.search(r"\d|%|倍|亿|万|million|billion", metric, re.IGNORECASE))
         metric_has_outcome = bool(PAPER_OUTCOME_PATTERN.search(metric))
         if metric and metric not in method and (metric_has_number or metric_has_outcome):
-            details.append(f"{'公开数字' if metric_has_number else '公开结果'}是{metric}")
+            details.append(f"{'关键数字为' if metric_has_number else '公开结果为'}{metric}")
         elif evidence:
             numeric_evidence = next(
                 (point for point in evidence if re.search(r"\d|%|倍|亿|万|million|billion", point, re.IGNORECASE)),
@@ -751,30 +1034,22 @@ class EditorialEngine:
                 else:
                     details.append(f"应用场景是{deployment}")
         if baseline and baseline not in method:
-            details.append(f"对照或替代对象是{baseline}")
+            details.append(f"它对照的是{baseline}")
         if code and code.lower() not in {"open-source", "open source", "github", "开源"}:
-            details.append(f"代码或项目入口是{code}")
+            details.append(f"代码或项目入口指向{code}")
         if not details and evidence:
             details.append(f"公开信息显示，{evidence[0]}")
 
         detail_text = "。".join(details[:2])
         if detail_text:
             detail_text += "。"
-        if "github" in content_text or "open source" in content_text or "开源" in content_text or domain_key == "infra_open_source":
-            return _clean_complete(f"{lead}。{detail_text}直接证据是：{evidence_line}", 210)
-        if domain_key == "physical_ai":
-            return _clean_complete(f"{lead}。{detail_text}验证信息是：{evidence_line}", 210)
-        if domain_key == "world_model":
-            return _clean_complete(f"{lead}。{detail_text}验证信息是：{evidence_line}", 210)
-        if domain_key == "agent_models":
-            return _clean_complete(f"{lead}。{detail_text}直接证据是：{evidence_line}", 210)
-        return _clean_complete(
-            f"{lead}。{detail_text}直接证据是：{evidence_line}",
-            220,
-        )
+        return _clean_complete(f"{lead}。{detail_text}", 210 if domain_key != "products_business" else 220)
 
     def paper_plain_summary(self, item: Dict[str, Any]) -> str:
-        existing = _clean_complete(item.get("paper_plain_summary"), 180)
+        raw_existing = str(item.get("paper_plain_summary") or "").strip()
+        if paper_plain_summary_passes(raw_existing):
+            return raw_existing
+        existing = _clean_complete(raw_existing, 180)
         if paper_plain_summary_passes(existing):
             return existing
         facts = _facts(item)
@@ -865,7 +1140,15 @@ class EditorialEngine:
             benchmark = _clean_complete(benchmark_source, benchmark_limit)
             baseline = _clean_complete(baseline_source, baseline_limit)
             opening = opening_templates[opening_index].format(problem)
-            method_sentence = f"作者的办法是{method}"
+            method_templates = (
+                "方法上，论文采用{}",
+                "作者采用{}",
+                "它的关键步骤是{}",
+                "具体实现是{}",
+                "为处理这个问题，论文{}",
+                "研究中的做法是{}",
+            )
+            method_sentence = method_templates[opening_index].format(method)
             benchmark_location = benchmark if benchmark.endswith(("上", "中", "内")) else f"{benchmark}上"
             if benchmark and baseline:
                 result_sentence = f"在{benchmark_location}与{baseline}比较，论文报告{result}"
@@ -927,12 +1210,21 @@ class EditorialEngine:
         return text if len(text) >= 36 else ""
 
     def paper_technical_intro(self, item: Dict[str, Any]) -> str:
-        existing = _clean_complete(item.get("paper_technical_intro"), 300)
+        raw_existing = str(item.get("paper_technical_intro") or "").strip()
+        if str(item.get("model_used") or "") == "codex-automation" and paper_technical_intro_passes(raw_existing):
+            return raw_existing
+        existing = _clean_complete(raw_existing, 300)
         facts = _facts(item)
         name = _paper_name(item)
         fact_mechanism = _clean_complete(facts.get("core_method") or facts.get("method"), 88)
         fact_result = _paper_result(item)
-        if paper_technical_intro_passes(existing) and not (fact_mechanism and fact_result):
+        if (
+            paper_technical_intro_passes(existing)
+            and (
+                str(item.get("model_used") or "") == "codex-automation"
+                or not (fact_mechanism and fact_result)
+            )
+        ):
             return existing
         mechanism = fact_mechanism or _paper_mechanism(item)
         result = fact_result
@@ -1001,6 +1293,11 @@ class EditorialEngine:
         return "继续看客户、价格、使用数据或产品细节是否补齐。"
 
     def quality_tier(self, item: Dict[str, Any]) -> str:
+        if item.get("_codex_research_validated"):
+            return "deep" if item.get("content_type") == "paper" else "standard"
+        summary_quality_tier = str(item.get("summary_quality_tier") or "")
+        if summary_quality_tier in {"index_only", "brief_only"}:
+            return "brief"
         facts = _facts(item)
         evidence_quality = _safe_float(item.get("evidence_quality"))
         density = _safe_float(item.get("information_density"), evidence_quality)
@@ -1054,6 +1351,7 @@ class EditorialEngine:
                 flags.append("paper_mechanism_missing")
             if not any(str(facts.get(key) or "").strip() for key in ("metric_result", "dataset_or_benchmark", "baseline")):
                 flags.append("paper_result_context_missing")
+        flags.extend(str(reason) for reason in item.get("summary_quality_reasons") or [])
         return sorted(set(flags))
 
     def decorate_items(self, items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1064,6 +1362,8 @@ class EditorialEngine:
         decorated = [self.decorate_item(item) for item in items]
 
         def visible_untranslated(item: Dict[str, Any]) -> bool:
+            if item.get("source_grounded_brief") and str(item.get("report_section") or "") == "brief":
+                return False
             if str(item.get("report_section") or "") != "paper_appendix":
                 return "untranslated_fact" in item.get("editorial_flags", [])
             return any(
@@ -1096,6 +1396,15 @@ class EditorialEngine:
                 or item.get("quality_tier") != "brief"
             )
         )
+        gpt_items = [
+            item for item in decorated
+            if str(item.get("model_used") or "").lower().startswith("gpt-")
+        ]
+        llm_items = [
+            item for item in decorated
+            if str(item.get("model_used") or "")
+            and str(item.get("model_used") or "") != "template_fallback"
+        ]
         metrics = {
             "editorial_quality_status": "passed",
             "mixed_language_title_count": sum(1 for item in decorated if "mixed_language_title" in item.get("editorial_flags", [])),
@@ -1123,6 +1432,32 @@ class EditorialEngine:
                 if str(item.get("model_used") or "") == "deepseek-v4-pro"
                 and not all(_facts(item).get(key) for key in ("who", "action", "target"))
             ),
+            "gpt_schema_valid_count": sum(1 for item in gpt_items if bool(_facts(item))),
+            "gpt_empty_facts_count": sum(1 for item in gpt_items if not bool(_facts(item))),
+            "gpt_key_field_missing_count": sum(
+                1
+                for item in gpt_items
+                if not all(_facts(item).get(key) for key in ("who", "action", "target"))
+            ),
+            "llm_schema_valid_count": sum(1 for item in llm_items if bool(_facts(item))),
+            "llm_empty_facts_count": sum(1 for item in llm_items if not bool(_facts(item))),
+            "llm_key_field_missing_count": sum(
+                1
+                for item in llm_items
+                if not all(_facts(item).get(key) for key in ("who", "action", "target"))
+            ),
+            "template_fallback_count": sum(
+                1 for item in decorated if str(item.get("model_used") or "") == "template_fallback"
+            ),
+            "index_only_paper_count": sum(
+                1 for item in decorated if str(item.get("summary_quality_tier") or "") == "index_only"
+            ),
+            "generic_fact_bundle_count": sum(
+                1 for item in decorated if "generic_method" in item.get("editorial_flags", [])
+            ),
+            "unsupported_numeric_claim_count": sum(
+                1 for item in decorated if "unsupported_numeric_claim" in item.get("editorial_flags", [])
+            ),
             "failed_editorial_urls": [
                 str(item.get("url") or "")
                 for item in focus_items
@@ -1146,6 +1481,18 @@ class EditorialEngine:
             metrics["deepseek_health_hint"] = "deepseek_ok"
         else:
             metrics["deepseek_health_hint"] = "deepseek_not_observed"
+        if metrics["gpt_schema_valid_count"] and metrics["gpt_key_field_missing_count"]:
+            metrics["gpt_health_hint"] = "gpt_low_fact_quality"
+        elif metrics["gpt_schema_valid_count"]:
+            metrics["gpt_health_hint"] = "gpt_ok"
+        else:
+            metrics["gpt_health_hint"] = "gpt_not_observed"
+        if metrics["llm_schema_valid_count"] and metrics["llm_key_field_missing_count"]:
+            metrics["llm_health_hint"] = "llm_low_fact_quality"
+        elif metrics["llm_schema_valid_count"]:
+            metrics["llm_health_hint"] = "llm_ok"
+        else:
+            metrics["llm_health_hint"] = "llm_not_observed"
         return metrics
 
 

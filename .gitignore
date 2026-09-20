@@ -17,11 +17,18 @@ __pycache__/
 
 # Runtime logs and scratch outputs
 logs/
+artifacts/
 *.log
 tmp_reports_index.html
 tmp_reports_index.md
 alert_*.html
 Web_Agent_Agent_Feasibility_Report.md
+data/codex_research/latest.json
+data/codex_research/latest.tmp.json
+data/codex_research/*
+!data/codex_research/.gitkeep
+data/v11_editorial_reviews/*
+!data/v11_editorial_reviews/.gitkeep
 
 # Generated reports and archive indexes
 archive/

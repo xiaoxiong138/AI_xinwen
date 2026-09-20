@@ -5,11 +5,13 @@ import os
 import re
 from collections import Counter
 from difflib import SequenceMatcher
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from ..editorial_engine import contains_mojibake, has_bad_public_phrase
 from ..relevance import (
     category_to_cn,
     classify_paper_topic,
@@ -88,6 +90,8 @@ class LLMProcessor:
         "企业合作": "合作能否转化成真正的资源整合和商业落地，通常比发布消息本身更值得持续跟踪。",
         "社交讨论": "讨论热度背后往往对应着市场预期变化，值得结合后续产品和融资动作一起看。",
         "视频解读": "这类内容的价值在于帮助快速识别市场正在集中讨论哪些方向，以及哪些观点开始形成共识。",
+        "访谈观点": "访谈的价值在于还原技术负责人对路线、约束和竞争的真实判断，并与已发生的事实分开阅读。",
+        "播客解读": "播客适合捕捉长篇讨论中的技术假设、分歧和尚未公开写入产品文档的经验判断。",
         "应用落地": "真正的落地案例最能检验部署成本、客户接受度和规模化复制能力。",
         "其他": "如果这条信息持续发酵，通常会影响相关方向的关注度、资源配置和后续动作节奏。",
     }
@@ -117,6 +121,8 @@ class LLMProcessor:
         "行业动态": "投资方、竞争对手和正在规划预算的企业团队",
         "社交讨论": "从业者、产品团队和市场观察者",
         "视频解读": "关注该方向的开发者和业务决策者",
+        "访谈观点": "研究者、产品负责人和技术决策者",
+        "播客解读": "希望理解技术路线与行业判断的从业者",
         "其他": "相关从业者和后续跟进团队",
     }
 
@@ -124,23 +130,124 @@ class LLMProcessor:
         self.config = config
         api_key_env = config.get("api_key_env", "OPENAI_API_KEY")
         api_key = os.getenv(api_key_env)
-        self.enabled = bool(api_key)
+        provider_hint = self._clean_text(config.get("provider", ""))
+        self.enabled = bool(api_key) and provider_hint != "codex_automation"
         self.model = config.get("model", "gpt-4o-mini")
         self.fallback_model = self._clean_text(config.get("fallback_model", ""))
+        base_url = str(config.get("base_url", "https://api.openai.com/v1") or "")
+        self.provider = provider_hint or (
+            "openai" if "api.openai.com" in base_url or api_key_env == "OPENAI_API_KEY" else "compatible"
+        )
+        self.api_mode = self._clean_text(config.get("api_mode", "")) or (
+            "responses" if self.provider == "openai" else "chat_completions"
+        )
+        self.reasoning_effort = self._clean_text(config.get("reasoning_effort", "low"))
+        self.response_verbosity = self._clean_text(config.get("response_verbosity", "low"))
+        self.store_responses = bool(config.get("store_responses", False))
+        self.send_temperature = bool(config.get("send_temperature", self.api_mode != "responses"))
+        self.article_content_char_limit = max(1000, int(config.get("article_content_char_limit", 6000) or 6000))
         self.primary_mode = self._clean_text(config.get("primary_mode", ""))
         self.primary_thinking = self._clean_text(config.get("primary_thinking", ""))
         self.temperature = float(config.get("temperature", 0.3))
         self.timeout_seconds = float(config.get("timeout_seconds", 60))
         self.force_json_response = bool(config.get("force_json_response", False))
         self._primary_model_disabled = False
+        self._live_generation_disabled = False
         self._last_model_used = ""
+        self.health_status = "available" if self.enabled else (
+            "research_inbox" if self.provider == "codex_automation" else "missing_api_key"
+        )
+        self.failure_reason = ""
+        self.request_count = 0
+        self.success_count = 0
+        self.schema_valid_count = 0
+        self.template_fallback_count = 0
         self.client = OpenAI(
             api_key=api_key,
-            base_url=config.get("base_url", "https://api.openai.com/v1"),
+            base_url=base_url,
             timeout=self.timeout_seconds,
         ) if self.enabled else None
-        if not self.enabled:
+        if not self.enabled and self.provider != "codex_automation":
             print(f"Warning: API Key {api_key_env} not found. Falling back to heuristic processing.")
+
+    @property
+    def live_generation_available(self) -> bool:
+        return bool(self.enabled and self.client is not None and not self._live_generation_disabled)
+
+    def health_snapshot(self) -> Dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "api_mode": self.api_mode,
+            "status": self.health_status,
+            "failure_reason": self.failure_reason,
+            "request_count": self.request_count,
+            "success_count": self.success_count,
+            "schema_valid_count": self.schema_valid_count,
+            "template_fallback_count": self.template_fallback_count,
+        }
+
+    @staticmethod
+    def _terminal_provider_error(exc: Exception) -> str:
+        message = str(exc or "").lower()
+        if "insufficient balance" in message or "insufficient_balance" in message or "error code: 402" in message:
+            return "insufficient_balance"
+        if "invalid api key" in message or "authentication" in message or "error code: 401" in message:
+            return "authentication_failed"
+        if "insufficient_quota" in message or "quota exceeded" in message or "billing hard limit" in message:
+            return "quota_exceeded"
+        return ""
+
+    @staticmethod
+    def _text_response(content: str) -> Any:
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    def _responses_completion(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> Any:
+        if self.client is None:
+            raise RuntimeError("LLM client is not enabled")
+        instructions = "\n\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if str(message.get("role") or "") in {"system", "developer"}
+        ).strip()
+        input_items = [
+            {
+                "role": str(message.get("role") or "user") if str(message.get("role") or "") in {"user", "assistant"} else "user",
+                "content": str(message.get("content") or ""),
+            }
+            for message in messages
+            if str(message.get("role") or "") not in {"system", "developer"}
+        ]
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "input": input_items,
+            "max_output_tokens": max_tokens,
+            "store": self.store_responses,
+        }
+        if instructions:
+            kwargs["instructions"] = instructions
+        if self.reasoning_effort:
+            kwargs["reasoning"] = {"effort": self.reasoning_effort}
+        text_config: Dict[str, Any] = {}
+        if self.force_json_response:
+            text_config["format"] = {"type": "json_object"}
+        if self.response_verbosity:
+            text_config["verbosity"] = self.response_verbosity
+        if text_config:
+            kwargs["text"] = text_config
+        if self.send_temperature:
+            kwargs["temperature"] = temperature
+        response = self.client.responses.create(**kwargs)
+        return self._text_response(str(response.output_text or ""))
 
     def _clean_json_string(self, json_str: str) -> str:
         json_str = (json_str or "").strip()
@@ -162,6 +269,45 @@ class LLMProcessor:
         chinese_like = len(re.findall(r"[\u4e00-\u9fff]", content))
         return thai_like >= 4 and chinese_like == 0
 
+    def _primary_facts_are_usable(self, article: Dict[str, Any], facts: Dict[str, Any]) -> bool:
+        if not facts or not facts.get("who") or not facts.get("target"):
+            return False
+        public_values = [
+            facts.get("who"),
+            facts.get("action"),
+            facts.get("target"),
+            facts.get("research_problem"),
+            facts.get("core_method"),
+            facts.get("method"),
+            facts.get("metric_result"),
+        ]
+        if any(contains_mojibake(value) or has_bad_public_phrase(value) for value in public_values):
+            return False
+        if str(article.get("content_type") or "").lower() != "paper":
+            return True
+
+        method = self._clean_text(str(facts.get("core_method") or facts.get("method") or ""))
+        target = self._clean_text(str(facts.get("target") or ""))
+        generic_methods = {
+            "ai", "llm", "vla", "机器人", "具身智能", "世界模型", "基础模型",
+            "人工智能", "模型", "框架", "方法", "发布", "评测", "融资",
+        }
+        evidence = facts.get("evidence") or []
+        if isinstance(evidence, str):
+            evidence = [evidence]
+        evidence = [self._clean_text(str(point)) for point in evidence if self._clean_text(str(point))]
+        result_context = self._clean_text(
+            " ".join(
+                str(facts.get(key) or "")
+                for key in ("metric_result", "dataset_or_benchmark", "baseline")
+            )
+        )
+        if len(method) < 12 or method.lower() in generic_methods or normalize_text(method) == normalize_text(target):
+            return False
+        if len(evidence) < 2 or not result_context:
+            return False
+        return True
+
     def _chat_completion(
         self,
         messages: List[Dict[str, str]],
@@ -171,7 +317,7 @@ class LLMProcessor:
         allow_fallback: bool = True,
         prefer_fallback: bool = False,
     ):
-        if self.client is None:
+        if self.client is None or self._live_generation_disabled:
             raise RuntimeError("LLM client is not enabled")
         models = []
         if prefer_fallback and self.fallback_model:
@@ -187,25 +333,43 @@ class LLMProcessor:
         self._last_model_used = ""
         for model in models:
             try:
-                kwargs: Dict[str, Any] = {}
-                if self.force_json_response and model == self.model:
-                    kwargs["response_format"] = {"type": "json_object"}
-                if self.primary_thinking and model == self.model:
-                    kwargs["extra_body"] = {"thinking": {"type": self.primary_thinking}}
-                response = self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **kwargs,
-                )
+                self.request_count += 1
+                if self.api_mode == "responses":
+                    response = self._responses_completion(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                else:
+                    kwargs: Dict[str, Any] = {}
+                    if self.force_json_response and model == self.model:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    if self.primary_thinking and model == self.model:
+                        kwargs["extra_body"] = {"thinking": {"type": self.primary_thinking}}
+                    response = self.client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        **kwargs,
+                    )
                 content = response.choices[0].message.content or ""
                 if self._looks_corrupt_llm_content(content):
                     raise ValueError(f"{purpose} returned empty or corrupt content from {model}")
                 self._last_model_used = model
+                self.success_count += 1
+                self.health_status = "available"
                 return response
             except Exception as exc:
                 last_error = exc
+                terminal_reason = self._terminal_provider_error(exc)
+                if terminal_reason:
+                    self._live_generation_disabled = True
+                    self._primary_model_disabled = True
+                    self.health_status = terminal_reason
+                    self.failure_reason = terminal_reason
+                    raise
                 if allow_fallback and model == self.model and self.fallback_model:
                     self._primary_model_disabled = True
                     print(f"Warning: {purpose} failed on {model}; falling back to {self.fallback_model}: {exc}")
@@ -299,6 +463,10 @@ class LLMProcessor:
             "Application": "应用落地",
             "Social": "社交讨论",
             "Video": "视频解读",
+            "Interview": "访谈观点",
+            "Podcast": "播客解读",
+            "访谈观点": "访谈观点",
+            "播客解读": "播客解读",
             "Other": "其他",
         }.get(str(category or ""), "其他")
 
@@ -306,6 +474,10 @@ class LLMProcessor:
         category_cn = self._category_cn(category, content_type, topic_cn)
         if content_type == "paper":
             return "论文类必须写清：方法/任务、实验或指标证据、相对已有方法的变化、局限或下一步复现点。"
+        if str(content_type or "").lower() == "interview":
+            return "访谈类必须写清：谁提出了什么判断、使用了什么论据、哪些是事实、哪些是个人观点、与主流路线的分歧在哪里。"
+        if str(content_type or "").lower() in {"podcast", "video"}:
+            return "播客/视频类必须写清：嘉宾的核心主张、支撑案例或数据、争议点和可继续核对的原始上下文。"
         guidance = {
             "产品发布": "产品发布必须写清：具体功能、面向用户、替代或新增的工作流、采用或商业影响。",
             "企业合作": "合作/融资类必须写清：合作双方、资源或渠道互补、客户/交付路径、后续验证指标。",
@@ -1513,6 +1685,7 @@ class LLMProcessor:
         }
 
     def _fallback_process(self, article: Dict[str, Any]) -> Dict[str, Any]:
+        self.template_fallback_count += 1
         title = self._clean_text(article.get("title", ""))
         content = self._clean_text(article.get("content", ""))
         text = self._clean_text(f"{title} {content}")
@@ -1523,6 +1696,24 @@ class LLMProcessor:
 
     def prepare_report_item(self, article: Dict[str, Any], runtime_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         base = dict(article)
+        curated = {**base, **dict(runtime_result or {})}
+        if str(curated.get("model_used") or curated.get("_model_used") or "") == "codex-automation":
+            curated["model_used"] = "codex-automation"
+            category = str(curated.get("category") or "Other")
+            if curated.get("content_type") == "paper":
+                curated["display_topic"] = (
+                    curated.get("display_topic")
+                    or curated.get("topic_cn")
+                    or topic_to_cn(category)
+                    or curated.get("topic")
+                )
+            else:
+                curated["display_topic"] = (
+                    curated.get("display_topic")
+                    or curated.get("topic_cn")
+                    or category_to_cn(category)
+                )
+            return curated
         normalized = self._normalize_single_result(base, dict(runtime_result or {}) or base)
         base.update(normalized)
         base["display_topic"] = normalized["topic_cn"] if base.get("content_type") == "paper" else category_to_cn(normalized["category"])
@@ -1546,7 +1737,7 @@ class LLMProcessor:
 
     def judge_event_similarity(self, left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, str]:
         heuristic = self._heuristic_event_similarity(left, right)
-        if heuristic["decision"] != "unsure" or not self.enabled or self.client is None:
+        if heuristic["decision"] != "unsure" or not self.live_generation_available:
             return heuristic
         system_prompt = "你是 AI 情报去重助手。请判断两条动态是否在报道同一事件。输出 JSON，不要输出 Markdown。"
         user_prompt = f"""请判断以下两条动态是否为同一事件：\n\n动态A：\n- 标题：{left.get('title_cn') or left.get('title')}\n- 摘要：{clean_snippet(left.get('summary') or left.get('content', ''), 240)}\n- 来源：{left.get('source_detail') or left.get('source')}\n- 时间：{left.get('publish_date', '')}\n\n动态B：\n- 标题：{right.get('title_cn') or right.get('title')}\n- 摘要：{clean_snippet(right.get('summary') or right.get('content', ''), 240)}\n- 来源：{right.get('source_detail') or right.get('source')}\n- 时间：{right.get('publish_date', '')}\n\n返回 JSON：{{"decision": "same_event 或 not_same_event 或 unsure", "reason": "一句中文理由"}}"""
@@ -1603,25 +1794,27 @@ class LLMProcessor:
     @retry(stop=stop_after_attempt(1), wait=wait_exponential(multiplier=1, min=2, max=5))
     def process_article(self, article: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         title = article.get("title", "")
-        content = (article.get("content", "") or "")[:3000]
-        if not self.enabled or self.client is None:
+        content = (article.get("content", "") or "")[: self.article_content_char_limit]
+        if not self.live_generation_available:
             return self._fallback_process(article)
         if (
             self.primary_mode == "fact_extraction"
             and not self._primary_model_disabled
-            and self.model == "deepseek-v4-pro"
         ):
             fact_result = self._process_article_with_primary_facts(article, title, content)
             if fact_result:
                 return fact_result
+            if not self.live_generation_available:
+                return self._fallback_process(article)
         system_prompt = "你是 AI 情报编辑。请将给定内容整理为高质量中文情报卡片。输出必须是 JSON，不要输出 Markdown，不要解释。"
         guidance = self._prompt_guidance(article.get("category", article.get("topic", "")), article.get("content_type", "news"), article.get("topic", ""))
-        user_prompt = f"""请分析以下内容并输出 JSON：\n\n原始标题: {title}\n来源: {article.get('source', '')}\n平台: {article.get('platform', '')}\n内容类型: {article.get('content_type', 'news')}\n已有主题: {article.get('topic', '')}\n正文: {content}\n\n先抽取事实，再基于事实写摘要。返回字段必须为：{{"facts":{{"who":"谁，必须是具体公司/团队/论文/项目名","action":"做了什么，必须是具体动作","target":"针对什么产品、模型、论文方法、客户或场景","evidence":["1-3条具体证据、数字、能力、来源句或实验结果"],"audience":"主要影响谁","research_problem":"论文真正研究的问题；非论文可为空","core_method":"论文核心技术机制，不得复述标题；非论文可为空","architecture":"模型或系统结构；原文未提供则为空","training_objective":"训练目标、损失函数或优化方式；原文未提供则为空","input_output":"模型接收什么输入、产生什么输出；原文未提供则为空","method":"论文/技术内容的方法机制；非技术新闻可为空","dataset_or_benchmark":"数据集、基准、客户场景或评测环境；没有则为空","metric_result":"最关键的数字结果或实验结论；没有则为空","baseline":"对照基线、竞品或替代方案；没有则为空","limitation":"局限、失败案例或尚未验证部分；没有则为空","code_or_project":"代码、项目页、仓库或开源线索；没有则为空","deployment_context":"真实部署、客户、机器人或业务场景；没有则为空"}},"title_cn":"18-34个中文字符的信息型标题","summary_preview":"22-44个中文字符的一行副标题","summary":"中文摘要，内部顺序必须是发生了什么 -> 证据是什么 -> 对谁有影响 -> 下一步看什么，但输出成自然段，不要直接写这些标签","score":"0-10之间的一位小数","keywords":["3-5个中文短词"],"category":"Physical AI / Robotics / World Model / 模型/研究 / 产品发布 / 基础设施 / 开源生态 / 行业动态 / 企业合作 / 社交讨论 / 视频解读 / 应用落地 / Other","topic_cn":"中文主题名","why_it_matters":"40-70字中文","why_now":"30-60字中文，解释为什么现在做","expected_effect":"30-60字中文，解释会先改变什么","future_impact":"30-60字中文，解释会影响哪一层竞争、预算、标准或生态"}}\n\n分类写法：{guidance}\n硬性要求：1. summary 不允许只写行业判断，必须包含具体主体、动作和对象。2. 如果 evidence 不足 2 条或正文证据不足，summary 只写2句、80-120字，score 必须低于 5.5，并在 evidence 里说明“来源信息不足”。3. 禁止使用这些空泛表达：相关机构、出现了新的动作、不只是单点更新、可能影响产品路线、值得持续关注、未来可能带来影响。4. summary 和 why_it_matters 不能同义改写。5. why_now、expected_effect、future_impact 必须分工明确，不要互相复述。6. 标题里的公司、产品、动作至少两个要出现在 facts 或 summary 中。7. 论文的 research_problem、core_method、architecture、training_objective、input_output 必须分别抽取，原文没有就留空，不能用标题补齐。8. 只输出 JSON。"""
+        user_prompt = f"""请分析以下内容并输出 JSON：\n\n原始标题: {title}\n来源: {article.get('source', '')}\n平台: {article.get('platform', '')}\n内容类型: {article.get('content_type', 'news')}\n已有主题: {article.get('topic', '')}\n正文: {content}\n\n先抽取事实，再基于事实写摘要。返回字段必须为：{{"facts":{{"who":"谁，必须是具体公司/团队/论文/项目名","action":"做了什么，必须是具体动作","target":"针对什么产品、模型、论文方法、客户或场景","evidence":["1-3条具体证据、数字、能力、来源句或实验结果"],"audience":"主要影响谁","research_problem":"论文真正研究的问题；非论文可为空","core_method":"论文核心技术机制，不得复述标题；非论文可为空","architecture":"模型或系统结构；原文未提供则为空","training_objective":"训练目标、损失函数或优化方式；原文未提供则为空","input_output":"模型接收什么输入、产生什么输出；原文未提供则为空","method":"论文/技术内容的方法机制；非技术新闻可为空","dataset_or_benchmark":"数据集、基准、客户场景或评测环境；没有则为空","metric_result":"最关键的数字结果或实验结论；没有则为空","baseline":"对照基线、竞品或替代方案；没有则为空","limitation":"局限、失败案例或尚未验证部分；没有则为空","code_or_project":"代码、项目页、仓库或开源线索；没有则为空","deployment_context":"真实部署、客户、机器人或业务场景；没有则为空"}},"title_cn":"18-34个中文字符的信息型标题","summary_preview":"22-44个中文字符的一行副标题","summary":"中文摘要，内部顺序必须是发生了什么 -> 证据是什么 -> 对谁有影响 -> 下一步看什么，但输出成自然段，不要直接写这些标签","score":"0-10之间的一位小数","keywords":["3-5个中文短词"],"category":"Physical AI / Robotics / World Model / 模型/研究 / 产品发布 / 基础设施 / 开源生态 / 行业动态 / 企业合作 / 访谈观点 / 播客解读 / 视频解读 / 应用落地 / Other","topic_cn":"中文主题名","why_it_matters":"40-70字中文","why_now":"30-60字中文，解释为什么现在做","expected_effect":"30-60字中文，解释会先改变什么","future_impact":"30-60字中文，解释会影响哪一层竞争、预算、标准或生态"}}\n\n分类写法：{guidance}\n硬性要求：1. summary 不允许只写行业判断，必须包含具体主体、动作和对象。2. 如果 evidence 不足 2 条或正文证据不足，summary 只写2句、80-120字，score 必须低于 5.5，并在 evidence 里说明“来源信息不足”。3. 禁止使用这些空泛表达：相关机构、出现了新的动作、不只是单点更新、可能影响产品路线、值得持续关注、未来可能带来影响。4. summary 和 why_it_matters 不能同义改写。5. why_now、expected_effect、future_impact 必须分工明确，不要互相复述。6. 标题里的公司、产品、动作至少两个要出现在 facts 或 summary 中。7. 论文的 research_problem、core_method、architecture、training_objective、input_output 必须分别抽取，原文没有就留空，不能用标题补齐。8. 访谈、演讲和播客必须区分“嘉宾观点”与“可核实事实”，不得把预测写成已经发生。9. 只输出 JSON。"""
         try:
             response = self._chat_completion(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], temperature=self.temperature, max_tokens=1400, purpose="article analysis")
             result = json.loads(self._clean_json_string(response.choices[0].message.content or ""))
             if "summary" not in result or "score" not in result:
                 return self._fallback_process(article)
+            self.schema_valid_count += 1
             result["_model_used"] = self._last_model_used or self.model
             return self._normalize_single_result(article, result)
         except Exception as exc:
@@ -1686,8 +1879,9 @@ Content: {content[:2200]}"""
             )
             result = json.loads(self._clean_json_string(response.choices[0].message.content or ""))
             facts = self._normalise_facts(result.get("facts"))
-            if not facts or not facts.get("who") or not facts.get("target"):
-                raise ValueError("primary fact extraction returned incomplete facts")
+            if not self._primary_facts_are_usable(article, facts):
+                raise ValueError("primary fact extraction returned low-quality facts")
+            self.schema_valid_count += 1
             result["_facts_first_only"] = True
             result["_model_used"] = self.model
             return self._normalize_single_result(article, result)
@@ -1698,7 +1892,7 @@ Content: {content[:2200]}"""
 
     def summarize_report(self, papers: List[Dict[str, Any]], updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         fallback = self._heuristic_report_summary(papers, updates)
-        if not self.enabled or self.client is None:
+        if not self.live_generation_available:
             return fallback
         paper_lines = [
             f"- {item.get('title_cn')} | {item.get('display_topic')} | score={item.get('score')} | 事实：{self._report_fact_line(item)} | 摘要：{clean_snippet(item.get('summary', ''), 120)}"

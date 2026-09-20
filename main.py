@@ -2,6 +2,7 @@
 
 import os
 import multiprocessing as mp
+import hashlib
 import json
 import re
 import socket
@@ -12,8 +13,9 @@ import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, unquote, urlparse, urlsplit, urlunsplit
 from urllib.request import urlopen
 
@@ -22,7 +24,17 @@ from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from src.collectors import ArxivCollector, HuggingFaceCollector, RSSCollector, WebSearchCollector
+from src.collectors import (
+    ArxivCollector,
+    CodexResearchInboxCollector,
+    SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS,
+    build_codex_research_inbox_collector,
+    build_codex_research_readiness_summary,
+    evaluate_sent_history_overlap,
+    HuggingFaceCollector,
+    RSSCollector,
+    WebSearchCollector,
+)
 from src.continuity import (
     build_closing_memory,
     build_topic_dossiers,
@@ -32,7 +44,9 @@ from src.continuity import (
 )
 from src.database import Database, resolve_database_path
 from src.editorial_engine import (
+    attribution_opener_pattern,
     build_editorial_quality_metrics,
+    contains_mojibake,
     enrich_editorial_fields,
     has_field_label_leak,
     has_untranslated_prose,
@@ -40,12 +54,13 @@ from src.editorial_engine import (
     paper_plain_summary_passes,
     paper_technical_intro_passes,
 )
-from src.generator import ReportGenerator
+from src.generator import ReportGenerator, editorial_item_render_key, editorial_source_identity
 from src.notifier import EmailNotifier, resolve_imap_server, verify_email_arrival
+from src.ui_audit import run_email_ui_audit
 
 EMAIL_COMMITTED_MARKER = "__SCHEDULER_EMAIL_COMMITTED__="
 from src.processors import LLMProcessor
-from src.relevance import infer_impact_tag, is_low_signal_update, normalize_text, score_preference_boost, score_update_quality
+from src.relevance import infer_impact_tag, infer_source_tier, is_low_signal_update, normalize_text, score_preference_boost, score_update_quality
 
 EVENT_STOPWORDS = {
     "latest",
@@ -75,6 +90,7 @@ OFFICIAL_HOST_HINTS = (
     "microsoft.com",
     "meta.com",
 )
+PERSISTENT_QUALITY_FLAGS = {"supplemental_older_source"}
 GENERIC_SUMMARY_PATTERNS = (
     r"相关机构",
     r"出现了新的动作",
@@ -115,13 +131,27 @@ TRUSTED_CLAIM_SOURCE_HINTS = (
     "pr newswire",
 )
 
-CONTINUOUS_READER_DESIGNS = {"v8-editorial-reader", "v9-continuous-learning", "v10-learning-digest"}
+V10_DESIGN_VERSION = "v10-learning-digest"
+V11_DESIGN_VERSION = "v11-editorial-library"
+LEARNING_DIGEST_DESIGNS = {V10_DESIGN_VERSION, V11_DESIGN_VERSION}
+CONTINUOUS_READER_DESIGNS = {
+    "v8-editorial-reader",
+    "v9-continuous-learning",
+    *LEARNING_DIGEST_DESIGNS,
+}
+V11_ACCEPTANCE_CONTRACT_VERSION = 12
 
 
 def is_continuous_reader_design(value: Any) -> bool:
     if isinstance(value, dict):
         value = value.get("design_version")
     return str(value or "") in CONTINUOUS_READER_DESIGNS
+
+
+def is_learning_digest_design(value: Any) -> bool:
+    if isinstance(value, dict):
+        value = value.get("design_version")
+    return str(value or "") in LEARNING_DIGEST_DESIGNS
 
 
 def load_config():
@@ -198,6 +228,29 @@ def apply_runtime_profile(config: Dict[str, Any], profile: str) -> Dict[str, Any
     runtime_section["max_unprocessed_items"] = 8
     runtime_section["max_analysis_backfill_items"] = 0
     runtime_section["skip_paper_enrichment"] = True
+    return runtime_config
+
+
+def apply_environment_path_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Redirect generated artifacts without mutating the production config file."""
+    runtime_config = copy.deepcopy(config)
+    archive_config = runtime_config.setdefault("archive", {})
+    scheduler_config = runtime_config.setdefault("scheduler", {})
+
+    path_overrides = (
+        ("WEB_AGENT_REPORT_DIR", archive_config, "report_dir"),
+        ("WEB_AGENT_ARCHIVE_OUTPUT_HTML", archive_config, "output_html"),
+        ("WEB_AGENT_ARCHIVE_OUTPUT_MARKDOWN", archive_config, "output_markdown"),
+        ("WEB_AGENT_UI_AUDIT_OUTPUT_DIR", scheduler_config, "ui_audit_output_dir"),
+    )
+    for env_name, section, key in path_overrides:
+        value = str(os.getenv(env_name, "") or "").strip()
+        if value:
+            section[key] = value
+
+    archive_enabled = str(os.getenv("WEB_AGENT_ARCHIVE_ENABLED", "") or "").strip().lower()
+    if archive_enabled:
+        archive_config["enabled"] = archive_enabled in {"1", "true", "yes", "on"}
     return runtime_config
 
 
@@ -406,6 +459,22 @@ def build_collector_summary(collector_runs: List[Dict[str, Any]]) -> Dict[str, A
         for path in ((item.get("diagnostics") or {}).get("retry_paths") or [])
         if len(path.get("attempted_show_counts") or []) > 1
     ]
+    gpt_search_rows = [
+        item for item in collector_runs
+        if str(item.get("label", "")).startswith("OpenAIWebSearchCollector")
+    ]
+    gpt_search_request_count = sum(
+        int((item.get("diagnostics") or {}).get("request_count", 0) or 0)
+        for item in gpt_search_rows
+    )
+    gpt_search_success_count = sum(
+        int((item.get("diagnostics") or {}).get("success_count", 0) or 0)
+        for item in gpt_search_rows
+    )
+    gpt_search_schema_error_count = sum(
+        int((item.get("diagnostics") or {}).get("schema_error_count", 0) or 0)
+        for item in gpt_search_rows
+    )
     status_text = (
         f"本轮共运行 {len(collector_runs)} 个采集单元，成功 {len(success)} 个，零结果 {len(empty)} 个，"
         f"超时 {timeout_count} 个，失败 {failed_count} 个，跳过 {skipped_count} 个，新入库 {fresh_items} 条。"
@@ -425,6 +494,9 @@ def build_collector_summary(collector_runs: List[Dict[str, Any]]) -> Dict[str, A
         "arxiv_parse_error_count": arxiv_parse_error_count,
         "arxiv_fallback_recovery_count": arxiv_fallback_recovery_count,
         "arxiv_retry_paths": arxiv_retry_paths,
+        "gpt_search_request_count": gpt_search_request_count,
+        "gpt_search_success_count": gpt_search_success_count,
+        "gpt_search_schema_error_count": gpt_search_schema_error_count,
         "rows": collector_runs,
     }
 
@@ -433,9 +505,18 @@ def build_source_health_summary(
     collector_runs: List[Dict[str, Any]],
     db: Database,
     history_limit: int = 160,
+    active_labels: Optional[set[str]] = None,
 ) -> Dict[str, Any]:
     recent_rows = db.get_recent_collector_runs(limit=history_limit)
-    labels = sorted({str(row.get("label", "")) for row in recent_rows + collector_runs if row.get("label")})
+    labels = sorted(
+        label
+        for label in {
+            str(row.get("label", ""))
+            for row in recent_rows + collector_runs
+            if row.get("label")
+        }
+        if active_labels is None or label in active_labels
+    )
     current_by_label = {str(row.get("label", "")): row for row in collector_runs}
     rows: List[Dict[str, Any]] = []
 
@@ -487,7 +568,10 @@ def build_source_health_summary(
         row
         for row in rows
         if row["consecutive_failures"] >= 2
-        or row["recent_failure_count"] >= 2
+        or (
+            row["recent_failure_count"] >= 2
+            and row["recent_failure_count"] / max(1, row["recent_runs"]) >= 0.5
+        )
         or row["recent_empty_success_count"] >= 5
     ]
     return {
@@ -580,6 +664,11 @@ def build_quality_diagnostics(
                 collector_summary.get("arxiv_fallback_recovery_count", 0) or 0
             ),
             "arxiv_retry_paths": list(collector_summary.get("arxiv_retry_paths") or []),
+            "gpt_search_request_count": int(collector_summary.get("gpt_search_request_count", 0) or 0),
+            "gpt_search_success_count": int(collector_summary.get("gpt_search_success_count", 0) or 0),
+            "gpt_search_schema_error_count": int(
+                collector_summary.get("gpt_search_schema_error_count", 0) or 0
+            ),
         },
         "selection": {
             "report_items": report_items_count,
@@ -661,6 +750,11 @@ def title_looks_bad(item: Dict[str, Any]) -> bool:
         return True
     if re.search(r"[\u4e00-\u9fff]\s+[\u4e00-\u9fff]", title):
         return True
+    if re.search(
+        r"(?:增加|减少|提升|降低|扩展|优化|改进|支持|引入|采用|实现|构建|发布|更新|训练|部署)，(?:也|并|但|同时|仍)",
+        title,
+    ):
+        return True
     if any(
         phrase in title
         for phrase in (
@@ -702,6 +796,67 @@ def title_looks_bad(item: Dict[str, Any]) -> bool:
     return False
 
 
+def build_source_grounded_news_brief(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a no-inference news card from the source title and source excerpt."""
+    if str(item.get("content_type") or "news").lower() == "paper":
+        return None
+    source_tier = str(item.get("source_tier") or source_tier_for_item(item)).lower()
+    if source_tier in {"aggregator", "low_signal"} or is_google_news_aggregator(item):
+        return None
+
+    def clean_source_text(value: Any) -> str:
+        text = html_lib.unescape(str(value or ""))
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\[?&#?8230;?\]?", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+The post .+? appeared first on .+?[.]?$", "", text, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", text).strip(" -|·")
+
+    source_title = clean_source_text(item.get("title"))
+    source_body = clean_source_text(item.get("content"))
+    if not source_title or contains_mojibake(source_title) or len(source_title) < 12:
+        return None
+    if not source_body or contains_mojibake(source_body):
+        return None
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?。！？])\s+", source_body)
+        if sentence.strip()
+    ]
+    evidence_sentences: List[str] = []
+    normalized_title = normalize_text(source_title)
+    for sentence in sentences:
+        if len(sentence) < 28:
+            continue
+        if SequenceMatcher(None, normalized_title, normalize_text(sentence)).ratio() >= 0.88:
+            continue
+        evidence_sentences.append(sentence)
+        if len(" ".join(evidence_sentences)) >= 150 or len(evidence_sentences) >= 2:
+            break
+    source_excerpt = " ".join(evidence_sentences) or source_body
+    if len(source_excerpt) < 36 or len(re.findall(r"[A-Za-z\u4e00-\u9fff]", source_excerpt)) < 24:
+        return None
+    if len(source_excerpt) > 260:
+        clipped = source_excerpt[:260]
+        boundary = max(clipped.rfind(". "), clipped.rfind("。"), clipped.rfind("; "), clipped.rfind("；"))
+        source_excerpt = clipped[: boundary + 1] if boundary >= 120 else re.sub(r"\s+\S*$", "", clipped).rstrip(" ,;:") + "…"
+
+    candidate = dict(item)
+    candidate.update(
+        {
+            "source_tier": source_tier,
+            "source_grounded_brief": True,
+            "source_display_title": source_title[:180],
+            "source_excerpt": source_excerpt,
+            "brief_line": source_excerpt,
+            "summary_quality_tier": "source_brief",
+            "quality_tier": "brief",
+            "report_section": "brief",
+        }
+    )
+    return candidate
+
+
 def build_content_quality_counts(
     selected_items: List[Dict[str, Any]],
     update_candidates: List[Dict[str, Any]],
@@ -709,7 +864,11 @@ def build_content_quality_counts(
 ) -> Dict[str, int]:
     generic_summary_count = sum(1 for item in selected_items if summary_looks_generic(item.get("summary", "")))
     low_evidence_count = sum(1 for item in selected_items if evidence_quality_value(item) < 0.35)
-    bad_title_count = sum(1 for item in selected_items if title_looks_bad(item))
+    bad_title_count = sum(
+        1
+        for item in selected_items
+        if not item.get("source_grounded_brief") and title_looks_bad(item)
+    )
     aggregator_demoted_count = sum(
         1
         for item in update_candidates
@@ -733,20 +892,7 @@ def build_content_quality_counts(
 
 
 def source_tier_for_item(item: Dict[str, Any], source_preferences: Optional[Dict[str, Any]] = None) -> str:
-    source_preferences = source_preferences or {}
-    host = urlparse(str(item.get("canonical_url") or item.get("url", "") or "")).netloc.lower()
-    host = host[4:] if host.startswith("www.") else host
-    if host == "news.google.com" or "google news" in str(item.get("source_detail", "") or "").lower():
-        return "aggregator"
-    if host in set(source_preferences.get("blacklist_hosts") or []):
-        return "low_signal"
-    if host in set(source_preferences.get("whitelist_hosts") or []) or any(hint in host for hint in OFFICIAL_HOST_HINTS):
-        return "official"
-    if str(item.get("content_type", "")) == "paper" or host == "arxiv.org":
-        return "research"
-    if str(item.get("platform", "")).lower() in {"blog", "website"}:
-        return "primary"
-    return "media"
+    return infer_source_tier(item, source_preferences)
 
 
 def item_host(item: Dict[str, Any]) -> str:
@@ -793,7 +939,19 @@ def suspicious_claim(item: Dict[str, Any]) -> bool:
 
 
 def item_quality_flags(item: Dict[str, Any]) -> List[str]:
-    flags: List[str] = []
+    flags = [
+        str(flag)
+        for flag in (item.get("quality_flags") or [])
+        if str(flag) in PERSISTENT_QUALITY_FLAGS
+    ]
+    if item.get("source_grounded_brief"):
+        if is_google_news_aggregator(item):
+            flags.append("aggregator_source")
+        if contains_mojibake(str(item.get("source_display_title") or "")) or contains_mojibake(
+            str(item.get("source_excerpt") or "")
+        ):
+            flags.append("mojibake_suspect")
+        return sorted(set(flags))
     facts = item.get("facts") or {}
     if not isinstance(facts, dict) or not facts.get("who") or not facts.get("action") or not facts.get("target"):
         flags.append("missing_facts")
@@ -805,7 +963,9 @@ def item_quality_flags(item: Dict[str, Any]) -> List[str]:
         flags.append("generic_summary")
     if is_google_news_aggregator(item):
         flags.append("aggregator_source")
-    if title_fact_mismatch(item, facts if isinstance(facts, dict) else {}):
+    if not item.get("_codex_research_validated") and title_fact_mismatch(
+        item, facts if isinstance(facts, dict) else {}
+    ):
         flags.append("title_fact_mismatch")
     if title_looks_bad(item):
         flags.append("bad_title")
@@ -822,7 +982,7 @@ def item_quality_flags(item: Dict[str, Any]) -> List[str]:
         flags.append("suspicious_claim")
     if item.get("report_section") in {"must_read", "physical_ai", "watch", "featured_papers"} and not learning_card_complete(item):
         flags.append("learning_card_missing")
-    return flags
+    return sorted(set(flags))
 
 
 def title_fact_mismatch(item: Dict[str, Any], facts: Dict[str, Any]) -> bool:
@@ -1006,6 +1166,12 @@ def fact_based_title(item: Dict[str, Any]) -> str:
 def repair_title_fact_mismatch(item: Dict[str, Any]) -> Dict[str, Any]:
     facts = item.get("facts") or {}
     if not isinstance(facts, dict):
+        return item
+    if (
+        str(item.get("model_used") or "") == "codex-automation"
+        and str(item.get("title_cn") or "").strip()
+        and not title_looks_bad(item)
+    ):
         return item
     display_title = normalize_text(str(item.get("title_cn", "") or item.get("title", "") or ""))
     fact_parts = [
@@ -1228,14 +1394,18 @@ def item_learning_text(item: Dict[str, Any]) -> str:
 
 
 def learning_domain_key(item: Dict[str, Any]) -> str:
-    paper_domain_key = str(item.get("paper_domain_key") or "").strip()
+    facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+    paper_domain_key = str(
+        item.get("paper_domain_key") or facts.get("paper_domain_key") or ""
+    ).strip()
     if item.get("content_type") == "paper" and paper_domain_key in {
         "world_model",
         "physical_ai",
         "agent_models",
         "infra_open_source",
+        "other",
     }:
-        return paper_domain_key
+        return paper_domain_key if paper_domain_key != "other" else "products_business"
     text = item_learning_text(item)
     if any(token in text for token in ("world model", "world models", "世界模型", "latent dynamics", "jepa", "video prediction", "predictive model", "rollout")):
         return "world_model"
@@ -1256,7 +1426,10 @@ def paper_quota_domain(item: Dict[str, Any], quotas: Optional[Dict[str, Any]] = 
         "infra_open_source",
         "other",
     }
-    locked = str(item.get("paper_domain_key") or "").strip()
+    facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+    locked = str(
+        item.get("paper_domain_key") or facts.get("paper_domain_key") or ""
+    ).strip()
     if locked in quota_keys:
         return locked
     topic = " ".join(
@@ -1400,6 +1573,11 @@ def paper_substantive_description_fail_count(items: List[Dict[str, Any]]) -> int
     for item in items:
         if item.get("content_type") != "paper":
             continue
+        if (
+            paper_plain_summary_passes(item.get("paper_plain_summary"))
+            and paper_technical_intro_passes(item.get("paper_technical_intro"))
+        ):
+            continue
         description = generator._paper_substantive_description(item)
         if not generator._paper_description_is_substantive(description):
             failures += 1
@@ -1452,9 +1630,24 @@ def build_report_structure_diagnostics(layers: Dict[str, List[Dict[str, Any]]]) 
     )
     visible_v10_items = [item for item in all_items if str(item.get("report_section") or "") != "brief"]
     primary_source_count = sum(
-        1 for item in visible_v10_items if str(item.get("source_tier") or "").lower() in {"official", "research", "primary"}
+        1
+        for item in visible_v10_items
+        if infer_source_tier(item).lower() in {"official", "research", "primary"}
     )
     primary_source_ratio = round(primary_source_count / len(visible_v10_items), 3) if visible_v10_items else 1.0
+    visible_technical_items = [
+        item for item in visible_v10_items if report_primary_section(item) == "technical"
+    ]
+    technical_primary_source_count = sum(
+        1
+        for item in visible_technical_items
+        if infer_source_tier(item).lower() in {"official", "research", "primary"}
+    )
+    technical_primary_source_ratio = (
+        round(technical_primary_source_count / len(visible_technical_items), 3)
+        if visible_technical_items
+        else 1.0
+    )
     event_keys = [
         normalized_event_title(item) or str(item.get("canonical_url") or item.get("url") or "")
         for item in visible_v10_items
@@ -1487,6 +1680,25 @@ def build_report_structure_diagnostics(layers: Dict[str, List[Dict[str, Any]]]) 
         int(editorial_metrics.get("physical_ai_featured_count", 0) or 0),
     )
     paper_technical_intro_missing_count = int(editorial_metrics.get("paper_technical_intro_fail_count", 0) or 0)
+    visible_information_count = sum(
+        1
+        for item in (
+            list(layers.get("must_read", []))
+            + list(layers.get("physical_ai", []))
+            + list(layers.get("watch", []))
+        )
+        if item.get("content_type") != "paper" and str(item.get("quality_tier") or "") != "brief"
+    )
+    source_news_brief_count = sum(
+        1
+        for item in layers.get("brief", [])
+        if item.get("content_type") != "paper" and item.get("source_grounded_brief")
+    )
+    primary_section_counts = Counter(report_primary_section(item) for item in all_items)
+    unique_section_keys = {
+        str(item.get("canonical_url") or item.get("url") or item.get("title_cn") or "")
+        for item in all_items
+    }
     return {
         "physical_ai_count": physical_ai_count,
         "physical_ai_item_count": physical_ai_count,
@@ -1504,19 +1716,17 @@ def build_report_structure_diagnostics(layers: Dict[str, List[Dict[str, Any]]]) 
         "low_value_module_count": 0,
         "unsupported_claim_count": suspicious_count,
         "primary_source_ratio": primary_source_ratio,
+        "technical_primary_source_count": technical_primary_source_count,
+        "technical_primary_source_ratio": technical_primary_source_ratio,
         "duplicate_event_rate": duplicate_event_rate,
         "paper_selected_count": len(featured_papers) if featured_papers else min(len(research_fallback), 6),
         "paper_appendix_count": len(paper_appendix),
         "visible_paper_count": len(visible_papers),
-        "visible_information_count": sum(
-            1
-            for item in (
-                list(layers.get("must_read", []))
-                + list(layers.get("physical_ai", []))
-                + list(layers.get("watch", []))
-            )
-            if item.get("content_type") != "paper" and str(item.get("quality_tier") or "") != "brief"
-        ),
+        "visible_information_count": visible_information_count,
+        "source_news_brief_count": source_news_brief_count,
+        "visible_news_count": int(primary_section_counts.get("news", 0)),
+        "visible_technical_count": int(primary_section_counts.get("technical", 0)),
+        "cross_section_duplicate_count": len(all_items) - len(unique_section_keys),
         "memory_card_count": len(must_read),
         "suspicious_claim_count": suspicious_count,
         "high_evidence_calibration_warning": high_evidence_warning,
@@ -1531,6 +1741,14 @@ def build_report_structure_diagnostics(layers: Dict[str, List[Dict[str, Any]]]) 
         "deepseek_empty_facts_count": editorial_metrics.get("deepseek_empty_facts_count", 0),
         "deepseek_key_field_missing_count": editorial_metrics.get("deepseek_key_field_missing_count", 0),
         "deepseek_health_hint": editorial_metrics.get("deepseek_health_hint", ""),
+        "gpt_schema_valid_count": editorial_metrics.get("gpt_schema_valid_count", 0),
+        "gpt_empty_facts_count": editorial_metrics.get("gpt_empty_facts_count", 0),
+        "gpt_key_field_missing_count": editorial_metrics.get("gpt_key_field_missing_count", 0),
+        "gpt_health_hint": editorial_metrics.get("gpt_health_hint", ""),
+        "llm_schema_valid_count": editorial_metrics.get("llm_schema_valid_count", 0),
+        "llm_empty_facts_count": editorial_metrics.get("llm_empty_facts_count", 0),
+        "llm_key_field_missing_count": editorial_metrics.get("llm_key_field_missing_count", 0),
+        "llm_health_hint": editorial_metrics.get("llm_health_hint", ""),
         "mixed_language_title_count": editorial_metrics.get("mixed_language_title_count", 0),
         "field_label_leak_count": editorial_metrics.get("field_label_leak_count", 0),
         "low_info_expanded_count": editorial_metrics.get("low_info_expanded_count", 0),
@@ -1552,7 +1770,16 @@ def repair_bad_titles_in_layers(layers: Dict[str, List[Dict[str, Any]]]) -> Tupl
         updated[key] = []
         for item in items:
             candidate = dict(item)
-            candidate["title_cn"] = polish_report_title(str(candidate.get("title_cn") or candidate.get("title") or ""))
+            if candidate.get("source_grounded_brief"):
+                candidate["quality_flags"] = item_quality_flags(candidate)
+                updated[key].append(candidate)
+                continue
+            raw_title = str(candidate.get("title_cn") or candidate.get("title") or "").strip()
+            candidate["title_cn"] = (
+                raw_title
+                if str(candidate.get("model_used") or "") == "codex-automation"
+                else polish_report_title(raw_title)
+            )
             candidate = enrich_learning_fields(candidate)
             candidate = enrich_editorial_fields(candidate)
             if title_looks_bad(candidate):
@@ -1605,6 +1832,11 @@ def is_focus_quality_item(item: Dict[str, Any]) -> bool:
             "field_label_leak",
             "bad_public_phrase",
             "mojibake_suspect",
+            "template_fallback",
+            "unsupported_evidence",
+            "unsupported_numeric_claim",
+            "generic_method",
+            "invalid_result",
         }
         & flags
     )
@@ -1677,8 +1909,53 @@ def v10_has_concrete_news_evidence(item: Dict[str, Any]) -> bool:
     return has_numeric or has_substantive_method or has_code or has_supported_viewpoint or has_specific_features
 
 
+def v10_paper_fallback_topic(item: Dict[str, Any]) -> str:
+    title_text = str(item.get("title") or "").lower()
+    if "multi-robot" in title_text or "multi robot" in title_text:
+        return "多机器人协作方法与实验"
+    if "safe" in title_text or "safety" in title_text or "attack" in title_text:
+        return "机器人安全方法与评测"
+    if "navigation" in title_text:
+        if "subarctic" in title_text or "forest" in title_text:
+            return "亚寒带森林机器人导航挑战与评测"
+        return "机器人导航方法与评测"
+    if "vision-language-action" in title_text or re.search(r"\bvla\b", title_text):
+        if "pre-train" in title_text or "pretrain" in title_text:
+            return "视觉语言动作模型继续预训练方法"
+        return "视觉语言动作模型训练与评测"
+    if any(term in title_text for term in ("grasp", "manipulation", "dexterous")):
+        return "机器人操作与抓取方法"
+    if "planning" in title_text:
+        return "机器人规划方法与评测"
+    if "humanoid" in title_text or "locomotion" in title_text:
+        return "人形机器人运动控制方法"
+    if "multimodal" in title_text or "vision-language" in title_text:
+        return "多模态模型训练与评测"
+    if any(term in title_text for term in ("world model", "world modeling", "video prediction")):
+        return "世界模型训练与评测"
+    return {
+        "world_model": "世界模型训练与评测",
+        "physical_ai": "机器人控制与操作研究",
+        "agent_models": "智能体方法与评测",
+        "infra_open_source": "模型训练与推理研究",
+    }.get(str(item.get("domain_key") or learning_domain_key(item)), "人工智能方法与实验")
+
+
 def repair_v10_paper_title(item: Dict[str, Any]) -> Dict[str, Any]:
     candidate = dict(item)
+    if candidate.get("title_cn"):
+        candidate["title_cn"] = str(candidate.get("title_cn") or "").rstrip("，,；;：:、 ")
+    current_curated_title = str(candidate.get("title_cn") or "").strip()
+    if (
+        str(candidate.get("model_used") or "") == "codex-automation"
+        and current_curated_title
+        and len(current_curated_title) <= 72
+        and not title_looks_bad(candidate)
+        and not has_untranslated_prose(current_curated_title)
+        and not any(marker in current_curated_title for marker in ("…", "..."))
+    ):
+        candidate["editorial_title"] = current_curated_title
+        return candidate
     facts = candidate.get("facts_cn") or candidate.get("facts") or {}
     if not isinstance(facts, dict):
         facts = {}
@@ -1693,9 +1970,32 @@ def repair_v10_paper_title(item: Dict[str, Any]) -> Dict[str, Any]:
         fact_who = str(facts.get("who") or "").strip()
         if fact_who.lower() not in {"", "this paper", "researchers", "研究者", "研究团队"}:
             entity = fact_who
+    generic_targets = {
+        "人工智能", "模型", "方法", "框架", "机器人", "具身智能", "世界模型",
+        "智能体", "基础设施", "模型训练", "模型推理", "研究任务",
+    }
+    if normalize_text(entity) in {normalize_text(value) for value in generic_targets}:
+        entity = ""
+    if re.search(r"要解决的是|核心动作|研究问题|实验结果", entity):
+        entity = ""
     target = re.split(r"[，；;。]", str(facts.get("target") or "").strip(), maxsplit=1)[0].strip()
     target = _compact_paper_target(target, 38)
     target = re.sub(r"[（(][A-Za-z][A-Za-z0-9 /_-]{2,}[）)]", "", target).strip()
+    if normalize_text(target) in {normalize_text(value) for value in generic_targets}:
+        target = ""
+    normalized_entity = re.sub(r"[^a-z0-9]+", "", entity.lower())
+    normalized_target = re.sub(r"[^a-z0-9]+", "", target.lower())
+    target_repeats_entity = bool(
+        normalized_entity
+        and normalized_target
+        and min(len(normalized_entity), len(normalized_target)) >= 4
+        and (
+            normalized_entity.startswith(normalized_target)
+            or normalized_target.startswith(normalized_entity)
+        )
+    )
+    if target_repeats_entity:
+        target = ""
     if entity and target:
         repaired_title = f"{entity}：{target}".strip("，；：: ")
         if len(repaired_title) <= 56 and not title_looks_bad({**candidate, "title_cn": repaired_title}):
@@ -1703,16 +2003,124 @@ def repair_v10_paper_title(item: Dict[str, Any]) -> Dict[str, Any]:
             candidate["editorial_title"] = repaired_title
             return candidate
 
-    if not title_looks_bad(candidate):
+    current_title = str(candidate.get("title_cn") or candidate.get("title") or "").strip()
+    generic_title_pattern = re.compile(
+        r"(?:的新方法与实验|方法与实验研究|研究方法与实验结果)$|"
+        r"^(?:人工智能|模型|方法|框架|机器人|具身智能|世界模型|智能体|研究任务)$"
+    )
+    repeated_title = bool(re.fullmatch(r"(.{2,12})\1", current_title))
+    if (
+        not target_repeats_entity
+        and not title_looks_bad(candidate)
+        and not generic_title_pattern.search(current_title)
+        and not repeated_title
+    ):
         candidate["editorial_title"] = str(candidate.get("title_cn") or candidate.get("title") or "").strip()
         return candidate
 
     suggestion = suggest_repaired_title_with_source(candidate).get("title", "")
     suggestion = str(suggestion or "").rstrip("，；：:（( ")
-    if suggestion and not title_looks_bad({**candidate, "title_cn": suggestion}):
+    suggestion_is_generic = bool(
+        generic_title_pattern.search(suggestion)
+        or re.fullmatch(r"(.{2,12})\1", suggestion)
+        or
+        re.fullmatch(
+            r"(?:研究团队|研究者|论文|本文)?[：:]?(?:人工智能|模型|方法|框架|机器人|具身智能|世界模型|智能体|研究任务)",
+            suggestion,
+        )
+    )
+    if (
+        suggestion
+        and not target_repeats_entity
+        and not suggestion_is_generic
+        and not title_looks_bad({**candidate, "title_cn": suggestion})
+    ):
         candidate["title_cn"] = suggestion
         candidate["editorial_title"] = suggestion
+        return candidate
+
+    meaningful_tokens = [
+        token
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9._+\-]*", original_title)
+        if token.lower() not in {"a", "an", "the", "this", "via", "for", "with", "from", "using", "of", "in", "on"}
+    ]
+    fallback_entity = entity or " ".join(meaningful_tokens[:2])
+    fallback_topic = v10_paper_fallback_topic(candidate)
+    fallback_title = _trim_repaired_title(
+        f"{fallback_entity}：{fallback_topic}" if fallback_entity else fallback_topic,
+        56,
+    )
+    if fallback_title and not title_looks_bad({**candidate, "title_cn": fallback_title}):
+        candidate["title_cn"] = fallback_title
+        candidate["editorial_title"] = fallback_title
     return candidate
+
+
+def v10_paper_is_ai_relevant(item: Dict[str, Any]) -> bool:
+    topic = normalize_text(
+        item.get("paper_domain_key", ""),
+        item.get("domain_key", ""),
+        item.get("topic", ""),
+        item.get("category", ""),
+        item.get("source_detail", ""),
+    )
+    text = normalize_text(
+        item.get("title", ""),
+        item.get("content", ""),
+        item.get("summary", ""),
+    )
+    if "world model" in topic or "world_model" in topic:
+        return any(
+            token in text
+            for token in (
+                "machine learning", "artificial intelligence", "neural", "robot", "agent",
+                "policy", "planning", "control", "video", "prediction", "predictive",
+                "latent", "generative", "reinforcement", "benchmark", "dataset",
+                "世界模型", "机器学习", "人工智能", "神经网络", "机器人", "智能体",
+                "策略", "规划", "控制", "视频生成", "预测", "潜变量", "生成模型",
+                "强化学习", "基准", "数据集", "自动驾驶",
+            )
+        )
+    return True
+
+
+def v10_paper_has_display_content(item: Dict[str, Any]) -> bool:
+    if not v10_paper_is_ai_relevant(item):
+        return False
+    candidate = enrich_editorial_fields({**dict(item), "_v8_force_fact_title": True})
+    candidate = repair_v10_paper_title(candidate)
+    if title_looks_bad(candidate):
+        return False
+    if str(candidate.get("summary_quality_tier") or "") == "index_only":
+        return True
+    return bool(
+        str(
+            candidate.get("paper_compact_summary")
+            or candidate.get("paper_plain_summary")
+            or candidate.get("paper_technical_intro")
+            or ""
+        ).strip()
+    )
+
+
+def v10_paper_has_editorial_summary(item: Dict[str, Any]) -> bool:
+    candidate = enrich_editorial_fields({**dict(item), "_v8_force_fact_title": True})
+    return bool(
+        str(candidate.get("summary_quality_tier") or "") == "editorial_ready"
+        and paper_plain_summary_passes(candidate.get("paper_plain_summary"))
+        and paper_technical_intro_passes(candidate.get("paper_technical_intro"))
+    )
+
+
+def should_preserve_existing_paper_analysis(
+    paper: Dict[str, Any],
+    result: Optional[Dict[str, Any]],
+) -> bool:
+    return bool(
+        result
+        and str(result.get("model_used") or "") == "template_fallback"
+        and v10_paper_has_display_content(paper)
+    )
 
 
 def repair_v10_paper_titles_in_layers(
@@ -1727,6 +2135,11 @@ def repair_v10_paper_titles_in_layers(
         target = re.sub(r"[（）()\[\]【】]", " ", target)
         target = re.sub(r"\s+", "", target).strip("，；：、。 ")
         target = _compact_title_piece(target, 44)
+        generic_safe_parts = {
+            "人工智能", "模型", "方法", "框架", "机器人", "具身智能", "世界模型", "智能体",
+        }
+        if normalize_text(target) in {normalize_text(value) for value in generic_safe_parts}:
+            target = ""
         if len(re.findall(r"[\u4e00-\u9fff]", target)) >= 6:
             return target
         method = str(facts.get("core_method") or facts.get("method") or "").strip()
@@ -1734,16 +2147,16 @@ def repair_v10_paper_titles_in_layers(
         method = re.sub(r"[（）()\[\]【】]", " ", method)
         method = re.sub(r"\s+", "", method).strip("，；：、。 ")
         method = _compact_title_piece(method, 24)
+        if normalize_text(method) in {normalize_text(value) for value in generic_safe_parts}:
+            method = ""
         combined = _compact_title_piece(f"{target}{method}", 44)
-        if len(re.findall(r"[\u4e00-\u9fff]", combined)) >= 6:
+        if (
+            len(re.findall(r"[\u4e00-\u9fff]", combined)) >= 6
+            and not re.fullmatch(r"(.{2,12})\1", combined)
+        ):
             return combined
         domain = str(item.get("domain_key") or learning_domain_key(item))
-        return {
-            "world_model": "世界模型方法与实验研究",
-            "physical_ai": "具身智能方法与实验研究",
-            "agent_models": "智能体模型方法与实验研究",
-            "infra_open_source": "模型基础设施方法与实验研究",
-        }.get(domain, "人工智能方法与实验研究")
+        return v10_paper_fallback_topic({**item, "domain_key": domain})
 
     repaired: Dict[str, List[Dict[str, Any]]] = {}
     for key, items in layers.items():
@@ -1763,6 +2176,8 @@ def repair_v10_paper_titles_in_layers(
             if item.get("content_type") == "paper":
                 candidate["_v8_force_fact_title"] = False
             candidate = enrich_editorial_fields(candidate)
+            if item.get("content_type") == "paper":
+                candidate = repair_v10_paper_title(candidate)
             candidate["quality_flags"] = item_quality_flags(candidate)
             repaired[key].append(candidate)
     return repaired
@@ -2053,6 +2468,138 @@ def flatten_report_layers(layers: Dict[str, List[Dict[str, Any]]]) -> List[Dict[
     return result
 
 
+def report_primary_section(item: Dict[str, Any]) -> str:
+    facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+    section = str(item.get("primary_section") or facts.get("primary_section") or "").strip().lower()
+    if section in {"news", "technical", "paper"}:
+        return section
+    if str(item.get("content_type") or "").strip().lower() == "paper":
+        return "paper"
+    if str(item.get("content_type") or "").strip().lower() in {"project", "open_source", "opensource"}:
+        return "technical"
+    return "news"
+
+
+def v11_item_contract_failures(item: Dict[str, Any]) -> List[str]:
+    """Return production contract failures for a Codex-researched V11 item."""
+    candidate = enrich_editorial_fields(enrich_learning_fields(dict(item)))
+    model_used = str(candidate.get("model_used") or "").strip().lower()
+    analysis_version = str(candidate.get("analysis_version") or "").strip().lower()
+    is_codex_research = model_used == "codex-automation" or analysis_version.startswith(
+        "codex-research"
+    )
+    if not is_codex_research:
+        return []
+
+    failures: List[str] = []
+    section = report_primary_section(candidate)
+    facts = candidate.get("facts") if isinstance(candidate.get("facts"), dict) else {}
+    source_excerpt = str(
+        candidate.get("source_excerpt") or facts.get("source_excerpt") or ""
+    ).strip()
+    evidence_locator = str(
+        candidate.get("evidence_locator") or facts.get("evidence_locator") or ""
+    ).strip()
+    claim_type = str(candidate.get("claim_type") or facts.get("claim_type") or "").strip()
+    if analysis_version not in SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS:
+        failures.append("analysis_version")
+    if not str(candidate.get("publish_date") or "").strip():
+        failures.append("publish_date")
+    if not source_excerpt:
+        failures.append("source_excerpt")
+    if not evidence_locator:
+        failures.append("evidence_locator")
+    if not claim_type:
+        failures.append("claim_type")
+    if evidence_quality_value(candidate) < 0.45:
+        failures.append("evidence_quality")
+    if information_density_value(candidate) < 0.45:
+        failures.append("information_density")
+    if title_looks_bad(candidate):
+        failures.append("title")
+
+    blocked_flags = {
+        "missing_facts",
+        "low_evidence",
+        "low_density",
+        "generic_summary",
+        "title_fact_mismatch",
+        "bad_title",
+        "mixed_language_title",
+        "field_label_leak",
+        "mojibake_suspect",
+        "bad_public_phrase",
+        "low_info_expanded",
+        "suspicious_claim",
+        "untranslated_fact",
+        "unsupported_numeric_claim",
+    }
+    observed_flags = set(candidate.get("editorial_flags") or []) | set(
+        item_quality_flags(candidate)
+    )
+    failures.extend(sorted(blocked_flags & observed_flags))
+    if str(candidate.get("quality_tier") or "") == "brief":
+        failures.append("quality_tier")
+
+    if section == "paper":
+        if not paper_plain_summary_passes(candidate.get("paper_plain_summary")):
+            failures.append("paper_plain_summary")
+        if not paper_technical_intro_passes(candidate.get("paper_technical_intro")):
+            failures.append("paper_technical_intro")
+        if not str(facts.get("method") or facts.get("core_method") or "").strip():
+            failures.append("paper_method")
+        if not any(
+            str(facts.get(key) or "").strip()
+            for key in ("metric_result", "dataset_or_benchmark", "baseline")
+        ):
+            failures.append("paper_result_context")
+    else:
+        body = re.sub(
+            r"\s+",
+            "",
+            str(candidate.get("analysis_body") or candidate.get("summary") or ""),
+        )
+        content_type = str(candidate.get("content_type") or "").strip().lower()
+        minimum_body_chars = (
+            300
+            if content_type in {"interview", "podcast", "video"}
+            else 220
+            if section == "technical"
+            else 180
+        )
+        if len(body) < minimum_body_chars:
+            failures.append("body_under_min")
+    return sorted(set(failures))
+
+
+def select_v11_update_candidates(
+    candidates: List[Dict[str, Any]],
+    report_config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Preserve independent news and technical buffers before editorial ranking."""
+    targets = {
+        "news": max(
+            int(report_config.get("min_visible_news_count", 20) or 20),
+            int(report_config.get("news_section_limit", 24) or 24),
+            int(report_config.get("news_candidate_pool_limit", 30) or 30),
+        ),
+        "technical": max(
+            int(report_config.get("min_visible_technical_count", 20) or 20),
+            int(report_config.get("technical_section_limit", 24) or 24),
+            int(report_config.get("technical_candidate_pool_limit", 30) or 30),
+        ),
+    }
+    selected: List[Dict[str, Any]] = []
+    for section in ("news", "technical"):
+        section_candidates = [
+            item
+            for item in candidates
+            if report_primary_section(item) == section
+        ]
+        selected.extend(section_candidates[:targets[section]])
+    return selected
+
+
 def apply_v9_continuity(
     layers: Dict[str, List[Dict[str, Any]]],
     previous_items: List[Dict[str, Any]],
@@ -2182,6 +2729,7 @@ def apply_v8_reading_budget(
         return sorted(
             items,
             key=lambda item: (
+                1 if item.get("content_type") != "paper" or v10_paper_has_editorial_summary(item) else 0,
                 source_rank.get(str(item.get("source_tier") or "").lower(), 1),
                 float(item.get("selection_score", item.get("score", 0)) or 0),
                 evidence_quality_value(item),
@@ -2192,7 +2740,227 @@ def apply_v8_reading_budget(
         )
 
     def source_key(item: Dict[str, Any]) -> str:
-        return item_host(item) or normalize_text(item.get("source_detail", ""), item.get("platform", "")) or "unknown"
+        host = item_host(item)
+        source_detail = normalize_text(item.get("source_detail", ""), item.get("platform", ""))
+        if (
+            str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
+            and host == "github.com"
+            and source_detail
+        ):
+            return f"github:{source_detail}"
+        return host or source_detail or "unknown"
+
+    def topic_key(item: Dict[str, Any]) -> str:
+        if (
+            str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
+            and report_primary_section(item) == "technical"
+        ):
+            facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+            category = str(
+                item.get("technical_category") or facts.get("technical_category") or "other"
+            ).strip().lower()
+            return f"technical:{category}"
+        return str(item.get("domain_key") or learning_domain_key(item))
+
+    if str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library":
+        all_candidates = unique_items(
+            list(layers.get("must_read", []))
+            + list(layers.get("physical_ai", []))
+            + list(layers.get("watch", []))
+            + list(layers.get("featured_papers", []))
+            + list(layers.get("paper_appendix", []))
+            + list(layers.get("research", []))
+            + list(layers.get("brief", []))
+        )
+        all_candidates = [
+            enrich_editorial_fields({**dict(item), "_v8_force_fact_title": False})
+            for item in all_candidates
+        ]
+        contract_rejections: List[Dict[str, Any]] = []
+        contract_ready_candidates: List[Dict[str, Any]] = []
+        for item in all_candidates:
+            failure_reasons = v11_item_contract_failures(item)
+            if failure_reasons:
+                contract_rejections.append(
+                    {
+                        "section": report_primary_section(item),
+                        "url": str(item.get("canonical_url") or item.get("url") or ""),
+                        "reasons": failure_reasons,
+                    }
+                )
+            else:
+                contract_ready_candidates.append(item)
+        all_candidates = contract_ready_candidates
+        report_config["_v11_selection_contract_rejections"] = contract_rejections
+        nonpaper = [item for item in all_candidates if report_primary_section(item) != "paper"]
+        papers = [
+            item
+            for item in all_candidates
+            if report_primary_section(item) == "paper"
+            and paper_plain_summary_passes(item.get("paper_plain_summary"))
+            and paper_technical_intro_passes(item.get("paper_technical_intro"))
+        ]
+        ordered_nonpaper = sort_items(nonpaper)
+        supplemental_limits = {
+            str(section): max(0, int(limit or 0))
+            for section, limit in dict(
+                report_config.get("supplemental_visible_max_by_section")
+                or {"news": 5, "technical": 5, "paper": 3}
+            ).items()
+        }
+
+        def select_with_supplemental_limit(
+            candidates: List[Dict[str, Any]],
+            *,
+            section: str,
+            limit: int,
+            enforce_diversity: bool = False,
+        ) -> List[Dict[str, Any]]:
+            selected: List[Dict[str, Any]] = []
+            selected_urls: set[str] = set()
+            selected_sources: Counter[str] = Counter()
+            selected_topics: Counter[str] = Counter()
+            supplemental_count = 0
+            supplemental_limit = supplemental_limits.get(section, 0)
+
+            def add_candidates(*, enforce_caps: bool) -> None:
+                nonlocal supplemental_count
+                for item in candidates:
+                    if len(selected) >= limit:
+                        return
+                    url = str(item.get("canonical_url") or item.get("url") or "")
+                    if not url or url in selected_urls:
+                        continue
+                    supplemental = "supplemental_older_source" in set(
+                        item.get("quality_flags") or []
+                    )
+                    if supplemental and supplemental_count >= supplemental_limit:
+                        continue
+                    source = source_key(item)
+                    topic = topic_key(item)
+                    if enforce_caps and (
+                        selected_sources[source] >= source_limit
+                        or selected_topics[topic] >= topic_limit
+                    ):
+                        continue
+                    selected.append(item)
+                    selected_urls.add(url)
+                    selected_sources[source] += 1
+                    selected_topics[topic] += 1
+                    supplemental_count += int(supplemental)
+
+            add_candidates(enforce_caps=enforce_diversity)
+            if len(selected) < limit:
+                add_candidates(enforce_caps=False)
+            return selected
+
+        news_limit = max(
+            int(report_config.get("min_visible_news_count", 20) or 20),
+            int(report_config.get("news_section_limit", 24) or 24),
+        )
+        technical_limit = max(
+            int(report_config.get("min_visible_technical_count", 20) or 20),
+            int(report_config.get("technical_section_limit", 24) or 24),
+        )
+        selected_nonpaper = (
+            select_with_supplemental_limit(
+                [item for item in ordered_nonpaper if report_primary_section(item) == "news"],
+                section="news",
+                limit=news_limit,
+                enforce_diversity=True,
+            )
+            + select_with_supplemental_limit(
+                [item for item in ordered_nonpaper if report_primary_section(item) == "technical"],
+                section="technical",
+                limit=technical_limit,
+                enforce_diversity=True,
+            )
+        )
+        ordered_nonpaper = sort_items(selected_nonpaper)
+
+        def select_diverse_must_read(
+            candidates: List[Dict[str, Any]],
+            limit: int,
+        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            source_cap = max(
+                1,
+                int(report_config.get("must_read_source_limit", 2) or 2),
+            )
+            available_sections = {
+                report_primary_section(item) for item in candidates
+            }
+            section_cap = (
+                max(1, (limit + 1) // 2)
+                if {"news", "technical"}.issubset(available_sections)
+                else limit
+            )
+            selected: List[Dict[str, Any]] = []
+            selected_urls: set[str] = set()
+            source_counts: Counter[str] = Counter()
+            section_counts: Counter[str] = Counter()
+
+            def item_url(item: Dict[str, Any]) -> str:
+                return str(
+                    item.get("canonical_url")
+                    or item.get("url")
+                    or item.get("title_cn")
+                    or item.get("title")
+                    or ""
+                )
+
+            def add_pass(*, enforce_section_cap: bool, enforce_diversity: bool) -> None:
+                for item in candidates:
+                    if len(selected) >= limit:
+                        return
+                    url = item_url(item)
+                    if not url or url in selected_urls:
+                        continue
+                    source = report_source_key(item)
+                    section = report_primary_section(item)
+                    if enforce_diversity and source_counts[source] >= source_cap:
+                        continue
+                    if enforce_section_cap and section_counts[section] >= section_cap:
+                        continue
+                    selected.append(dict(item))
+                    selected_urls.add(url)
+                    source_counts[source] += 1
+                    section_counts[section] += 1
+
+            add_pass(enforce_section_cap=True, enforce_diversity=True)
+            add_pass(enforce_section_cap=False, enforce_diversity=True)
+            add_pass(enforce_section_cap=False, enforce_diversity=False)
+            remaining = [
+                dict(item) for item in candidates if item_url(item) not in selected_urls
+            ]
+            return selected, remaining
+
+        must_read, watch = select_diverse_must_read(
+            ordered_nonpaper,
+            must_limit,
+        )
+        selected_papers = select_with_supplemental_limit(
+            papers,
+            section="paper",
+            limit=featured_limit + appendix_limit,
+        )
+        featured_papers = [dict(item) for item in selected_papers[:featured_limit]]
+        paper_appendix = [dict(item) for item in selected_papers[featured_limit:]]
+        result = {
+            "must_read": must_read,
+            "physical_ai": [],
+            "watch": watch,
+            "featured_papers": featured_papers,
+            "paper_appendix": paper_appendix,
+            "research": [],
+            "brief": [],
+        }
+        rank = 1
+        for key in REPORT_SECTION_ORDER:
+            for item in result.get(key, []):
+                item["report_section"] = key
+                item["report_rank"] = rank
+                rank += 1
+        return result
 
     news_candidates = unique_items(
         list(layers.get("must_read", []))
@@ -2204,7 +2972,14 @@ def apply_v8_reading_budget(
         enrich_editorial_fields({**dict(item), "_v8_force_fact_title": True})
         for item in sort_items(news_candidates)
     ]
-    is_v10_design = str(report_config.get("design_version") or "") == "v10-learning-digest"
+    source_news_candidate_pool = list(normalized_news_candidates)
+    is_v10_design = is_learning_digest_design(report_config)
+    strict_v11_papers = str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
+    if is_v10_design:
+        brief_limit = max(
+            brief_limit,
+            int(report_config.get("source_news_brief_limit", 12) or 12),
+        )
     news_candidates = [
         item
         for item in normalized_news_candidates
@@ -2280,6 +3055,27 @@ def apply_v8_reading_budget(
                 continue
             domain_items.append(mark_selected(item, "watch"))
 
+        section_minimums = {
+            "news": int(report_config.get("min_visible_news_count", 20) or 20),
+            "technical": int(report_config.get("min_visible_technical_count", 20) or 20),
+        }
+        for primary_section, minimum in section_minimums.items():
+            selected_count = sum(
+                1
+                for selected in must_read + domain_items
+                if report_primary_section(selected) == primary_section
+            )
+            if selected_count >= minimum:
+                continue
+            for item in news_candidates:
+                if selected_count >= minimum:
+                    break
+                url = str(item.get("canonical_url") or item.get("url") or "")
+                if url in selected_urls or report_primary_section(item) != primary_section:
+                    continue
+                domain_items.append(mark_selected(item, "watch"))
+                selected_count += 1
+
     paper_candidates = unique_items(
         list(layers.get("featured_papers", []))
         + list(layers.get("paper_appendix", []))
@@ -2306,15 +3102,17 @@ def apply_v8_reading_budget(
         intro = str(candidate.get("paper_technical_intro") or "")
         intro_is_complete = not re.search(r"…|\.\.\.", intro)
         intro_length_ok = paper_body_min <= len(intro) <= paper_body_max
+        focus_quality_ok = is_focus_quality_item(candidate)
         if (
             len(featured_papers) < featured_limit
+            and focus_quality_ok
             and has_mechanism
             and has_result
             and intro_is_complete
             and intro_length_ok
             and paper_technical_intro_passes(intro)
             and (
-                str(report_config.get("design_version") or "") != "v10-learning-digest"
+                not is_learning_digest_design(report_config)
                 or paper_plain_summary_passes(candidate.get("paper_plain_summary"))
             )
         ):
@@ -2323,14 +3121,25 @@ def apply_v8_reading_budget(
         elif (
             len(paper_appendix) < appendix_limit
             and (
-                str(report_config.get("design_version") or "") != "v10-learning-digest"
-                or bool(
-                    str(
-                        candidate.get("paper_compact_summary")
-                        or candidate.get("paper_plain_summary")
-                        or candidate.get("paper_technical_intro")
-                        or ""
-                    ).strip()
+                not is_learning_digest_design(report_config)
+                or (
+                    strict_v11_papers
+                    and paper_plain_summary_passes(candidate.get("paper_plain_summary"))
+                    and paper_technical_intro_passes(candidate.get("paper_technical_intro"))
+                )
+                or (
+                    not strict_v11_papers
+                    and (
+                        str(candidate.get("summary_quality_tier") or "") == "index_only"
+                        or bool(
+                            str(
+                                candidate.get("paper_compact_summary")
+                                or candidate.get("paper_plain_summary")
+                                or candidate.get("paper_technical_intro")
+                                or ""
+                            ).strip()
+                        )
+                    )
                 )
             )
         ):
@@ -2344,16 +3153,21 @@ def apply_v8_reading_budget(
     brief_candidates = unique_items(
         [
             item
-            for item in list(layers.get("brief", [])) + news_candidates
+            for item in list(layers.get("brief", [])) + source_news_candidate_pool
             if str(item.get("canonical_url") or item.get("url") or "") not in used
             and item.get("content_type") != "paper"
         ]
     )
     brief: List[Dict[str, Any]] = []
     for item in sort_items(brief_candidates):
-        candidate = enrich_editorial_fields({**dict(item), "_v8_force_fact_title": True})
-        if title_looks_bad(candidate) or has_untranslated_prose(candidate.get("brief_line")):
-            continue
+        if is_v10_design:
+            candidate = build_source_grounded_news_brief(item)
+            if not candidate:
+                continue
+        else:
+            candidate = enrich_editorial_fields({**dict(item), "_v8_force_fact_title": True})
+            if title_looks_bad(candidate) or has_untranslated_prose(candidate.get("brief_line")):
+                continue
         candidate["report_section"] = "brief"
         candidate["freshness_label"] = "今日新增" if datetime.now() - parse_datetime(candidate.get("publish_date", "")) <= timedelta(hours=36) else "历史补位"
         brief.append(candidate)
@@ -2367,7 +3181,7 @@ def apply_v8_reading_budget(
         "featured_papers": featured_papers,
         "paper_appendix": paper_appendix,
         "research": [],
-        "brief": [] if is_v10_design else brief,
+        "brief": brief,
     }
     rank = 1
     for key in REPORT_SECTION_ORDER:
@@ -2419,6 +3233,263 @@ def v8_backfill_pool_ready(items: List[Dict[str, Any]], report_config: Optional[
     )
 
 
+def compact_email_html(html_content: str) -> str:
+    compacted = re.sub(r"<!--(?!\[if)[\s\S]*?-->", "", str(html_content or ""))
+    compacted = re.sub(r">\r?\n[ \t]*<", "><", compacted)
+    compacted = re.sub(r"\r?\n[ \t]*\r?\n+", "\n", compacted)
+    return compacted.strip()
+
+
+def build_v11_email_volume_layers(
+    layers: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    volume_definitions = (
+        ("新闻、博客与访谈", "news"),
+        ("技术方法与工程实践", "technical"),
+        ("论文精读", "paper"),
+    )
+    volumes: List[Dict[str, Any]] = []
+    for label, primary_section in volume_definitions:
+        volume_layers = {
+            key: [
+                dict(item)
+                for item in layers.get(key, [])
+                if report_primary_section(item) == primary_section
+            ]
+            for key in REPORT_SECTION_ORDER
+        }
+        items = flatten_report_layers(volume_layers)
+        if not items:
+            continue
+        volumes.append(
+            {
+                "label": label,
+                "primary_section": primary_section,
+                "layers": volume_layers,
+                "items": items,
+            }
+        )
+    return volumes
+
+
+def prepare_v11_email_delivery_volumes(
+    html_report: str,
+    layers: Dict[str, List[Dict[str, Any]]],
+    report_config: Dict[str, Any],
+    render_volume: Callable[[int, Dict[str, Any]], str],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    original = [{
+        "label": "完整日报",
+        "html": html_report,
+        "primary_section": "all",
+        "item_count": len(flatten_report_layers(layers)),
+        "items": flatten_report_layers(layers),
+        "layers": layers,
+    }]
+    max_bytes = int(report_config.get("email_html_max_bytes", 104448) or 104448)
+    if (
+        str(report_config.get("product_mode") or "") != "intelligence_v11_editorial_library"
+        or not bool(report_config.get("email_split_enabled", True))
+        or len(html_report.encode("utf-8")) <= max_bytes
+    ):
+        return original, False
+
+    def sliced_volume(
+        volume: Dict[str, Any],
+        selected_items: List[Dict[str, Any]],
+        part_index: int = 1,
+        part_count: int = 1,
+    ) -> Dict[str, Any]:
+        selected_keys = {editorial_item_render_key(item) for item in selected_items}
+        volume_layers = {
+            key: [
+                item
+                for item in volume["layers"].get(key, [])
+                if editorial_item_render_key(item) in selected_keys
+            ]
+            for key in REPORT_SECTION_ORDER
+        }
+        label = str(volume["label"])
+        if part_count > 1:
+            label = f"{label}（{part_index}/{part_count}）"
+        return {
+            "label": label,
+            "primary_section": volume["primary_section"],
+            "layers": volume_layers,
+            "items": selected_items,
+        }
+
+    def render_candidate(index: int, volume: Dict[str, Any]) -> Dict[str, Any]:
+        volume_html = compact_email_html(render_volume(index, volume))
+        return {
+            **volume,
+            "html": volume_html,
+            "item_count": len(volume["items"]),
+            "size_bytes": len(volume_html.encode("utf-8")),
+        }
+
+    rendered: List[Dict[str, Any]] = []
+    for base_volume in build_v11_email_volume_layers(layers):
+        candidate = render_candidate(
+            len(rendered) + 1,
+            sliced_volume(base_volume, list(base_volume["items"])),
+        )
+        if int(candidate["size_bytes"]) <= max_bytes:
+            rendered.append(candidate)
+            continue
+
+        items = list(base_volume["items"])
+        split_candidates: List[Dict[str, Any]] = []
+        for part_count in range(2, len(items) + 1):
+            base_size, remainder = divmod(len(items), part_count)
+            cursor = 0
+            trial: List[Dict[str, Any]] = []
+            for part_index in range(1, part_count + 1):
+                chunk_size = base_size + (1 if part_index <= remainder else 0)
+                chunk = items[cursor : cursor + chunk_size]
+                cursor += chunk_size
+                volume = sliced_volume(base_volume, chunk, part_index, part_count)
+                trial.append(render_candidate(len(rendered) + part_index, volume))
+            if trial and all(int(volume["size_bytes"]) <= max_bytes for volume in trial):
+                split_candidates = trial
+                break
+        if not split_candidates:
+            return original, False
+        rendered.extend(split_candidates)
+
+    if rendered:
+        return rendered, True
+    return original, False
+
+
+def send_email_delivery_volumes(
+    notifier: Any,
+    recipient: str,
+    base_subject: str,
+    volumes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    volume_count = len(volumes)
+    subjects = [
+        (
+            base_subject
+            if volume_count == 1
+            else f"{base_subject} [{index}/{volume_count}] {volume['label']}"
+        )
+        for index, volume in enumerate(volumes, start=1)
+    ]
+    sent_count = 0
+    for subject, volume in zip(subjects, volumes):
+        if not notifier.send_email(
+            recipient_email=recipient,
+            subject=subject,
+            html_content=str(volume["html"]),
+        ):
+            return {
+                "success": False,
+                "subjects": subjects,
+                "sent_count": sent_count,
+                "volume_count": volume_count,
+            }
+        sent_count += 1
+    return {
+        "success": True,
+        "subjects": subjects,
+        "sent_count": sent_count,
+        "volume_count": volume_count,
+    }
+
+
+class _V11RenderedItemTextParser(HTMLParser):
+    """Collect visible text from each V11 item container in the final email HTML."""
+
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+    _BLOCK_TAGS = {
+        "article", "blockquote", "div", "h1", "h2", "h3", "h4", "h5",
+        "h6", "li", "p", "section", "table", "td", "th", "tr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._tag_stack: List[str] = []
+        self._captures: List[Dict[str, Any]] = []
+        self.item_text: Dict[str, str] = {}
+        self.item_structured_text: Dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        normalized_tag = str(tag or "").lower()
+        if normalized_tag == "br" or normalized_tag in self._BLOCK_TAGS:
+            for capture in self._captures:
+                capture["parts"].append("\n")
+        if normalized_tag not in self._VOID_TAGS:
+            self._tag_stack.append(normalized_tag)
+        item_key = dict(attrs).get("data-v11-item-key")
+        if item_key:
+            self._captures.append(
+                {
+                    "key": str(item_key),
+                    "tag": normalized_tag,
+                    "depth": len(self._tag_stack),
+                    "parts": [],
+                }
+            )
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+        for capture in self._captures:
+            capture["parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = str(tag or "").lower()
+        if normalized_tag in self._BLOCK_TAGS:
+            for capture in self._captures:
+                capture["parts"].append("\n")
+        for capture in list(self._captures):
+            if (
+                capture["tag"] == normalized_tag
+                and capture["depth"] == len(self._tag_stack)
+            ):
+                raw_text = "".join(capture["parts"])
+                normalized_text = re.sub(r"\s+", " ", raw_text).strip()
+                self.item_text[capture["key"]] = normalized_text
+                self.item_structured_text[capture["key"]] = (
+                    _normalize_editorial_paragraphs(raw_text)
+                )
+                self._captures.remove(capture)
+        if self._tag_stack:
+            if self._tag_stack[-1] == normalized_tag:
+                self._tag_stack.pop()
+            elif normalized_tag in self._tag_stack:
+                reverse_index = self._tag_stack[::-1].index(normalized_tag)
+                del self._tag_stack[len(self._tag_stack) - reverse_index - 1 :]
+
+
+def _normalize_editorial_paragraphs(value: Any) -> str:
+    paragraphs = [
+        re.sub(r"\s+", " ", html_lib.unescape(part)).strip()
+        for part in re.split(r"(?:\r\n|\r|\n)+", str(value or ""))
+        if re.sub(r"\s+", " ", html_lib.unescape(part)).strip()
+    ]
+    return "\n".join(paragraphs)
+
+
+def _editorial_paragraph_digest(value: Any) -> str:
+    normalized = _normalize_editorial_paragraphs(value)
+    if normalized.count("\n") < 1:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _v11_rendered_item_text(html_content: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    parser = _V11RenderedItemTextParser()
+    parser.feed(html_content)
+    parser.close()
+    return parser.item_text, parser.item_structured_text
+
+
 def scan_final_html_quality(
     html_content: str,
     layers: Dict[str, List[Dict[str, Any]]],
@@ -2427,7 +3498,8 @@ def scan_final_html_quality(
 ) -> Dict[str, Any]:
     quality_config = quality_config or {}
     report_config = report_config or {}
-    v10_mode = str(report_config.get("design_version") or "") == "v10-learning-digest"
+    v10_mode = is_learning_digest_design(report_config)
+    v11_mode = str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
     items = flatten_report_layers(layers)
     focus_items = list(layers.get("must_read", [])) + list(layers.get("watch", [])) + list(layers.get("featured_papers", []))
     paper_items = list(layers.get("featured_papers", []))
@@ -2436,6 +3508,10 @@ def scan_final_html_quality(
     visible_fresh_paper_items = [item for item in visible_paper_items if not item.get("is_reappeared_update")]
     public_texts: List[str] = []
     opening_counts: Counter[str] = Counter()
+    attribution_opening_counts: Counter[str] = Counter()
+    attribution_opening_run = 0
+    max_attribution_opening_run = 0
+    previous_attribution_opening = ""
     sentence_counts: Counter[str] = Counter()
     displayed_body_items = focus_items
     for item in displayed_body_items:
@@ -2449,6 +3525,20 @@ def scan_final_html_quality(
         opening = re.sub(r"\W+", "", body)[:12]
         if len(opening) >= 6:
             opening_counts[opening] += 1
+        attribution_opening = attribution_opener_pattern(body)
+        if attribution_opening:
+            attribution_opening_counts[attribution_opening] += 1
+        if attribution_opening and attribution_opening == previous_attribution_opening:
+            attribution_opening_run += 1
+        elif attribution_opening:
+            attribution_opening_run = 1
+        else:
+            attribution_opening_run = 0
+        previous_attribution_opening = attribution_opening
+        max_attribution_opening_run = max(
+            max_attribution_opening_run,
+            attribution_opening_run,
+        )
         for sentence in re.split(r"[。！？.!?]+", body):
             key = re.sub(r"\W+", "", normalize_text(sentence))[:100]
             if len(key) >= 18:
@@ -2491,6 +3581,10 @@ def scan_final_html_quality(
                     else ((item.get("facts_cn") or {}).get("evidence") or [])
                 )
             )
+            or (
+                v11_mode
+                and paper_technical_intro_passes(item.get("paper_technical_intro"))
+            )
         )
     )
     paper_body_min = max(0, int(report_config.get("paper_body_char_min", 0) or 0))
@@ -2522,14 +3616,179 @@ def scan_final_html_quality(
     html_without_assets = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", "", html_content, flags=re.IGNORECASE | re.DOTALL)
     visible_text = html_lib.unescape(re.sub(r"<[^>]+>", " ", html_without_assets))
     visible_text = re.sub(r"\s+", " ", visible_text).strip()
-    displayed_bodies = [
-        re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", body))).strip()
-        for body in re.findall(
-            r'<div\s+class="(?:v8-body|v10-body|v10-paper-plain|v10-paper-tech)"[^>]*>(.*?)</div>',
-            html_content,
-            flags=re.IGNORECASE | re.DOTALL,
+    if v11_mode:
+        v11_rendered_item_text, v11_rendered_item_structured_text = (
+            _v11_rendered_item_text(html_content)
         )
-    ]
+    else:
+        v11_rendered_item_text, v11_rendered_item_structured_text = {}, {}
+    v11_content_fidelity_missing_examples: List[Dict[str, Any]] = []
+    v11_key_number_fidelity_missing_examples: List[Dict[str, Any]] = []
+    v11_editorial_source_hash_missing_examples: List[Dict[str, Any]] = []
+    v11_editorial_source_mismatch_examples: List[Dict[str, Any]] = []
+    if v11_mode:
+        for item in items:
+            render_key = editorial_item_render_key(item)
+            rendered_item_text = v11_rendered_item_text.get(render_key, "") if render_key else ""
+            rendered_item_structured_text = (
+                v11_rendered_item_structured_text.get(render_key, "")
+                if render_key
+                else ""
+            )
+            item_facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+            expected_fragments = {
+                "title": item.get("title_cn") or item.get("title"),
+                "source_excerpt": item_facts.get("source_excerpt")
+                or item.get("source_excerpt"),
+                "evidence_locator": item_facts.get("evidence_locator")
+                or item.get("evidence_locator"),
+            }
+            if report_primary_section(item) == "paper":
+                expected_fragments.update(
+                    {
+                        "paper_plain_summary": item.get("paper_plain_summary"),
+                        "paper_technical_intro": item.get("paper_technical_intro"),
+                    }
+                )
+            else:
+                expected_fragments["analysis_body"] = (
+                    item.get("analysis_body") or item.get("summary")
+                )
+            missing_fragments = []
+            for field, value in expected_fragments.items():
+                normalized_value = re.sub(
+                    r"\s+", " ", html_lib.unescape(str(value or ""))
+                ).strip()
+                if normalized_value and normalized_value not in rendered_item_text:
+                    missing_fragments.append(field)
+                    continue
+                structured_value = _normalize_editorial_paragraphs(value)
+                if (
+                    structured_value.count("\n") >= 1
+                    and structured_value not in rendered_item_structured_text
+                ):
+                    missing_fragments.append(f"{field}:paragraphs")
+            if missing_fragments:
+                v11_content_fidelity_missing_examples.append(
+                    {
+                        "url": str(item.get("canonical_url") or item.get("url") or ""),
+                        "fields": missing_fragments,
+                        "container_missing": not bool(rendered_item_text),
+                    }
+                )
+            facts_cn = item.get("facts_cn") if isinstance(item.get("facts_cn"), dict) else {}
+            key_numbers = item_facts.get("key_numbers")
+            if not isinstance(key_numbers, list):
+                key_numbers = facts_cn.get("key_numbers")
+            if isinstance(key_numbers, list) and key_numbers:
+                expected_key_tokens = set().union(
+                    *(
+                        CodexResearchInboxCollector._metric_tokens(value)
+                        for value in key_numbers
+                    )
+                )
+                if report_primary_section(item) == "paper":
+                    public_key_text = " ".join(
+                        [
+                            str(item.get("paper_plain_summary") or ""),
+                            str(item.get("paper_technical_intro") or ""),
+                        ]
+                    )
+                else:
+                    public_key_text = str(
+                        item.get("analysis_body") or item.get("summary") or ""
+                    )
+                public_key_tokens = CodexResearchInboxCollector._metric_tokens(
+                    public_key_text
+                )
+                missing_key_tokens = expected_key_tokens - public_key_tokens
+                if missing_key_tokens:
+                    v11_key_number_fidelity_missing_examples.append(
+                        {
+                            "url": str(item.get("canonical_url") or item.get("url") or ""),
+                            "missing_tokens": sorted(missing_key_tokens),
+                        }
+                    )
+            if str(item.get("analysis_version") or "") not in SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS:
+                continue
+            facts = item_facts
+            source_hashes = facts.get("editorial_source_hashes")
+            if not isinstance(source_hashes, dict):
+                source_hashes = facts_cn.get("editorial_source_hashes")
+            if not isinstance(source_hashes, dict) or not source_hashes:
+                v11_editorial_source_hash_missing_examples.append(
+                    {"url": str(item.get("canonical_url") or item.get("url") or "")}
+                )
+                continue
+            paper_item = report_primary_section(item) == "paper"
+            current_values = {
+                "title_cn": item.get("title_cn") or item.get("title"),
+                "summary": (
+                    item.get("summary")
+                    if paper_item
+                    else item.get("analysis_body") or item.get("summary")
+                ),
+                "source_excerpt": facts.get("source_excerpt"),
+                "evidence_locator": facts.get("evidence_locator"),
+            }
+            if isinstance(facts.get("key_numbers"), list):
+                current_values["key_numbers"] = json.dumps(
+                    facts.get("key_numbers"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            if paper_item:
+                current_values.update(
+                    {
+                        "paper_plain_summary": item.get("paper_plain_summary"),
+                        "paper_technical_intro": item.get("paper_technical_intro"),
+                    }
+                )
+            mismatched_fields = []
+            for field, expected_hash in source_hashes.items():
+                if field not in current_values or not str(expected_hash or "").strip():
+                    continue
+                normalized = re.sub(r"\s+", " ", str(current_values[field] or "")).strip()
+                current_hash = (
+                    hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+                    if normalized
+                    else ""
+                )
+                if current_hash != str(expected_hash):
+                    mismatched_fields.append(field)
+            if mismatched_fields:
+                v11_editorial_source_mismatch_examples.append(
+                    {
+                        "url": str(item.get("canonical_url") or item.get("url") or ""),
+                        "fields": mismatched_fields,
+                    }
+                )
+            paragraph_hashes = facts.get("editorial_paragraph_hashes")
+            if not isinstance(paragraph_hashes, dict):
+                paragraph_hashes = facts_cn.get("editorial_paragraph_hashes")
+            if isinstance(paragraph_hashes, dict):
+                paragraph_mismatches = []
+                for field, expected_hash in paragraph_hashes.items():
+                    if field not in current_values or not str(expected_hash or "").strip():
+                        continue
+                    if _editorial_paragraph_digest(current_values[field]) != str(expected_hash):
+                        paragraph_mismatches.append(f"{field}:paragraphs")
+                if paragraph_mismatches:
+                    v11_editorial_source_mismatch_examples.append(
+                        {
+                            "url": str(item.get("canonical_url") or item.get("url") or ""),
+                            "fields": paragraph_mismatches,
+                        }
+                    )
+    html_size_bytes = len(html_content.encode("utf-8"))
+    html_size_warning_bytes = max(
+        1,
+        int(report_config.get("email_html_warning_bytes", 97280) or 97280),
+    )
+    html_size_max_bytes = max(
+        html_size_warning_bytes,
+        int(report_config.get("email_html_max_bytes", 104448) or 104448),
+    )
     memory_texts = [
         re.sub(r"^0\d\s*", "", re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", row))).strip())
         for row in re.findall(
@@ -2538,22 +3797,142 @@ def scan_final_html_quality(
             flags=re.IGNORECASE | re.DOTALL,
         )
     ]
+    def focus_source_key(item: Dict[str, Any]) -> str:
+        host = item_host(item)
+        source_detail = normalize_text(item.get("source_detail", ""), item.get("platform", ""))
+        if v11_mode and host == "github.com" and source_detail:
+            return f"github:{source_detail}"
+        return host or source_detail or "unknown"
+
+    def focus_topic_key(item: Dict[str, Any]) -> str:
+        if v11_mode and report_primary_section(item) == "technical":
+            facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+            category = str(
+                item.get("technical_category") or facts.get("technical_category") or "other"
+            ).strip().lower()
+            return f"technical:{category}"
+        return str(item.get("domain_key") or learning_domain_key(item))
+
     source_counts = Counter(
-        item_host(item) or normalize_text(item.get("source_detail", ""), item.get("platform", "")) or "unknown"
+        focus_source_key(item)
         for item in focus_items
         if item.get("content_type") != "paper"
     )
     topic_counts = Counter(
-        str(item.get("domain_key") or learning_domain_key(item))
+        focus_topic_key(item)
         for item in focus_items
         if item.get("content_type") != "paper"
     )
     source_concentration = max(source_counts.values(), default=0) / max(1, sum(source_counts.values()))
-    display_body_limit = (
-        int(report_config.get("paper_body_char_limit", 300) or 300)
-        if v10_mode
-        else int(report_config.get("news_body_char_limit", 180) or 180)
+    source_news_brief_count = sum(
+        1
+        for item in layers.get("brief", [])
+        if item.get("content_type") != "paper" and item.get("source_grounded_brief")
     )
+    v11_rendered_counts = {"news": 0, "technical": 0, "paper": 0}
+    v11_supplemental_expected_count = sum(
+        1
+        for item in items
+        if "supplemental_older_source" in set(item.get("quality_flags") or [])
+    )
+    v11_supplemental_counts_by_section = Counter(
+        report_primary_section(item)
+        for item in items
+        if "supplemental_older_source" in set(item.get("quality_flags") or [])
+    )
+    supplemental_visible_limits = {
+        str(section): max(0, int(limit or 0))
+        for section, limit in dict(
+            report_config.get("supplemental_visible_max_by_section")
+            or {"news": 5, "technical": 5, "paper": 3}
+        ).items()
+    }
+    v11_supplemental_limit_exceeded = {
+        section: {
+            "count": int(v11_supplemental_counts_by_section.get(section, 0)),
+            "max": limit,
+        }
+        for section, limit in supplemental_visible_limits.items()
+        if int(v11_supplemental_counts_by_section.get(section, 0)) > limit
+    }
+    supplemental_max_age_hours = {
+        str(section): max(0, int(hours or 0))
+        for section, hours in dict(
+            report_config.get("supplemental_max_age_hours_by_section")
+            or {"news": 168, "technical": 720, "paper": 720}
+        ).items()
+    }
+    v11_supplemental_age_violation_examples: List[Dict[str, Any]] = []
+    now = datetime.now()
+    for item in items:
+        if "supplemental_older_source" not in set(item.get("quality_flags") or []):
+            continue
+        section = report_primary_section(item)
+        maximum_hours = supplemental_max_age_hours.get(section, 0)
+        published_at = parse_datetime(str(item.get("publish_date") or ""))
+        if maximum_hours <= 0 or published_at == datetime.min:
+            continue
+        age_hours = (now - published_at).total_seconds() / 3600
+        if age_hours > maximum_hours:
+            v11_supplemental_age_violation_examples.append({
+                "section": section,
+                "url": str(item.get("canonical_url") or item.get("url") or ""),
+                "publish_date": str(item.get("publish_date") or ""),
+                "age_hours": round(age_hours, 1),
+                "max_age_hours": maximum_hours,
+            })
+    v11_supplemental_label_count = html_content.count("补充阅读 ·")
+    valid_claim_types = {
+        "verified_fact",
+        "official_claim",
+        "interview_opinion",
+        "analysis",
+        "research_result",
+    }
+    v11_claim_label_expected_count = sum(
+        1
+        for item in items
+        if str(
+            item.get("claim_type")
+            or (item.get("facts") or {}).get("claim_type")
+            or ""
+        ).strip().lower() in valid_claim_types
+    )
+    v11_claim_label_visible_count = html_content.count('class="v11-claim-label"')
+    if v11_mode:
+        for raw_count, raw_label in re.findall(
+            r'<div\s+class="v11-count-value"[^>]*>(\d+)</div><div\s+class="v11-count-label"[^>]*>([^<]+)</div>',
+            html_content,
+            flags=re.IGNORECASE,
+        ):
+            label = re.sub(r"^本期", "", html_lib.unescape(raw_label).strip())
+            if label.startswith("新闻"):
+                v11_rendered_counts["news"] = int(raw_count)
+            elif label.startswith("非论文技术"):
+                v11_rendered_counts["technical"] = int(raw_count)
+            elif label.startswith("论文"):
+                v11_rendered_counts["paper"] = int(raw_count)
+
+    def display_body_limit_for_item(item: Dict[str, Any]) -> int:
+        primary_section = report_primary_section(item)
+        content_type = str(item.get("content_type") or "").strip().lower()
+        if primary_section == "paper":
+            return int(report_config.get("paper_body_char_limit", 300) or 300)
+        if content_type in {"interview", "podcast", "video"}:
+            return int(report_config.get("interview_body_char_limit", 500) or 500)
+        if primary_section == "technical":
+            return int(report_config.get("technical_body_char_limit", 400) or 400)
+        return int(report_config.get("news_body_char_limit", 180) or 180)
+
+    display_body_over_limit_count = 0
+    for item in displayed_body_items:
+        body = str(
+            item.get("paper_plain_summary") or item.get("paper_technical_intro") or ""
+            if report_primary_section(item) == "paper"
+            else item.get("analysis_body") or item.get("summary") or ""
+        )
+        if len(body) > display_body_limit_for_item(item):
+            display_body_over_limit_count += 1
     low_value_labels = (
         "相较上次",
         "可信度：",
@@ -2566,7 +3945,14 @@ def scan_final_html_quality(
         "快讯 / 待确认",
     )
     low_value_module_count = sum(visible_text.count(label) for label in low_value_labels)
-    if v10_mode:
+    if v11_mode:
+        title_only_item_count = sum(
+            1
+            for item in visible_paper_items
+            if not paper_plain_summary_passes(item.get("paper_plain_summary"))
+            or not paper_technical_intro_passes(item.get("paper_technical_intro"))
+        )
+    elif v10_mode:
         appendix_blocks = re.findall(
             r'<div\s+class="v10-more-paper"[^>]*>(.*?)</div>\s*</div>?',
             html_content,
@@ -2602,17 +3988,23 @@ def scan_final_html_quality(
         ) if paper_items else 1.0,
         "low_value_module_count": low_value_module_count,
         "title_only_item_count": title_only_item_count,
-        "display_body_over_limit_count": sum(
-            1
-            for body in displayed_bodies
-            if len(body) > display_body_limit
-        ),
+        "display_body_over_limit_count": display_body_over_limit_count,
         "appendix_body_overlap_count": len(featured_urls & appendix_urls),
         "truncated_focus_text_count": truncated_focus_text_count,
         "visible_text_chars": len(visible_text),
+        "html_size_bytes": html_size_bytes,
+        "html_size_kb": round(html_size_bytes / 1024, 1),
+        "email_clipping_warning": html_size_bytes > html_size_warning_bytes,
+        "email_clipping_risk": html_size_bytes > html_size_max_bytes,
         "reading_budget_underfilled": len(visible_text) < int(report_config.get("total_visible_chars_min", 5000) or 5000),
         "reading_budget_exceeded": len(visible_text) > int(report_config.get("total_visible_chars_max", 9000) or 9000),
         "max_opening_repeat_count": max(opening_counts.values(), default=0),
+        "attribution_opener_counts": dict(attribution_opening_counts),
+        "max_attribution_opener_repeat_count": max(
+            attribution_opening_counts.values(),
+            default=0,
+        ),
+        "max_attribution_opener_run": max_attribution_opening_run,
         "focus_source_concentration": round(source_concentration, 3),
         "details_element_count": len(re.findall(r"<details\b", html_content, flags=re.IGNORECASE)),
         "score_label_count": len(re.findall(r"\bScore\s+\d", html_content, flags=re.IGNORECASE)),
@@ -2621,10 +4013,60 @@ def scan_final_html_quality(
         "featured_fresh_paper_count": len(fresh_paper_items),
         "visible_paper_count": len(visible_paper_items),
         "visible_fresh_paper_count": len(visible_fresh_paper_items),
+        "v11_source_note_count": html_content.count('class="v11-source-note"'),
+        "v11_paper_plain_visible_count": (
+            html_content.count('class="v10-paper-plain"')
+            + html_content.count('class="v10-more-plain"')
+        ),
+        "v11_paper_technical_visible_count": (
+            html_content.count('class="v10-paper-tech"')
+            + html_content.count('class="v10-more-tech"')
+        ),
+        "v11_rendered_news_count": v11_rendered_counts["news"],
+        "v11_rendered_technical_count": v11_rendered_counts["technical"],
+        "v11_rendered_paper_count": v11_rendered_counts["paper"],
+        "v11_supplemental_expected_count": v11_supplemental_expected_count,
+        "v11_supplemental_label_count": v11_supplemental_label_count,
+        "v11_supplemental_counts_by_section": dict(v11_supplemental_counts_by_section),
+        "v11_supplemental_limit_exceeded": v11_supplemental_limit_exceeded,
+        "v11_supplemental_age_violation_count": len(
+            v11_supplemental_age_violation_examples
+        ),
+        "v11_supplemental_age_violation_examples": (
+            v11_supplemental_age_violation_examples[:5]
+        ),
+        "v11_claim_label_expected_count": v11_claim_label_expected_count,
+        "v11_claim_label_visible_count": v11_claim_label_visible_count,
+        "v11_content_fidelity_missing_count": len(
+            v11_content_fidelity_missing_examples
+        ),
+        "v11_content_fidelity_missing_examples": v11_content_fidelity_missing_examples[:5],
+        "v11_key_number_fidelity_missing_count": len(
+            v11_key_number_fidelity_missing_examples
+        ),
+        "v11_key_number_fidelity_missing_examples": (
+            v11_key_number_fidelity_missing_examples[:5]
+        ),
+        "v11_editorial_source_hash_missing_count": len(
+            v11_editorial_source_hash_missing_examples
+        ),
+        "v11_editorial_source_hash_missing_examples": (
+            v11_editorial_source_hash_missing_examples[:5]
+        ),
+        "v11_editorial_source_mismatch_count": len(
+            v11_editorial_source_mismatch_examples
+        ),
+        "v11_editorial_source_mismatch_examples": (
+            v11_editorial_source_mismatch_examples[:5]
+        ),
+        "v11_inline_style_count": len(
+            re.findall(r'<(?:body|div|table|h1|h2|h3|article|a)\b[^>]*\sstyle="', html_content, flags=re.IGNORECASE)
+        ),
         "visible_information_count": max(
             0,
             len(re.findall(r'class="v10-entry"', html_content)) - len(paper_items),
         ) if v10_mode else sum(1 for item in focus_items if item.get("content_type") != "paper"),
+        "source_news_brief_count": source_news_brief_count,
         "memory_item_count": len(re.findall(r'class="v8-memory-row"', html_content)),
         "memory_total_chars": sum(len(text) for text in memory_texts),
         "memory_budget_exceeded": sum(len(text) for text in memory_texts)
@@ -2634,6 +4076,14 @@ def scan_final_html_quality(
         "focus_topic_max_count": max(topic_counts.values(), default=0),
         "focus_brief_item_count": sum(1 for item in focus_items if item.get("quality_tier") == "brief"),
     }
+    metrics["visible_news_count"] = metrics["visible_information_count"] + source_news_brief_count
+    if v11_mode:
+        metrics["visible_news_count"] = v11_rendered_counts["news"]
+        metrics["visible_technical_count"] = v11_rendered_counts["technical"]
+        metrics["visible_paper_count"] = v11_rendered_counts["paper"]
+        metrics["visible_information_count"] = (
+            v11_rendered_counts["news"] + v11_rendered_counts["technical"]
+        )
     thresholds = {
         "final_html_bad_title_count": int(quality_config.get("final_html_bad_title_count", 0) or 0),
         "untranslated_fact_count": int(quality_config.get("untranslated_fact_count", 0) or 0),
@@ -2648,8 +4098,13 @@ def scan_final_html_quality(
         any(int(metrics[key]) > limit for key, limit in thresholds.items())
         or metrics["reading_budget_underfilled"]
         or metrics["reading_budget_exceeded"]
+        or metrics["email_clipping_risk"]
         or metrics["max_opening_repeat_count"]
         > int(quality_config.get("max_opening_repeat_count", 2) or 2)
+        or metrics["max_attribution_opener_repeat_count"]
+        > int(quality_config.get("max_attribution_opener_repeat_count", 8) or 8)
+        or metrics["max_attribution_opener_run"]
+        > int(quality_config.get("max_attribution_opener_run", 1) or 1)
         or (
             metrics["focus_source_item_count"] >= 8
             and metrics["focus_source_concentration"]
@@ -2658,6 +4113,32 @@ def scan_final_html_quality(
         or metrics["focus_source_max_count"] > int(report_config.get("source_focus_limit", 2) or 2)
         or metrics["focus_topic_max_count"] > int(report_config.get("topic_focus_limit", 3) or 3)
         or metrics["display_body_over_limit_count"] > 0
+        or (
+            v11_mode
+            and (
+                metrics["v11_source_note_count"] < len(items)
+                or metrics["v11_paper_plain_visible_count"] < len(visible_paper_items)
+                or metrics["v11_paper_technical_visible_count"] < len(visible_paper_items)
+                or metrics["v11_rendered_news_count"]
+                < int(report_config.get("min_visible_news_count", 20) or 20)
+                or metrics["v11_rendered_technical_count"]
+                < int(report_config.get("min_visible_technical_count", 20) or 20)
+                or metrics["v11_rendered_paper_count"]
+                < int(report_config.get("min_visible_paper_count", 15) or 15)
+                or metrics["v11_supplemental_label_count"]
+                < metrics["v11_supplemental_expected_count"]
+                or bool(metrics["v11_supplemental_limit_exceeded"])
+                or metrics["v11_supplemental_age_violation_count"] > 0
+                or metrics["v11_claim_label_expected_count"] != len(items)
+                or metrics["v11_claim_label_visible_count"]
+                != metrics["v11_claim_label_expected_count"]
+                or metrics["v11_content_fidelity_missing_count"] > 0
+                or metrics["v11_key_number_fidelity_missing_count"] > 0
+                or metrics["v11_editorial_source_hash_missing_count"] > 0
+                or metrics["v11_editorial_source_mismatch_count"] > 0
+                or metrics["v11_inline_style_count"] < len(items) * 3 + 10
+            )
+        )
         or (not v10_mode and metrics["memory_budget_exceeded"])
         or metrics["focus_brief_item_count"] > 0
         or (
@@ -2677,6 +4158,11 @@ def scan_final_html_quality(
             v10_mode
             and metrics["visible_information_count"]
             < int(report_config.get("min_visible_information_count", 25) or 25)
+        )
+        or (
+            v10_mode
+            and metrics["visible_news_count"]
+            < int(quality_config.get("min_visible_news_count", 8) or 8)
         )
         or (not v10_mode and is_continuous_reader_design(report_config) and not 6 <= metrics["featured_paper_count"] <= 8)
         or (not v10_mode and is_continuous_reader_design(report_config) and metrics["memory_item_count"] != 3)
@@ -2736,6 +4222,7 @@ def evaluate_report_quality(layers: Dict[str, List[Dict[str, Any]]], quality_con
     quality_config = quality_config or {}
     strict_v8 = bool(quality_config.get("v8_enabled", False))
     strict_v10 = bool(quality_config.get("v10_enabled", False))
+    strict_v11 = bool(quality_config.get("v11_enabled", False))
     for section_key, section_items in list(layers.items()):
         layers[section_key] = [
             dict(item)
@@ -2836,7 +4323,15 @@ def evaluate_report_quality(layers: Dict[str, List[Dict[str, Any]]], quality_con
             failed_items.append(item)
     repeated_count = repeated_sentence_count(all_items)
     high_evidence_count = sum(1 for item in all_items if evidence_quality_value(item) >= 0.45)
-    high_evidence_warning = bool(all_items and high_evidence_count == len(all_items) and any(str(item.get("report_section", "")) in {"brief", "watch"} for item in all_items))
+    high_evidence_warning = bool(
+        all_items
+        and high_evidence_count == len(all_items)
+        and any(
+            str(item.get("quality_tier") or "") == "brief"
+            or str(item.get("report_section") or "") == "brief"
+            for item in all_items
+        )
+    )
     status = "passed"
     domain_counts: Dict[str, int] = {}
     for item in all_items:
@@ -2885,11 +4380,37 @@ def evaluate_report_quality(layers: Dict[str, List[Dict[str, Any]]], quality_con
         )
         if item.get("content_type") != "paper" and str(item.get("quality_tier") or "") != "brief"
     )
+    source_news_brief_count = sum(
+        1
+        for item in layers.get("brief", [])
+        if item.get("content_type") != "paper" and item.get("source_grounded_brief")
+    )
+    visible_news_count = visible_information_count + source_news_brief_count
+    visible_technical_count = 0
+    if strict_v11:
+        visible_news_count = sum(1 for item in all_items if report_primary_section(item) == "news")
+        visible_technical_count = sum(1 for item in all_items if report_primary_section(item) == "technical")
+        visible_information_count = visible_news_count + visible_technical_count
     visible_v10_items = [item for item in all_items if str(item.get("report_section") or "") != "brief"]
     primary_source_count = sum(
-        1 for item in visible_v10_items if str(item.get("source_tier") or "").lower() in {"official", "research", "primary"}
+        1
+        for item in visible_v10_items
+        if infer_source_tier(item).lower() in {"official", "research", "primary"}
     )
     primary_source_ratio = round(primary_source_count / len(visible_v10_items), 3) if visible_v10_items else 1.0
+    visible_technical_items = [
+        item for item in visible_v10_items if report_primary_section(item) == "technical"
+    ]
+    technical_primary_source_count = sum(
+        1
+        for item in visible_technical_items
+        if infer_source_tier(item).lower() in {"official", "research", "primary"}
+    )
+    technical_primary_source_ratio = (
+        round(technical_primary_source_count / len(visible_technical_items), 3)
+        if visible_technical_items
+        else 1.0
+    )
     event_keys = [
         normalized_event_title(item) or str(item.get("canonical_url") or item.get("url") or "")
         for item in visible_v10_items
@@ -2907,10 +4428,24 @@ def evaluate_report_quality(layers: Dict[str, List[Dict[str, Any]]], quality_con
         or generic_count > int(quality_config.get("generic_phrase_count", 0) or 0)
         or suspicious_claim_count > int(quality_config.get("unsupported_claim_count", 0) or 0)
         or duplicate_event_rate > float(quality_config.get("duplicate_event_ratio_max", 0.08) or 0.08)
-        or primary_source_ratio < float(quality_config.get("primary_source_ratio_min", 0.70) or 0.70)
+        or (
+            not strict_v11
+            and primary_source_ratio
+            < float(quality_config.get("primary_source_ratio_min", 0.70) or 0.70)
+        )
+        or (
+            strict_v11
+            and technical_primary_source_ratio
+            < float(quality_config.get("technical_primary_source_ratio_min", 0.80) or 0.80)
+        )
         or paper_plain_pass_rate < float(quality_config.get("paper_plain_summary_pass_rate_min", 1.0) or 1.0)
         or visible_fresh_paper_count < int(quality_config.get("min_visible_paper_count", 28))
         or visible_information_count < int(quality_config.get("min_visible_information_count", 25) or 25)
+        or visible_news_count < int(quality_config.get("min_visible_news_count", 8) or 8)
+    ):
+        status = "failed"
+    if strict_v11 and technical_primary_source_ratio < float(
+        quality_config.get("technical_primary_source_ratio_min", 0.80) or 0.80
     ):
         status = "failed"
     return {
@@ -2940,9 +4475,14 @@ def evaluate_report_quality(layers: Dict[str, List[Dict[str, Any]]], quality_con
         "visible_fresh_paper_count": visible_fresh_paper_count,
         "featured_fresh_paper_count": len(fresh_featured_papers),
         "visible_information_count": visible_information_count,
+        "source_news_brief_count": source_news_brief_count,
+        "visible_news_count": visible_news_count,
+        "visible_technical_count": visible_technical_count,
         "low_value_module_count": 0,
         "unsupported_claim_count": suspicious_claim_count,
         "primary_source_ratio": primary_source_ratio,
+        "technical_primary_source_count": technical_primary_source_count,
+        "technical_primary_source_ratio": technical_primary_source_ratio,
         "duplicate_event_rate": duplicate_event_rate,
         "domain_coverage_warning_count": domain_coverage_warning_count,
         "domain_counts": domain_counts,
@@ -3043,6 +4583,7 @@ def filter_updates_for_report(
         information_density = information_density_value(item)
         evidence_penalty = -0.9 if evidence_quality < 0.35 else 0.0
         density_penalty = -0.8 if information_density < 0.35 else 0.0
+        editorial_penalty = -100.0 if str(item.get("model_used") or "") == "template_fallback" else 0.0
         candidate = dict(item)
         candidate["quality_score"] = quality_score
         candidate["preference_score"] = preference_score
@@ -3056,6 +4597,7 @@ def filter_updates_for_report(
             + preference_score
             + evidence_penalty
             + density_penalty
+            + editorial_penalty
         )
         ranked.append(candidate)
 
@@ -3552,6 +5094,10 @@ def filter_recently_sent_papers(
             if not status_label:
                 filtered_count += 1
                 continue
+            reason = normalize_paper_change_reason(status_label, reason, candidate)
+            if not reason:
+                filtered_count += 1
+                continue
             candidate["paper_status_label"] = status_label
             candidate["paper_change_reason"] = reason
             candidate["is_reappeared_update"] = True
@@ -3571,14 +5117,57 @@ def filter_recently_sent_papers(
     }
 
 
+def normalize_paper_change_reason(
+    status_label: str,
+    reason: Any,
+    item: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Keep reappeared-paper explanations public-ready or suppress the update."""
+    text = re.sub(r"\s+", " ", str(reason or "")).strip()
+    if not text or contains_mojibake(text) or any(marker in text for marker in ("...", "…")):
+        return ""
+    field_labels = {
+        "abstract": "摘要",
+        "method": "方法",
+        "core_method": "核心方法",
+        "metric_result": "实验结果",
+        "dataset_or_benchmark": "数据集或基准",
+        "baseline": "对照基线",
+        "limitation": "局限",
+    }
+    referenced_fields = [key for key in field_labels if key in text]
+    for key in referenced_fields:
+        raw_value = _paper_fact_value(item or {}, key)
+        if raw_value and (
+            contains_mojibake(raw_value)
+            or any(marker in raw_value for marker in ("...", "…"))
+        ):
+            return ""
+        text = text.replace(key, field_labels[key])
+    if not has_untranslated_prose(text):
+        return text
+
+    percent = re.search(r"\b\d+(?:\.\d+)?\s*%", text)
+    lowered = text.lower()
+    if percent and "success" in lowered:
+        setting = "真实机器人实验" if re.search(r"real[- ](?:robot|world)", lowered) else "实验"
+        comparison = "，并优于对照基线" if re.search(r"outperform|improv|better|higher", lowered) else ""
+        return f"新增{setting}，成功率达到 {percent.group(0)}{comparison}。"
+    if str(status_label or "") == "版本更新" and re.search(r"abstract|method|experiment|result", lowered):
+        return "论文发布了新版本，并更新了摘要、方法或实验内容。"
+    return ""
+
+
 def select_papers_by_domain_quota(
     papers: List[Dict[str, Any]],
     quotas: Optional[Dict[str, Any]],
     total_limit: int,
+    minimum_count: int = 0,
 ) -> List[Dict[str, Any]]:
     ranked = sorted(
         [dict(item) for item in papers],
         key=lambda item: (
+            2 if v10_paper_has_editorial_summary(item) else (1 if v10_paper_has_display_content(item) else 0),
             float(item.get("selection_score", item.get("score", 0)) or 0),
             evidence_quality_value(item),
             information_density_value(item),
@@ -3618,6 +5207,18 @@ def select_papers_by_domain_quota(
         append_from(domain, min(limits["min"], limits["max"]))
     for domain, limits in normalized.items():
         append_from(domain, limits["max"])
+    minimum_count = min(total_limit, max(0, int(minimum_count or 0)))
+    if len(selected) < minimum_count:
+        for item in ranked:
+            if len(selected) >= minimum_count:
+                break
+            if any(paper_identity_matches(item, existing) for existing in selected):
+                continue
+            domain = quota_domain(item)
+            item["paper_domain_key"] = domain
+            item["domain_key"] = domain if domain != "other" else "products_business"
+            selected.append(item)
+            counts[domain] += 1
     return selected[:total_limit]
 
 
@@ -3626,11 +5227,13 @@ def select_papers_with_strict_freshness(
     quotas: Optional[Dict[str, Any]],
     total_limit: int,
     overlap_max: float = 0.10,
+    minimum_count: int = 0,
 ) -> Tuple[List[Dict[str, Any]], int]:
     def rank(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return sorted(
             [dict(item) for item in items],
             key=lambda item: (
+                2 if v10_paper_has_editorial_summary(item) else (1 if v10_paper_has_display_content(item) else 0),
                 float(item.get("selection_score", item.get("score", 0)) or 0),
                 evidence_quality_value(item),
                 information_density_value(item),
@@ -3641,7 +5244,12 @@ def select_papers_with_strict_freshness(
 
     fresh = rank([item for item in papers if not item.get("is_reappeared_update")])
     updates = rank([item for item in papers if item.get("is_reappeared_update")])
-    selected_fresh = select_papers_by_domain_quota(fresh, quotas, total_limit)
+    selected_fresh = select_papers_by_domain_quota(
+        fresh,
+        quotas,
+        total_limit,
+        minimum_count=minimum_count,
+    )
     if not updates or not selected_fresh:
         return selected_fresh, len(updates)
 
@@ -3742,6 +5350,65 @@ def finalize_paper_freshness_metrics(
     return metrics
 
 
+def scan_v11_delivery_volume_fidelity(
+    delivery_volumes: List[Dict[str, Any]],
+    quality_config: Dict[str, Any],
+    report_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Verify approved copy inside every HTML volume that will actually be sent."""
+    missing_counts: List[int] = []
+    missing_examples: List[Dict[str, Any]] = []
+    key_number_missing_counts: List[int] = []
+    key_number_missing_examples: List[Dict[str, Any]] = []
+    for volume_index, volume in enumerate(delivery_volumes, start=1):
+        volume_html = str(volume.get("html") or "")
+        volume_scan_config = dict(report_config)
+        volume_scan_config.update(
+            {
+                "min_visible_news_count": 0,
+                "min_visible_technical_count": 0,
+                "min_visible_paper_count": 0,
+                "paper_technical_intro_min_count": 0,
+                "total_visible_chars_min": 0,
+                "total_visible_chars_max": max(100000, len(volume_html)),
+            }
+        )
+        volume_metrics = scan_final_html_quality(
+            volume_html,
+            dict(volume.get("layers") or {}),
+            quality_config=quality_config,
+            report_config=volume_scan_config,
+        )
+        missing_count = int(
+            volume_metrics.get("v11_content_fidelity_missing_count", 0) or 0
+        )
+        missing_counts.append(missing_count)
+        for example in volume_metrics.get("v11_content_fidelity_missing_examples", []) or []:
+            missing_examples.append({"volume": volume_index, **dict(example)})
+        key_number_missing_count = int(
+            volume_metrics.get("v11_key_number_fidelity_missing_count", 0) or 0
+        )
+        key_number_missing_counts.append(key_number_missing_count)
+        for example in volume_metrics.get("v11_key_number_fidelity_missing_examples", []) or []:
+            key_number_missing_examples.append(
+                {"volume": volume_index, **dict(example)}
+            )
+    return {
+        "email_delivery_volume_content_fidelity_missing_counts": missing_counts,
+        "email_delivery_volume_content_fidelity_missing_count": sum(missing_counts),
+        "email_delivery_volume_content_fidelity_missing_examples": missing_examples[:5],
+        "email_delivery_volume_key_number_fidelity_missing_counts": (
+            key_number_missing_counts
+        ),
+        "email_delivery_volume_key_number_fidelity_missing_count": sum(
+            key_number_missing_counts
+        ),
+        "email_delivery_volume_key_number_fidelity_missing_examples": (
+            key_number_missing_examples[:5]
+        ),
+    }
+
+
 def evaluate_paper_domain_quotas(
     selected_papers: List[Dict[str, Any]],
     quotas: Optional[Dict[str, Any]],
@@ -3785,15 +5452,22 @@ def should_block_report_send(
 ) -> bool:
     if not quality_gate_config.get("block_send_on_final_failure", False):
         return False
-    if str(quality_status or "") == "passed":
-        return False
     if str(email_mode or "").strip().lower() in {"dry-run", "dry_run", "skip", "disabled"}:
+        return False
+    blocking_reasons = (
+        report_send_blocking_reasons(quality_gate_config, quality_diagnostics)
+        if quality_diagnostics
+        else []
+    )
+    if blocking_reasons:
+        return True
+    if str(quality_status or "") == "passed":
         return False
     if not quality_gate_config.get("allow_degraded_send_on_soft_failure", False):
         return True
     if not quality_diagnostics:
         return True
-    return bool(report_send_blocking_reasons(quality_gate_config, quality_diagnostics))
+    return False
 
 
 def report_send_blocking_reasons(
@@ -3844,6 +5518,73 @@ def report_send_blocking_reasons(
         reasons.append("paper_freshness_status")
     if str(diagnostics.get("paper_domain_quota_status") or "passed") == "failed":
         reasons.append("paper_domain_quota_status")
+    if bool(quality_gate_config.get("hard_min_visible_paper_count", False)) and int(
+        diagnostics.get("visible_paper_count", 0) or 0
+    ) < int(quality_gate_config.get("min_visible_paper_count", 15) or 15):
+        reasons.append("visible_paper_count")
+    if "visible_news_count" in diagnostics and int(diagnostics.get("visible_news_count", 0) or 0) < int(
+        quality_gate_config.get("min_visible_news_count", 20) or 20
+    ):
+        reasons.append("visible_news_count")
+    if "visible_technical_count" in diagnostics and int(diagnostics.get("visible_technical_count", 0) or 0) < int(
+        quality_gate_config.get("min_visible_technical_count", 20) or 20
+    ):
+        reasons.append("visible_technical_count")
+    if "technical_primary_source_ratio" in diagnostics and float(
+        diagnostics.get("technical_primary_source_ratio", 0.0) or 0.0
+    ) < float(
+        quality_gate_config.get("technical_primary_source_ratio_min", 0.80) or 0.80
+    ):
+        reasons.append("technical_primary_source_ratio")
+    if int(diagnostics.get("cross_section_duplicate_count", 0) or 0) > 0:
+        reasons.append("cross_section_duplicate_count")
+    if int(diagnostics.get("cross_section_event_duplicate_count", 0) or 0) > 0:
+        reasons.append("cross_section_event_duplicate_count")
+    if dict(diagnostics.get("v11_supplemental_limit_exceeded") or {}):
+        reasons.append("v11_supplemental_limit_exceeded")
+    if int(diagnostics.get("v11_supplemental_age_violation_count", 0) or 0) > 0:
+        reasons.append("v11_supplemental_age_violation_count")
+    for key in (
+        "body_under_min_count",
+        "publish_date_missing_count",
+        "source_evidence_missing_count",
+        "claim_type_missing_count",
+        "paper_full_text_missing_count",
+        "analysis_version_mismatch_count",
+        "v11_external_item_count",
+        "v11_content_fidelity_missing_count",
+        "email_delivery_volume_content_fidelity_missing_count",
+        "v11_key_number_fidelity_missing_count",
+        "email_delivery_volume_key_number_fidelity_missing_count",
+        "v11_editorial_source_hash_missing_count",
+        "v11_editorial_source_mismatch_count",
+    ):
+        if int(diagnostics.get(key, 0) or 0) > 0:
+            reasons.append(key)
+    if "editorial_decision_count" in diagnostics:
+        editorial_decision_count = int(diagnostics.get("editorial_decision_count", 0) or 0)
+        editorial_decision_min = int(quality_gate_config.get("editorial_decision_min_count", 5) or 5)
+        editorial_decision_max = int(quality_gate_config.get("editorial_decision_max_count", 7) or 7)
+        if not editorial_decision_min <= editorial_decision_count <= editorial_decision_max:
+            reasons.append("editorial_decision_count")
+    for key in (
+        "editorial_decision_source_missing_count",
+        "editorial_decision_duplicate_source_count",
+    ):
+        if int(diagnostics.get(key, 0) or 0) > 0:
+            reasons.append(key)
+    if bool(diagnostics.get("email_clipping_risk", False)):
+        reasons.append("email_clipping_risk")
+    if (
+        "ui_audit_status" in diagnostics
+        and str(diagnostics.get("ui_audit_status") or "unknown") != "passed"
+    ):
+        reasons.append("ui_audit_status")
+    if (
+        bool(quality_gate_config.get("require_codex_research_inbox", False))
+        and str(diagnostics.get("codex_research_inbox_status") or "not_run") != "success"
+    ):
+        reasons.append("codex_research_inbox_status")
     return sorted(set(reasons))
 
 
@@ -4682,7 +6423,16 @@ def diversify_report_titles(items: List[Dict[str, Any]], llm_processor: LLMProce
         title = clean_title_candidate(candidate.get("title_cn") or candidate.get("title") or "")
         fingerprint = title_template_fingerprint(title)
         seen_fingerprints[fingerprint] += 1
+        trusted_curated_title = (
+            str(candidate.get("model_used") or "") == "codex-automation"
+            and bool(title)
+            and not title_looks_bad(candidate)
+            and not has_untranslated_prose(title)
+            and not any(marker in title for marker in ("…", "..."))
+        )
         needs_rewrite = bool(
+            not trusted_curated_title
+            and
             title
             and (
                 any(title_similarity(title, used) >= 0.82 for used in used_titles)
@@ -4873,9 +6623,12 @@ def dedupe_updates(updates: List[Dict[str, Any]], llm_processor: LLMProcessor, m
 def main() -> Dict[str, Any]:
     load_dotenv()
     config = load_config()
+    llm_provider = str((config.get("llm") or {}).get("provider") or "").strip().lower()
+    codex_research_mode = llm_provider == "codex_automation"
     runtime_profile = str(os.getenv("WEB_AGENT_RUN_PROFILE", "") or "").strip()
     report_only = str(os.getenv("WEB_AGENT_REPORT_ONLY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     config = apply_runtime_profile(config, runtime_profile)
+    config = apply_environment_path_overrides(config)
     started_at = datetime.now()
     run_id = started_at.strftime("%Y%m%d_%H%M%S")
     network_timeout = int(config.get("network", {}).get("timeout_seconds", 25))
@@ -4923,7 +6676,7 @@ def main() -> Dict[str, Any]:
     collectors = []
     collector_runs: List[Dict[str, Any]] = []
     arxiv_config = config["sources"].get("arxiv", {})
-    if arxiv_config.get("enabled", False) and not report_only:
+    if arxiv_config.get("enabled", False) and not report_only and not codex_research_mode:
         topic_limits = arxiv_config.get("topic_limits", {})
         topic_queries = arxiv_config.get("topic_queries", {})
         for topic, limit in topic_limits.items():
@@ -4944,7 +6697,7 @@ def main() -> Dict[str, Any]:
             collector.run_in_subprocess = False
             collectors.append(collector)
     rss_config = config["sources"].get("rss", {})
-    if rss_config.get("enabled", False) and not report_only:
+    if rss_config.get("enabled", False) and not report_only and not codex_research_mode:
         for feed in rss_config.get("feeds", []):
             if should_skip_rss_feed(db, str(feed.get("name", "feed")), rss_config.get("degradation", {})):
                 feed_name = str(feed.get("name", "feed"))
@@ -4964,10 +6717,18 @@ def main() -> Dict[str, Any]:
             collector.label = f"RSSCollector[{feed.get('name', 'feed')}]"
             collectors.append(collector)
     huggingface_config = config["sources"].get("huggingface", {})
-    if huggingface_config.get("enabled", False) and not report_only:
+    if huggingface_config.get("enabled", False) and not report_only and not codex_research_mode:
         collectors.append(HuggingFaceCollector())
+    codex_research_config = config["sources"].get("codex_research_inbox", {})
+    if codex_research_config.get("enabled", False) and not report_only:
+        collectors.append(
+            build_codex_research_inbox_collector(
+                codex_research_config,
+                root=Path(__file__).resolve().parent,
+            )
+        )
     web_search_config = config["sources"].get("web_search", {})
-    if web_search_config.get("enabled", False) and not report_only:
+    if web_search_config.get("enabled", False) and not report_only and not codex_research_mode:
         for search in web_search_config.get("searches", []):
             search_name = str(search.get("name", "search"))
             search_label = f"WebSearchCollector[{search_name}]"
@@ -4994,6 +6755,7 @@ def main() -> Dict[str, Any]:
             collectors.append(collector)
 
     new_articles_count = 0
+    codex_research_urls: List[str] = []
     original_socket_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(network_timeout)
     try:
@@ -5008,6 +6770,25 @@ def main() -> Dict[str, Any]:
                 else:
                     items = collector.collect()
                     collector_error = None
+                if label == "CodexResearchInboxCollector" and items:
+                    history_metrics = evaluate_sent_history_overlap(
+                        items,
+                        db.get_recent_report_items(
+                            days=int(codex_research_config.get("history_dedupe_days", 7) or 7),
+                            limit=int(codex_research_config.get("history_dedupe_limit", 5000) or 5000),
+                            sent_only=True,
+                        ),
+                    )
+                    collector.fetch_diagnostics.update(history_metrics)
+                    if history_metrics.get("production_ready_status") != "passed":
+                        collector_error = "sent_history_overlap"
+                if label == "CodexResearchInboxCollector":
+                    collector.fetch_diagnostics["readiness_summary"] = (
+                        build_codex_research_readiness_summary(
+                            collector.fetch_diagnostics,
+                            codex_research_config,
+                        )
+                    )
                 if collector_error:
                     print(f"Error in {label}: {collector_error}")
                     collector_runs.append(
@@ -5021,12 +6802,39 @@ def main() -> Dict[str, Any]:
                     continue
                 inserted_count = 0
                 for item in items:
+                    if label == "CodexResearchInboxCollector":
+                        codex_research_urls.append(str(item.get("url") or ""))
                     item["run_id"] = run_id
                     item["canonical_url"] = item.get("canonical_url") or item.get("url", "")
                     item["source_tier"] = source_tier_for_item(item, config.get("source_preferences", {}))
-                    if db.insert_article(item):
+                    inserted = db.insert_article(item)
+                    if inserted:
                         new_articles_count += 1
                         inserted_count += 1
+                    if label == "CodexResearchInboxCollector":
+                        db.update_article_source_snapshot(item["url"], item)
+                    web_analysis = item.get("_codex_research_analysis")
+                    if isinstance(web_analysis, dict):
+                        db.update_article_processing(
+                            url=item["url"],
+                            summary=str(web_analysis.get("summary") or ""),
+                            score=float(web_analysis.get("score", 0.0) or 0.0),
+                            keywords=list(web_analysis.get("keywords") or []),
+                            category=str(web_analysis.get("category") or "Other"),
+                            title_cn=str(web_analysis.get("title_cn") or ""),
+                            summary_preview=str(web_analysis.get("summary_preview") or ""),
+                            why_it_matters=str(web_analysis.get("why_it_matters") or ""),
+                            why_now=str(web_analysis.get("why_now") or ""),
+                            expected_effect=str(web_analysis.get("expected_effect") or ""),
+                            future_impact=str(web_analysis.get("future_impact") or ""),
+                            facts=dict(web_analysis.get("facts") or {}),
+                            evidence_quality=float(web_analysis.get("evidence_quality", 0.0) or 0.0),
+                            information_density=float(web_analysis.get("information_density", 0.0) or 0.0),
+                            model_used=str(web_analysis.get("model_used") or "codex-automation"),
+                            analysis_version=str(web_analysis.get("analysis_version") or "codex-research-v3"),
+                            quality_flags=list(web_analysis.get("quality_flags") or []),
+                            rewrite_attempts=0,
+                        )
                 collector_diagnostics = dict(getattr(collector, "fetch_diagnostics", {}) or {})
                 collector_status = "success"
                 collector_error = ""
@@ -5047,6 +6855,9 @@ def main() -> Dict[str, Any]:
                             if bool(collector_diagnostics.get("true_zero_result", False))
                             else "arxiv_no_matching_results"
                         )
+                elif label == "CodexResearchInboxCollector" and not items:
+                    collector_status = "error"
+                    collector_error = str(collector_diagnostics.get("quality_status") or "codex_research_inbox_empty")
                 collector_runs.append(
                     {
                         "label": label,
@@ -5079,6 +6890,16 @@ def main() -> Dict[str, Any]:
         print(f"Collection complete. Added {new_articles_count} new items.")
         db.record_collector_runs(run_id, collector_runs)
     collector_summary = build_collector_summary(collector_runs)
+    codex_research_run = next(
+        (row for row in collector_runs if str(row.get("label") or "") == "CodexResearchInboxCollector"),
+        {},
+    )
+    codex_research_inbox_status = str(codex_research_run.get("status") or "not_run")
+    codex_research_inbox_quality_status = str(
+        (codex_research_run.get("diagnostics") or {}).get("quality_status")
+        or codex_research_run.get("error")
+        or codex_research_inbox_status
+    )
     observability_config = dict(config.get("observability", {}) or {})
     if report_only:
         latest_report = db.get_latest_report_run(exclude_validation=True)
@@ -5099,11 +6920,17 @@ def main() -> Dict[str, Any]:
             collector_runs,
             db,
             history_limit=int(observability_config.get("source_health_history_limit", 160)),
+            active_labels={"CodexResearchInboxCollector"} if codex_research_mode else None,
         )
     print("Collector health: " + collector_summary["status_text"])
     run_result["new_articles_count"] = new_articles_count
     run_result["collector_summary"] = collector_summary
     run_result["source_health"] = source_health
+    if codex_research_mode and not report_only:
+        codex_runs = [item for item in collector_runs if item.get("label") == "CodexResearchInboxCollector"]
+        if not codex_runs or not any(int(item.get("collected_count", 0) or 0) > 0 for item in codex_runs):
+            reason = str((codex_runs[-1] if codex_runs else {}).get("error") or "missing_codex_research")
+            raise RuntimeError(f"Codex research is unavailable: {reason}")
 
     print("\n=== Step 2: Processing Data ===")
     run_unprocessed = [] if report_only else db.get_unprocessed_articles(run_id=run_id)
@@ -5152,7 +6979,7 @@ def main() -> Dict[str, Any]:
     print(f"Processing complete. Successfully processed {processed_count} items.")
     run_result["processed_count"] = processed_count
 
-    analysis_backfill_candidates = [] if report_only else [
+    analysis_backfill_candidates = [] if (report_only or codex_research_mode) else [
         item for item in db.get_recent_articles_missing_analysis(hours=24, limit=160) if item.get("url") not in runtime_results
     ]
     max_analysis_backfill_items = int(runtime_limits.get("max_analysis_backfill_items", 0) or 0)
@@ -5197,6 +7024,11 @@ def main() -> Dict[str, Any]:
 
     print("\n=== Step 3: Generating Report ===")
     report_items = db.get_articles_for_run(run_id=run_id, processed_only=True)
+    current_research_items: List[Dict[str, Any]] = []
+    if codex_research_urls:
+        current_research_items = db.get_articles_by_urls(codex_research_urls)
+        report_items = merge_unique_articles(current_research_items, report_items)
+        print(f"Added {len(current_research_items)} verified Codex research item(s) to this report batch.")
     if str(runtime_limits.get("profile") or "") == "validation_fast" and runtime_results:
         validation_batch = db.get_articles_by_urls(list(runtime_results))
         report_items = merge_unique_articles(report_items, validation_batch)
@@ -5213,6 +7045,12 @@ def main() -> Dict[str, Any]:
     feedback_config["runtime_healthy"] = feedback_server_is_healthy(feedback_config)
     run_result["feedback_server_status"] = "healthy" if feedback_config["runtime_healthy"] else "unhealthy"
     report_config = dict(config.get("report", {}) or {})
+    llm_config = dict(config.get("llm", {}) or {})
+    report_config["model_path_label"] = (
+        "Codex 网页研究 + 本地质量整理"
+        if codex_research_mode
+        else f"{llm_config.get('model', 'GPT')}（OpenAI Responses API + Web Search）"
+    )
     quality_gate_config = dict(config.get("quality_gate", {}) or {})
     quality_gate_config.setdefault(
         "paper_technical_intro_min_count",
@@ -5242,13 +7080,41 @@ def main() -> Dict[str, Any]:
 
     current_papers = [item for item in report_items if item.get("content_type") == "paper"]
     current_updates = [item for item in report_items if item.get("content_type") != "paper"]
-    is_v10_design = str(report_config.get("design_version") or "") == "v10-learning-digest"
+    is_v10_design = is_learning_digest_design(report_config)
+    strict_v11_mode = str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library"
+    paper_history: List[Dict[str, Any]] = []
+    cooldown_history: List[Dict[str, Any]] = []
+    adjacent_history: List[Dict[str, Any]] = []
+    if is_v10_design and bool(report_config.get("paper_freshness_enabled", True)):
+        cooldown_history = db.get_recent_report_items(
+            days=int(report_config.get("paper_repeat_cooldown_days", 7) or 7),
+            limit=int(report_config.get("paper_repeat_history_limit", 1600) or 1600),
+            sent_only=True,
+            content_type="paper",
+        )
+        adjacent_history = db.get_latest_sent_report_items(content_type="paper")
+        seen_history_rows: set[Tuple[str, Any]] = set()
+        for history_item in adjacent_history + cooldown_history:
+            marker = (
+                str(history_item.get("_history_report_id", "") or ""),
+                history_item.get("id"),
+            )
+            if marker in seen_history_rows:
+                continue
+            seen_history_rows.add(marker)
+            paper_history.append(history_item)
     paper_backfill_hours_used: List[int] = []
     web_backfill_hours_used: List[int] = []
-    if paper_backfill_ladder and len(current_papers) < paper_limit:
-        needed_papers = paper_limit - len(current_papers)
+    if not strict_v11_mode and paper_backfill_ladder and (len(current_papers) < paper_limit or is_v10_design):
+        needed_papers = max(0, paper_limit - len(current_papers))
         paper_candidate_ladder = (
-            [int(report_config.get("paper_fresh_candidate_hours", 72) or 72)]
+            parse_hour_ladder(
+                report_config.get(
+                    "paper_fresh_candidate_hours_ladder",
+                    report_config.get("paper_fresh_candidate_hours", 72),
+                ),
+                [72, 168, 336, 720],
+            )
             if is_v10_design else paper_backfill_ladder
         )
         for hours in paper_candidate_ladder:
@@ -5256,14 +7122,39 @@ def main() -> Dict[str, Any]:
             recent_papers = db.get_recent_processed_articles(
                 hours=hours,
                 content_type="paper",
-                limit=max(paper_limit * 6, needed_papers * 8, 120),
+                limit=max(
+                    int(report_config.get("paper_candidate_query_limit", 1000) or 1000),
+                    paper_limit * 12,
+                    needed_papers * 12,
+                    240,
+                ),
             )
             report_items = merge_unique_articles(report_items, recent_papers)
             print(
                 f"Added unsent paper candidates discovered in the last {hours} hours; current run had {len(current_papers)} papers."
             )
-            candidate_papers = [item for item in report_items if item.get("content_type") == "paper"]
-            if len(candidate_papers) >= paper_limit:
+            candidate_papers = [
+                item
+                for item in report_items
+                if item.get("content_type") == "paper"
+                and (not is_v10_design or v10_paper_is_ai_relevant(item))
+            ]
+            eligible_papers = candidate_papers
+            if is_v10_design and paper_history:
+                eligible_papers, _ = filter_recently_sent_papers(candidate_papers, paper_history)
+            if is_v10_design:
+                minimum_visible_papers = int(report_config.get("min_visible_paper_count", 15) or 15)
+                preview_papers, _ = select_papers_with_strict_freshness(
+                    eligible_papers,
+                    report_config.get("paper_domain_quotas", {}),
+                    min(paper_limit, int(report_config.get("paper_target_max_count", 25) or 25)),
+                    float(quality_gate_config.get("adjacent_report_paper_overlap_max", 0.10) or 0.10),
+                    minimum_count=minimum_visible_papers,
+                )
+                summarized_count = sum(v10_paper_has_editorial_summary(item) for item in preview_papers)
+                if len(preview_papers) >= minimum_visible_papers and summarized_count >= minimum_visible_papers:
+                    break
+            elif len(eligible_papers) >= paper_limit:
                 break
 
     min_visible_information_count = max(
@@ -5290,7 +7181,19 @@ def main() -> Dict[str, Any]:
         return len(eligible_urls)
 
     current_eligible_update_count = v10_eligible_update_count(report_items)
-    needs_web_backfill = (
+    current_research_section_counts = Counter(
+        report_primary_section(item) for item in current_research_items
+    )
+    v11_research_pool_ready = (
+        strict_v11_mode
+        and current_research_section_counts.get("news", 0)
+        >= int(report_config.get("min_visible_news_count", 20) or 20)
+        and current_research_section_counts.get("technical", 0)
+        >= int(report_config.get("min_visible_technical_count", 20) or 20)
+        and current_research_section_counts.get("paper", 0)
+        >= int(report_config.get("min_visible_paper_count", 15) or 15)
+    )
+    needs_web_backfill = not v11_research_pool_ready and (
         len(current_updates) < min_web_items
         or (is_v10_design and current_eligible_update_count < min_visible_information_count)
     )
@@ -5342,7 +7245,28 @@ def main() -> Dict[str, Any]:
     prepared_items = prepare_report_items(report_items, llm_processor, runtime_results)
     prepared_items = apply_preference_scores(prepared_items, preference_config)
     prepared_items = apply_feedback_preference_scores(prepared_items, db.get_preference_weights())
-    paper_candidates = [item for item in prepared_items if item.get("content_type") == "paper"]
+    research_order = {
+        str(url): index for index, url in enumerate(codex_research_urls)
+    }
+    if strict_v11_mode and research_order:
+        prepared_items = [
+            item
+            for item in prepared_items
+            if str(item.get("canonical_url") or item.get("url") or "") in research_order
+            or str(item.get("url") or "") in research_order
+        ]
+        prepared_items.sort(
+            key=lambda item: research_order.get(
+                str(item.get("canonical_url") or item.get("url") or ""),
+                research_order.get(str(item.get("url") or ""), len(research_order)),
+            )
+        )
+    paper_candidates = [
+        item
+        for item in prepared_items
+        if item.get("content_type") == "paper"
+        and (not is_v10_design or v10_paper_is_ai_relevant(item))
+    ]
     update_candidates = [item for item in prepared_items if item.get("content_type") != "paper"]
     paper_freshness_metrics = {
         "paper_candidate_count_before_freshness": len(paper_candidates),
@@ -5350,26 +7274,7 @@ def main() -> Dict[str, Any]:
         "paper_repeat_filtered_count": 0,
         "paper_history_unique_count": 0,
     }
-    paper_history: List[Dict[str, Any]] = []
     if is_v10_design and bool(report_config.get("paper_freshness_enabled", True)):
-        cooldown_history = db.get_recent_report_items(
-            days=int(report_config.get("paper_repeat_cooldown_days", 7) or 7),
-            limit=int(report_config.get("paper_repeat_history_limit", 1600) or 1600),
-            sent_only=True,
-            content_type="paper",
-        )
-        adjacent_history = db.get_latest_sent_report_items(content_type="paper")
-        seen_history_rows: set[Tuple[str, Any]] = set()
-        paper_history = []
-        for history_item in adjacent_history + cooldown_history:
-            marker = (
-                str(history_item.get("_history_report_id", "") or ""),
-                history_item.get("id"),
-            )
-            if marker in seen_history_rows:
-                continue
-            seen_history_rows.add(marker)
-            paper_history.append(history_item)
         paper_freshness_metrics["adjacent_report_history_count"] = len(adjacent_history)
         paper_freshness_metrics["cooldown_history_count"] = len(cooldown_history)
         paper_candidates, paper_freshness_metrics = filter_recently_sent_papers(
@@ -5384,12 +7289,16 @@ def main() -> Dict[str, Any]:
                 f"{paper_freshness_metrics['paper_repeat_filtered_count']} paper(s) already sent "
                 f"within {int(report_config.get('paper_repeat_cooldown_days', 7) or 7)} day(s)."
             )
-    if is_v10_design:
+    if strict_v11_mode:
+        papers = list(paper_candidates[:paper_limit])
+        overlap_filtered_count = 0
+    elif is_v10_design:
         papers, overlap_filtered_count = select_papers_with_strict_freshness(
             paper_candidates,
             report_config.get("paper_domain_quotas", {}),
             min(paper_limit, int(report_config.get("paper_target_max_count", 25) or 25)),
             float(quality_gate_config.get("adjacent_report_paper_overlap_max", 0.10) or 0.10),
+            minimum_count=int(report_config.get("min_visible_paper_count", 15) or 15),
         )
         paper_freshness_metrics["paper_repeat_filtered_count"] += overlap_filtered_count
     else:
@@ -5398,6 +7307,7 @@ def main() -> Dict[str, Any]:
     if (
         papers
         and arxiv_config.get("enabled", False)
+        and not strict_v11_mode
         and not report_only
         and not bool(runtime_limits.get("skip_paper_enrichment", False))
     ):
@@ -5423,6 +7333,13 @@ def main() -> Dict[str, Any]:
         refined_papers: List[Dict[str, Any]] = []
         for paper in enriched_papers:
             result = llm_processor.process_article(paper)
+            if should_preserve_existing_paper_analysis(paper, result):
+                print(
+                    "Preserved existing paper analysis after the live LLM path fell back to heuristics: "
+                    f"{paper.get('title', '')[:90]}"
+                )
+                refined_papers.append(paper)
+                continue
             if result:
                 db.update_article_processing(
                     url=paper["url"],
@@ -5455,17 +7372,24 @@ def main() -> Dict[str, Any]:
                 report_config.get("paper_domain_quotas", {}),
                 min(paper_limit, int(report_config.get("paper_target_max_count", 25) or 25)),
                 float(quality_gate_config.get("adjacent_report_paper_overlap_max", 0.10) or 0.10),
+                minimum_count=int(report_config.get("min_visible_paper_count", 15) or 15),
             )
             paper_freshness_metrics["paper_repeat_filtered_count"] += post_enrichment_filtered_count
         else:
             papers = limit_papers_by_topic(papers, paper_topic_limits, paper_limit)
 
-    deduped_updates = dedupe_updates(
-        update_candidates,
-        llm_processor,
-        max_llm_checks=0 if report_only else 12,
+    deduped_updates = (
+        list(update_candidates)
+        if strict_v11_mode
+        else dedupe_updates(
+            update_candidates,
+            llm_processor,
+            max_llm_checks=0 if report_only else 12,
+        )
     )
-    if is_v10_design:
+    if strict_v11_mode:
+        updates = select_v11_update_candidates(deduped_updates, report_config)
+    elif is_v10_design:
         concrete_updates: List[Dict[str, Any]] = []
         fallback_updates: List[Dict[str, Any]] = []
         for item in deduped_updates:
@@ -5513,14 +7437,19 @@ def main() -> Dict[str, Any]:
             preference_config=preference_config,
             diversify_sources=is_continuous_reader_design(report_config),
         )
-    papers = diversify_report_titles(papers, llm_processor)
-    updates = diversify_report_titles(updates, llm_processor)
+    if not strict_v11_mode:
+        papers = diversify_report_titles(papers, llm_processor)
+        updates = diversify_report_titles(updates, llm_processor)
     max_model_path_backfill_items = int(quality_gate_config.get("max_model_path_backfill_items", 4) or 4)
-    refreshed_model_path_items = refresh_missing_model_path_items(
-        papers + updates,
-        db=db,
-        llm_processor=llm_processor,
-        max_items=max_model_path_backfill_items,
+    refreshed_model_path_items = (
+        {}
+        if strict_v11_mode
+        else refresh_missing_model_path_items(
+            papers + updates,
+            db=db,
+            llm_processor=llm_processor,
+            max_items=max_model_path_backfill_items,
+        )
     )
     if refreshed_model_path_items:
         print(f"Refreshed model path metadata for {len(refreshed_model_path_items)} selected item(s).")
@@ -5536,7 +7465,11 @@ def main() -> Dict[str, Any]:
         configured_visible_min = int(report_config.get("min_visible_paper_count", 10))
         configured_featured_min = int(report_config.get("paper_technical_intro_min_count", 10))
         selected_fresh_paper_count = sum(1 for item in papers if not item.get("is_reappeared_update"))
-        effective_visible_min = effective_fresh_paper_minimum(configured_visible_min, selected_fresh_paper_count)
+        effective_visible_min = (
+            configured_visible_min
+            if bool(quality_gate_config.get("hard_min_visible_paper_count", False))
+            else effective_fresh_paper_minimum(configured_visible_min, selected_fresh_paper_count)
+        )
         effective_featured_min = min(
             max(0, configured_featured_min),
             selected_fresh_paper_count,
@@ -5589,6 +7522,9 @@ def main() -> Dict[str, Any]:
             source_health=source_health,
             source_weight_adjustments=source_weight_adjustments,
         )
+        run_result["quality_diagnostics"]["report_product_mode"] = str(
+            report_config.get("product_mode") or ""
+        )
         run_result.update(
             {
                 "status": "no_content",
@@ -5635,6 +7571,7 @@ def main() -> Dict[str, Any]:
         quality_gate_config.get("enabled", True)
         and quality_gate_config.get("auto_rewrite_once", True)
         and not report_only
+        and llm_processor.live_generation_available
         and quality_gate_result.get("status") == "failed"
     ):
         failed_items = list(quality_gate_result.get("failed_items") or [])
@@ -5738,6 +7675,7 @@ def main() -> Dict[str, Any]:
     run_result["auto_rewrite_attempted_count"] = auto_rewrite_attempted_count
     run_result["auto_rewrite_success_count"] = auto_rewrite_success_count
     run_result["model_path_breakdown"] = model_path_breakdown(flatten_report_layers(report_layers))
+    run_result["llm_health"] = llm_processor.health_snapshot()
 
     print(f"Report contains {len(papers)} papers and {len(updates)} web updates.")
     run_result["paper_count"] = len(papers)
@@ -5774,15 +7712,30 @@ def main() -> Dict[str, Any]:
         source_weight_adjustments=source_weight_adjustments,
         **content_quality_counts,
     )
+    run_result["quality_diagnostics"]["report_product_mode"] = str(
+        report_config.get("product_mode") or ""
+    )
+    if strict_v11_mode:
+        run_result["quality_diagnostics"]["v11_acceptance_contract_version"] = (
+            V11_ACCEPTANCE_CONTRACT_VERSION
+        )
     run_result["quality_diagnostics"]["quality_gate"] = {
         key: value
         for key, value in quality_gate_result.items()
         if key != "failed_items"
     }
+    run_result["quality_diagnostics"]["quality_gate"].update({
+        "codex_research_inbox_status": codex_research_inbox_status,
+        "codex_research_inbox_quality_status": codex_research_inbox_quality_status,
+    })
+    run_result["quality_diagnostics"]["codex_research_inbox"] = dict(
+        codex_research_run.get("diagnostics") or {}
+    )
     run_result["quality_diagnostics"]["auto_rewrite_attempted_count"] = auto_rewrite_attempted_count
     run_result["quality_diagnostics"]["auto_rewrite_success_count"] = auto_rewrite_success_count
     run_result["quality_diagnostics"]["title_repair"] = title_repair_summary
     run_result["quality_diagnostics"]["model_path_breakdown"] = run_result["model_path_breakdown"]
+    run_result["quality_diagnostics"]["llm_health"] = run_result["llm_health"]
     run_result["quality_diagnostics"]["report_structure"] = build_report_structure_diagnostics(report_layers)
     run_result["quality_diagnostics"]["paper_freshness"] = paper_freshness_metrics
     if continuity_metrics:
@@ -5812,9 +7765,14 @@ def main() -> Dict[str, Any]:
         post_reselect_fresh_paper_count = sum(
             1 for item in post_reselect_papers if not item.get("is_reappeared_update")
         )
-        effective_visible_min = effective_fresh_paper_minimum(
-            int(report_config.get("min_visible_paper_count", 10) or 10),
-            post_reselect_fresh_paper_count,
+        configured_visible_min = int(report_config.get("min_visible_paper_count", 10) or 10)
+        effective_visible_min = (
+            configured_visible_min
+            if bool(quality_gate_config.get("hard_min_visible_paper_count", False))
+            else effective_fresh_paper_minimum(
+                configured_visible_min,
+                post_reselect_fresh_paper_count,
+            )
         )
         effective_featured_min = min(
             int(report_config.get("paper_technical_intro_min_count", 10) or 10),
@@ -5841,7 +7799,8 @@ def main() -> Dict[str, Any]:
         ] = effective_visible_min
     final_report_layers = generator._decorate_layers(report_layers)
     final_report_layers, final_title_repair = repair_bad_titles_in_layers(final_report_layers)
-    if str(report_config.get("design_version") or "") == "v10-learning-digest":
+    # V11 inbox copy has already passed source-hash validation and is immutable.
+    if is_learning_digest_design(report_config) and not strict_v11_mode:
         final_report_layers = repair_v10_paper_titles_in_layers(final_report_layers)
     title_repair_summary["bad_title_repaired_count"] += final_title_repair["bad_title_repaired_count"]
     title_repair_summary["bad_title_unresolved_count"] = final_title_repair["bad_title_unresolved_count"]
@@ -5935,11 +7894,183 @@ def main() -> Dict[str, Any]:
         physical_ai_min_items=int(quality_gate_config.get("physical_ai_featured_min_count", 2) or 2),
         paper_technical_intro_min_count=int(quality_gate_config.get("paper_technical_intro_min_count", 6)),
     )
+    final_section_counts = Counter(report_primary_section(item) for item in final_report_items)
+    final_event_identities = [
+        CodexResearchInboxCollector._event_identity(item)
+        for item in final_report_items
+        if CodexResearchInboxCollector._event_identity(item)
+    ]
+    final_section_metrics = {
+        "visible_news_count": int(final_section_counts.get("news", 0)),
+        "visible_technical_count": int(final_section_counts.get("technical", 0)),
+        "visible_paper_count": int(final_section_counts.get("paper", 0)),
+        "visible_information_count": int(final_section_counts.get("news", 0) + final_section_counts.get("technical", 0)),
+        "cross_section_duplicate_count": len(final_report_items)
+        - len({str(item.get("canonical_url") or item.get("url") or item.get("title_cn") or "") for item in final_report_items}),
+        "cross_section_event_duplicate_count": len(final_event_identities) - len(set(final_event_identities)),
+    }
+    if str(report_config.get("product_mode") or "") == "intelligence_v11_editorial_library":
+        contract_rejections = list(
+            report_config.get("_v11_selection_contract_rejections") or []
+        )
+        contract_rejection_sections = Counter(
+            str(row.get("section") or "unknown")
+            for row in contract_rejections
+            if isinstance(row, dict)
+        )
+        contract_rejection_reasons = Counter(
+            str(reason)
+            for row in contract_rejections
+            if isinstance(row, dict)
+            for reason in (row.get("reasons") or [])
+        )
+        current_research_url_set = {
+            CodexResearchInboxCollector._url_identity(value)
+            for value in codex_research_urls
+            if CodexResearchInboxCollector._url_identity(value)
+        }
+        for research_item in current_research_items:
+            for value in (research_item.get("url"), research_item.get("canonical_url")):
+                identity = CodexResearchInboxCollector._url_identity(value)
+                if identity:
+                    current_research_url_set.add(identity)
+        external_items = []
+        if not report_only:
+            for item in final_report_items:
+                item_identities = {
+                    CodexResearchInboxCollector._url_identity(value)
+                    for value in (item.get("url"), item.get("canonical_url"))
+                    if CodexResearchInboxCollector._url_identity(value)
+                }
+                if not item_identities.intersection(current_research_url_set):
+                    external_items.append(item)
+        final_section_metrics.update({
+            "v11_selection_contract_rejected_count": len(contract_rejections),
+            "v11_selection_contract_rejected_by_section": dict(
+                contract_rejection_sections
+            ),
+            "v11_selection_contract_rejection_reasons": dict(
+                contract_rejection_reasons
+            ),
+            "v11_external_item_count": len(external_items),
+            "v11_external_item_examples": [
+                {
+                    "title": str(item.get("title_cn") or item.get("title") or "")[:120],
+                    "url": str(item.get("canonical_url") or item.get("url") or ""),
+                }
+                for item in external_items[:5]
+            ],
+        })
+        body_under_min_count = 0
+        publish_date_missing_count = 0
+        source_evidence_missing_count = 0
+        claim_type_missing_count = 0
+        paper_full_text_missing_count = 0
+        analysis_version_mismatch_count = 0
+        for item in final_report_items:
+            primary_section = report_primary_section(item)
+            facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+            if (
+                str(item.get("model_used") or "") == "codex-automation"
+                and str(item.get("analysis_version") or "") not in SUPPORTED_CODEX_RESEARCH_ANALYSIS_VERSIONS
+            ):
+                analysis_version_mismatch_count += 1
+            if not str(item.get("publish_date") or "").strip():
+                publish_date_missing_count += 1
+            if not str(item.get("claim_type") or facts.get("claim_type") or "").strip():
+                claim_type_missing_count += 1
+            if not (
+                str(item.get("source_excerpt") or facts.get("source_excerpt") or "").strip()
+                and str(item.get("evidence_locator") or facts.get("evidence_locator") or "").strip()
+            ):
+                source_evidence_missing_count += 1
+            if primary_section == "paper":
+                if not (
+                    paper_plain_summary_passes(item.get("paper_plain_summary"))
+                    and paper_technical_intro_passes(item.get("paper_technical_intro"))
+                ):
+                    paper_full_text_missing_count += 1
+                continue
+            body = re.sub(r"\s+", "", str(item.get("analysis_body") or item.get("summary") or ""))
+            content_type = str(item.get("content_type") or "").strip().lower()
+            minimum_body_chars = (
+                300
+                if content_type in {"interview", "podcast", "video"}
+                else 220
+                if primary_section == "technical"
+                else 180
+            )
+            if len(body) < minimum_body_chars:
+                body_under_min_count += 1
+        final_section_metrics.update({
+            "body_under_min_count": body_under_min_count,
+            "publish_date_missing_count": publish_date_missing_count,
+            "source_evidence_missing_count": source_evidence_missing_count,
+            "claim_type_missing_count": claim_type_missing_count,
+            "paper_full_text_missing_count": paper_full_text_missing_count,
+            "analysis_version_mismatch_count": analysis_version_mismatch_count,
+        })
+    if is_v10_design:
+        final_reader_context = generator._v10_reader_context(final_report_layers)
+        final_editorial_decisions = list(final_reader_context.get("editorial_decisions", []))
+        final_decision_source_identities = [
+            str(item.get("source_identity") or "").strip()
+            for item in final_editorial_decisions
+        ]
+        final_item_identities = {
+            editorial_source_identity(item)
+            for item in final_report_items
+            if editorial_source_identity(item)
+        }
+        final_section_metrics.update({
+            "editorial_decision_count": len(final_editorial_decisions),
+            "editorial_decision_source_missing_count": sum(
+                1
+                for identity in final_decision_source_identities
+                if not identity or identity not in final_item_identities
+            ),
+            "editorial_decision_duplicate_source_count": len(final_decision_source_identities)
+            - len(set(final_decision_source_identities)),
+        })
+    editorial_decision_count = int(final_section_metrics.get("editorial_decision_count", 0) or 0)
+    editorial_decision_min = int(report_config.get("editorial_decision_min_count", 5) or 5)
+    editorial_decision_max = int(report_config.get("editorial_decision_max_count", 7) or 7)
+    section_minimum_failed = (
+        final_section_metrics["visible_news_count"] < int(report_config.get("min_visible_news_count", 20) or 20)
+        or final_section_metrics["visible_technical_count"] < int(report_config.get("min_visible_technical_count", 20) or 20)
+        or final_section_metrics["visible_paper_count"] < int(report_config.get("min_visible_paper_count", 15) or 15)
+        or final_section_metrics["cross_section_duplicate_count"] > 0
+        or final_section_metrics["cross_section_event_duplicate_count"] > 0
+        or any(
+            int(final_section_metrics.get(key, 0) or 0) > 0
+            for key in (
+                "body_under_min_count",
+                "publish_date_missing_count",
+                "source_evidence_missing_count",
+                "claim_type_missing_count",
+                "paper_full_text_missing_count",
+                "analysis_version_mismatch_count",
+                "v11_external_item_count",
+            )
+        )
+        or (
+            is_v10_design
+            and not editorial_decision_min <= editorial_decision_count <= editorial_decision_max
+        )
+        or int(final_section_metrics.get("editorial_decision_source_missing_count", 0) or 0) > 0
+        or int(final_section_metrics.get("editorial_decision_duplicate_source_count", 0) or 0) > 0
+    )
     if (
         final_quality_result.get("status") != "passed"
         or final_editorial_metrics.get("editorial_quality_status") != "passed"
         or paper_freshness_metrics.get("paper_freshness_status") == "failed"
         or paper_freshness_metrics.get("paper_domain_quota_status") == "failed"
+        or section_minimum_failed
+        or (
+            not report_only
+            and bool(quality_gate_config.get("require_codex_research_inbox", False))
+            and codex_research_inbox_status != "success"
+        )
     ):
         run_result["quality_status"] = "failed"
     else:
@@ -5948,6 +8079,7 @@ def main() -> Dict[str, Any]:
         {key: value for key, value in final_quality_result.items() if key != "failed_items"}
     )
     run_result["quality_diagnostics"]["quality_gate"].update(final_editorial_metrics)
+    run_result["quality_diagnostics"]["quality_gate"].update(final_section_metrics)
     run_result["quality_diagnostics"]["report_structure"] = build_report_structure_diagnostics(final_report_layers)
     layered_items = final_report_items
     mixed_items = layered_items or generator.build_mixed_items(papers, updates)
@@ -6001,13 +8133,161 @@ def main() -> Dict[str, Any]:
         layered_updates=copy.deepcopy(final_report_layers),
         archive_summary=archive_summary,
     )
+    html_report = compact_email_html(html_report)
+    full_html_size_bytes = len(html_report.encode("utf-8"))
+    edition_counts = {
+        section: sum(1 for item in final_report_items if report_primary_section(item) == section)
+        for section in ("news", "technical", "paper")
+    }
+    def render_delivery_volume(index: int, volume: Dict[str, Any]) -> str:
+        volume_items = list(volume["items"])
+        volume_papers = [item for item in volume_items if item.get("content_type") == "paper"]
+        volume_updates = [item for item in volume_items if item.get("content_type") != "paper"]
+        volume_report_summary = dict(report_summary)
+        volume_report_summary["edition_counts"] = edition_counts
+        return generator.generate_html(
+            papers=volume_papers,
+            updates=volume_updates,
+            mixed_items=volume_items,
+            report_summary=volume_report_summary,
+            title=f"{report_title} · 第 {index} 卷：{volume['label']}",
+            collector_summary=collector_summary,
+            trend_summary=trend_summary,
+            alert_summary=alert_summary,
+            layered_updates=copy.deepcopy(volume["layers"]),
+            archive_summary=archive_summary,
+        )
+
+    delivery_volumes, email_split_applied = prepare_v11_email_delivery_volumes(
+        html_report,
+        final_report_layers,
+        report_config,
+        render_delivery_volume,
+    )
+    scan_report_config = dict(report_config)
+    if email_split_applied:
+        relaxed_limit = full_html_size_bytes + 1
+        scan_report_config["email_html_warning_bytes"] = relaxed_limit
+        scan_report_config["email_html_max_bytes"] = relaxed_limit
     final_html_metrics = scan_final_html_quality(
         html_report,
         final_report_layers,
         quality_config=quality_gate_config,
-        report_config=report_config,
+        report_config=scan_report_config,
     )
+    final_html_metrics.update(
+        {
+            "email_split_applied": email_split_applied,
+            "email_delivery_volume_count": len(delivery_volumes),
+            "email_delivery_volume_sizes": [
+                int(volume.get("size_bytes") or len(str(volume.get("html") or "").encode("utf-8")))
+                for volume in delivery_volumes
+            ],
+            "full_html_size_bytes": full_html_size_bytes,
+        }
+    )
+    volume_editorial_decision_counts = [
+        str(volume.get("html") or "").count('class="v10-decision"')
+        for volume in delivery_volumes
+    ]
+    volume_editorial_decision_visible_source_counts = [
+        str(volume.get("html") or "").count('data-source-key="')
+        for volume in delivery_volumes
+    ]
+    volume_editorial_decision_source_missing_counts: List[int] = []
+    volume_editorial_decision_duplicate_source_counts: List[int] = []
+    for volume in delivery_volumes:
+        volume_context = generator._v10_reader_context(dict(volume.get("layers") or {}))
+        volume_decisions = list(volume_context.get("editorial_decisions", []))
+        decision_identities = [
+            str(item.get("source_identity") or "").strip()
+            for item in volume_decisions
+        ]
+        item_identities = {
+            editorial_source_identity(item)
+            for item in list(volume.get("items") or [])
+            if editorial_source_identity(item)
+        }
+        volume_editorial_decision_source_missing_counts.append(
+            sum(1 for identity in decision_identities if not identity or identity not in item_identities)
+        )
+        volume_editorial_decision_duplicate_source_counts.append(
+            len(decision_identities) - len(set(decision_identities))
+        )
+    volume_claim_label_counts = [
+        str(volume.get("html") or "").count('class="v11-claim-label"')
+        for volume in delivery_volumes
+    ]
+    volume_item_counts = [
+        int(volume.get("item_count", 0) or 0)
+        for volume in delivery_volumes
+    ]
+    volume_fidelity_metrics = scan_v11_delivery_volume_fidelity(
+        delivery_volumes,
+        quality_gate_config,
+        scan_report_config,
+    )
+    volume_content_fidelity_missing_counts = list(
+        volume_fidelity_metrics[
+            "email_delivery_volume_content_fidelity_missing_counts"
+        ]
+    )
+    volume_nav_mismatch_count = 0
+    expected_preheader = (
+        f"AI 前沿日报：{edition_counts['news']} 条新闻与观点、"
+        f"{edition_counts['technical']} 条技术内容、{edition_counts['paper']} 篇论文"
+    )
+    volume_preheader_mismatch_count = sum(
+        expected_preheader not in str(volume.get("html") or "")
+        for volume in delivery_volumes
+    )
+    if email_split_applied:
+        section_anchors = {
+            "news": "news-and-voices",
+            "technical": "technical-trends",
+            "paper": "paper-deep-reads",
+        }
+        for volume in delivery_volumes:
+            volume_html = str(volume.get("html") or "")
+            expected_anchor = section_anchors.get(str(volume.get("primary_section") or ""))
+            live_anchors = {
+                anchor
+                for anchor in section_anchors.values()
+                if f'href="#{anchor}"' in volume_html
+            }
+            if expected_anchor is None or live_anchors != {expected_anchor}:
+                volume_nav_mismatch_count += 1
+    final_html_metrics.update(
+        {
+            "email_delivery_volume_editorial_decision_counts": volume_editorial_decision_counts,
+            "email_delivery_volume_editorial_decision_visible_source_counts": volume_editorial_decision_visible_source_counts,
+            "email_delivery_volume_editorial_decision_source_missing_counts": volume_editorial_decision_source_missing_counts,
+            "email_delivery_volume_editorial_decision_duplicate_source_counts": volume_editorial_decision_duplicate_source_counts,
+            "email_delivery_volume_claim_label_counts": volume_claim_label_counts,
+            "email_delivery_volume_item_counts": volume_item_counts,
+            **volume_fidelity_metrics,
+            "email_delivery_volume_nav_mismatch_count": volume_nav_mismatch_count,
+            "email_delivery_volume_preheader_mismatch_count": volume_preheader_mismatch_count,
+        }
+    )
+    if (
+        strict_v11_mode
+        and (
+            any(not 5 <= count <= 7 for count in volume_editorial_decision_counts)
+            or volume_editorial_decision_visible_source_counts != volume_editorial_decision_counts
+            or any(volume_editorial_decision_source_missing_counts)
+            or any(volume_editorial_decision_duplicate_source_counts)
+            or volume_claim_label_counts != volume_item_counts
+            or any(volume_content_fidelity_missing_counts)
+            or volume_nav_mismatch_count
+            or volume_preheader_mismatch_count
+        )
+    ):
+        final_html_metrics["final_html_quality_status"] = "failed"
     run_result["quality_diagnostics"]["quality_gate"].update(final_html_metrics)
+    run_result["quality_diagnostics"]["quality_gate"].update(final_section_metrics)
+    if section_minimum_failed:
+        run_result["quality_status"] = "failed"
     if final_html_metrics.get("final_html_quality_status") != "passed":
         run_result["quality_status"] = "failed"
     run_result["quality_diagnostics"]["quality_gate"]["status"] = run_result["quality_status"]
@@ -6019,6 +8299,50 @@ def main() -> Dict[str, Any]:
     html_filename = html_path.as_posix()
     run_result["html_report_path"] = html_filename
     print(f"HTML Report saved to {html_filename}")
+    email_volume_paths: List[str] = []
+    if email_split_applied:
+        for index, volume in enumerate(delivery_volumes, start=1):
+            volume_path = report_dir / f"report_{file_stamp}_part{index}.html"
+            with volume_path.open("w", encoding="utf-8", newline="") as file:
+                file.write(str(volume["html"]))
+            volume["path"] = volume_path.as_posix()
+            email_volume_paths.append(volume_path.as_posix())
+        print(f"Email report split into {len(email_volume_paths)} delivery volumes.")
+    else:
+        delivery_volumes[0]["path"] = html_filename
+        email_volume_paths.append(html_filename)
+    run_result["email_volume_paths"] = email_volume_paths
+    run_result["quality_diagnostics"]["quality_gate"][
+        "email_delivery_volume_paths"
+    ] = email_volume_paths
+    if bool(scheduler_config.get("ui_audit_enabled", True)):
+        ui_audit_root = Path(
+            str(scheduler_config.get("ui_audit_output_dir") or "artifacts/v11_production_ui_audit")
+        )
+        if not ui_audit_root.is_absolute():
+            ui_audit_root = Path(__file__).resolve().parent / ui_audit_root
+        ui_audit_result = run_email_ui_audit(
+            email_volume_paths,
+            output_dir=ui_audit_root / report_id,
+            root=Path(__file__).resolve().parent,
+            timeout_seconds=int(scheduler_config.get("ui_audit_timeout_seconds", 180) or 180),
+        )
+    else:
+        ui_audit_result = {"status": "disabled", "passed": False, "failed_render_count": 0}
+    run_result["ui_audit"] = ui_audit_result
+    run_result["quality_diagnostics"]["ui_audit"] = ui_audit_result
+    run_result["quality_diagnostics"]["quality_gate"].update(
+        {
+            "ui_audit_status": str(ui_audit_result.get("status") or "unknown"),
+            "ui_audit_render_count": int(ui_audit_result.get("render_count", 0) or 0),
+            "ui_audit_failed_render_count": int(
+                ui_audit_result.get("failed_render_count", 0) or 0
+            ),
+        }
+    )
+    if bool(scheduler_config.get("ui_audit_enabled", True)) and not ui_audit_result.get("passed", False):
+        run_result["quality_status"] = "failed"
+        run_result["quality_diagnostics"]["quality_gate"]["status"] = "failed"
     markdown_report = generator.generate_markdown(
         papers=papers,
         updates=updates,
@@ -6065,7 +8389,7 @@ def main() -> Dict[str, Any]:
     send_block_reasons = report_send_blocking_reasons(
         quality_gate_config,
         run_result.get("quality_diagnostics", {}),
-    ) if run_result.get("quality_status") != "passed" else []
+    )
     quality_blocked = should_block_report_send(
         quality_gate_config,
         str(run_result.get("quality_status") or ""),
@@ -6154,17 +8478,28 @@ def main() -> Dict[str, Any]:
             max_attempts=email_max_attempts,
             retry_delay_seconds=email_retry_delay,
         )
-        subject = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {report_title}"
-        run_result["email_subject"] = subject
-        success = notifier.send_email(recipient_email=recipient, subject=subject, html_content=html_report)
+        base_subject = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {report_title}"
+        delivery_result = send_email_delivery_volumes(
+            notifier,
+            recipient,
+            base_subject,
+            delivery_volumes,
+        )
+        volume_count = int(delivery_result["volume_count"])
+        email_subjects = list(delivery_result["subjects"])
+        run_result["email_subject"] = email_subjects[0]
+        run_result["email_subjects"] = email_subjects
+        sent_volume_count = int(delivery_result["sent_count"])
+        success = bool(delivery_result["success"])
+        run_result["email_volume_sent_count"] = sent_volume_count
         if success:
-            print("Notification sent successfully.")
+            print(f"Notification sent successfully ({sent_volume_count}/{volume_count} volume(s)).")
             notification_sent = True
             commit_payload = record_email_commit(
                 db,
                 report_id=report_id,
                 run_id=run_id,
-                subject=subject,
+                subject=email_subjects[0],
                 html_report_path=html_filename,
                 markdown_report_path=markdown_filename,
                 quality_status=str(run_result.get("quality_status", "")),
@@ -6182,17 +8517,36 @@ def main() -> Dict[str, Any]:
                     smtp_server=os.getenv("EMAIL_SMTP_SERVER", smtp_server),
                     configured_imap_server=os.getenv("EMAIL_IMAP_SERVER", str(arrival_config.get("imap_server", ""))),
                 )
-                run_result["delivery_verification"] = verify_email_arrival(
-                    imap_server=imap_server,
-                    imap_port=int(os.getenv("EMAIL_IMAP_PORT", str(arrival_config.get("imap_port", 993)))),
-                    username=os.getenv("EMAIL_IMAP_USERNAME", os.getenv("EMAIL_SENDER", "")),
-                    password=os.getenv("EMAIL_IMAP_PASSWORD", os.getenv("EMAIL_PASSWORD", "")),
-                    subject_contains=subject,
-                    since_minutes=int(arrival_config.get("since_minutes", 30)),
-                    mailbox=arrival_config.get("mailboxes") or str(arrival_config.get("mailbox", "INBOX")),
-                    timeout_seconds=int(arrival_config.get("timeout_seconds", config.get("network", {}).get("timeout_seconds", 25))),
-                    retry_attempts=int(arrival_config.get("retry_attempts", 1)),
-                    retry_delay_seconds=int(arrival_config.get("retry_delay_seconds", 5)),
+                volume_verifications = [
+                    verify_email_arrival(
+                        imap_server=imap_server,
+                        imap_port=int(os.getenv("EMAIL_IMAP_PORT", str(arrival_config.get("imap_port", 993)))),
+                        username=os.getenv("EMAIL_IMAP_USERNAME", os.getenv("EMAIL_SENDER", "")),
+                        password=os.getenv("EMAIL_IMAP_PASSWORD", os.getenv("EMAIL_PASSWORD", "")),
+                        subject_contains=subject,
+                        since_minutes=int(arrival_config.get("since_minutes", 30)),
+                        mailbox=arrival_config.get("mailboxes") or str(arrival_config.get("mailbox", "INBOX")),
+                        timeout_seconds=int(arrival_config.get("timeout_seconds", config.get("network", {}).get("timeout_seconds", 25))),
+                        expected_sender=sender,
+                        retry_attempts=int(arrival_config.get("retry_attempts", 1)),
+                        retry_delay_seconds=int(arrival_config.get("retry_delay_seconds", 5)),
+                    )
+                    for subject in email_subjects
+                ]
+                run_result["delivery_verification"] = (
+                    volume_verifications[0]
+                    if len(volume_verifications) == 1
+                    else {
+                        "status": (
+                            "found"
+                            if all(result.get("status") == "found" for result in volume_verifications)
+                            else "not_found"
+                            if any(result.get("status") == "not_found" for result in volume_verifications)
+                            else "error"
+                        ),
+                        "volume_count": len(volume_verifications),
+                        "volumes": volume_verifications,
+                    }
                 )
                 print(f"Arrival verification status: {run_result['delivery_verification'].get('status')}")
             if alert_config.get("enabled", True) and alert_config.get("send_separate_alert", False) and alert_summary.get("needs_alert"):
