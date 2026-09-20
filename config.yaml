@@ -108,6 +108,7 @@
       "2100": data/codex_research/candidate_2100.json
     required_schema_version: codex-research-v3
     max_age_minutes: 360
+    freshness_reserve_minutes: 360
     minimum_items: 55
     history_dedupe_days: 7
     history_dedupe_limit: 5000

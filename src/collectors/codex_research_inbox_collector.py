@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -73,6 +73,7 @@ class CodexResearchInboxCollector(BaseCollector):
         inbox_path: str,
         *,
         max_age_minutes: int = 240,
+        freshness_reserve_minutes: int = 0,
         minimum_items: int = 20,
         minimum_papers: int = 15,
         minimum_news: int = 20,
@@ -95,6 +96,11 @@ class CodexResearchInboxCollector(BaseCollector):
     ):
         self.inbox_path = Path(inbox_path)
         self.max_age_minutes = max(1, int(max_age_minutes))
+        self.freshness_reserve_minutes = max(
+            0,
+            int(freshness_reserve_minutes or 0),
+        )
+        self.freshness_reference_time: datetime | None = None
         self.minimum_items = max(1, int(minimum_items))
         self.minimum_papers = max(0, int(minimum_papers))
         self.minimum_news = max(0, int(minimum_news))
@@ -169,6 +175,8 @@ class CodexResearchInboxCollector(BaseCollector):
             "fresh": False,
             "generated_at": "",
             "age_minutes": None,
+            "freshness_reference_time": "",
+            "freshness_reserve_minutes": self.freshness_reserve_minutes,
             "schema_error_count": 0,
             "discovery_candidate_count": 0,
             "discovery_manifest_sha256": "",
@@ -1029,8 +1037,13 @@ class CodexResearchInboxCollector(BaseCollector):
             self.fetch_diagnostics["missing_publish_date_count"] += 1
             return None
         freshness_hours = {"news": 48, "technical": 168, "paper": 168}[primary_section]
+        current_time = datetime.now(timezone.utc)
+        freshness_reference_time = max(
+            current_time,
+            self.freshness_reference_time or current_time,
+        )
         source_age_hours = (
-            (datetime.now(timezone.utc) - published_at).total_seconds() / 3600
+            (freshness_reference_time - published_at).total_seconds() / 3600
             if published_at is not None
             else 0.0
         )
@@ -1399,6 +1412,12 @@ class CodexResearchInboxCollector(BaseCollector):
         )
         if generated_at is not None:
             self.fetch_diagnostics["generated_at"] = generated_at.isoformat()
+            self.freshness_reference_time = generated_at + timedelta(
+                minutes=self.freshness_reserve_minutes
+            )
+            self.fetch_diagnostics["freshness_reference_time"] = (
+                self.freshness_reference_time.isoformat()
+            )
             age_minutes = max(
                 0.0,
                 (datetime.now(timezone.utc) - generated_at).total_seconds() / 60,
@@ -1956,6 +1975,12 @@ def build_codex_research_readiness_summary(
         "fresh": bool(diagnostics.get("fresh", False)),
         "generated_at": str(diagnostics.get("generated_at") or ""),
         "age_minutes": diagnostics.get("age_minutes"),
+        "freshness_reference_time": str(
+            diagnostics.get("freshness_reference_time") or ""
+        ),
+        "freshness_reserve_minutes": int(
+            diagnostics.get("freshness_reserve_minutes", 0) or 0
+        ),
         "inbox_sha256": str(diagnostics.get("inbox_sha256") or ""),
         "schema_version": actual_schema_version,
         "required_schema_version": required_schema_version,
@@ -2043,6 +2068,9 @@ def build_codex_research_inbox_collector(
     return CodexResearchInboxCollector(
         str(inbox_path),
         max_age_minutes=int(config.get("max_age_minutes", 240) or 240),
+        freshness_reserve_minutes=int(
+            config.get("freshness_reserve_minutes", 0) or 0
+        ),
         minimum_items=int(config.get("minimum_items", 55) or 55),
         minimum_papers=int(
             15 if config.get("minimum_papers") is None else config["minimum_papers"]

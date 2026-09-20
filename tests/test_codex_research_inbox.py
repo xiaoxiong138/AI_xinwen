@@ -464,6 +464,7 @@ def test_shared_collector_factory_applies_all_quality_constraints(tmp_path):
     collector = build_codex_research_inbox_collector(
         {
             "path": "research/latest.json",
+            "freshness_reserve_minutes": 360,
             "minimum_items": 55,
             "minimum_papers": 15,
             "minimum_news": 20,
@@ -488,6 +489,7 @@ def test_shared_collector_factory_applies_all_quality_constraints(tmp_path):
     )
 
     assert collector.inbox_path == tmp_path / "research/latest.json"
+    assert collector.freshness_reserve_minutes == 360
     assert collector.minimum_items == 55
     assert collector.minimum_news == 20
     assert collector.technical_primary_source_ratio_min == 0.8
@@ -1400,6 +1402,42 @@ def test_codex_research_inbox_requires_fresh_source_or_supplemental_label(tmp_pa
         technical_category_quotas={},
     )
     assert len(collector.collect()) == 1
+
+
+def test_codex_research_inbox_reserves_freshness_until_send_window(tmp_path):
+    path = tmp_path / "latest.json"
+    generated_at = datetime.now(timezone.utc)
+    news = _row(1, "news")
+    news["publish_date"] = (generated_at - timedelta(hours=47)).isoformat()
+    path.write_text(
+        json.dumps(
+            {"generated_at": generated_at.isoformat(), "items": [news]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    common = {
+        "minimum_items": 1,
+        "minimum_papers": 0,
+        "minimum_news": 1,
+        "minimum_technical": 0,
+        "technical_category_quotas": {},
+    }
+
+    immediate = CodexResearchInboxCollector(str(path), **common)
+    assert len(immediate.collect()) == 1
+
+    reserved = CodexResearchInboxCollector(
+        str(path),
+        freshness_reserve_minutes=120,
+        **common,
+    )
+    assert reserved.collect() == []
+    assert reserved.fetch_diagnostics["stale_source_count"] == 1
+    assert reserved.fetch_diagnostics["freshness_reserve_minutes"] == 120
+    assert reserved.fetch_diagnostics["freshness_reference_time"] == (
+        generated_at + timedelta(minutes=120)
+    ).isoformat()
 
 
 def test_codex_research_inbox_rejects_supplemental_news_older_than_seven_days(tmp_path):
