@@ -429,7 +429,8 @@ class CodexResearchInboxCollector(BaseCollector):
         number_pattern = r"(?:\d[\d,]*(?:\.\d+)?|[零〇一二两三四五六七八九十百千万亿点]+)"
         unit_pattern = (
             r"(?:个百分点|tokens?\s*/?\s*s|tok\s*/?\s*s|亿美元|万美元|亿元|万元|"
-            r"毫秒|小时|分钟|美元|元|%|％|倍|x|ms|秒|gb|mb|项)"
+            r"毫秒|小时|分钟|美元|元|%|％|倍|x|ms|秒|gb|mb|项|"
+            r"megawatts?|mw|毫米|mm|像素|pixels?|摄氏度|°c|℃)"
         )
         unit_names = {
             "%": "percent",
@@ -449,6 +450,17 @@ class CodexResearchInboxCollector(BaseCollector):
             "gb": "gb",
             "mb": "mb",
             "项": "item_count",
+            "megawatt": "megawatt",
+            "megawatts": "megawatt",
+            "mw": "megawatt",
+            "毫米": "millimeter",
+            "mm": "millimeter",
+            "像素": "pixel_count",
+            "pixel": "pixel_count",
+            "pixels": "pixel_count",
+            "摄氏度": "celsius",
+            "°c": "celsius",
+            "℃": "celsius",
         }
         currency_units = {
             "亿美元": ("usd", Decimal("100000000")),
@@ -496,6 +508,11 @@ class CodexResearchInboxCollector(BaseCollector):
             "篇论文": "document_count",
             "台服务器": "machine_count",
             "名参与者": "person_count",
+            "名运营人员": "person_count",
+            "支球队": "team_count",
+            "张gpu": "gpu_count",
+            "个模型": "model_count",
+            "词": "token_count",
             "模态": "modality_count",
             "陨石坑": "crater_count",
             "样本": "sample_count",
@@ -505,16 +522,27 @@ class CodexResearchInboxCollector(BaseCollector):
         count_pattern = re.compile(
             r"(?P<number>\d[\d,]*(?:\.\d+)?)\s*(?P<scale>万|亿)?\s*"
             rf"(?P<unit>家公司|种模态|个陨石坑|组数据|个样本|个任务|个客户|"
-            rf"篇论文|台服务器|名参与者|公司|模态|陨石坑|样本|任务|客户)",
+            rf"篇论文|台服务器|名参与者|名运营人员|支球队|张\s*GPU|个模型|"
+            rf"公司|模态|陨石坑|样本|任务|客户|词)",
             re.IGNORECASE,
         )
         count_scales = {"": Decimal("1"), "万": Decimal("10000"), "亿": Decimal("100000000")}
         for match in count_pattern.finditer(text):
             number = cls._canonical_number(match.group("number"))
-            unit_name = count_units.get(match.group("unit"))
+            normalized_unit = re.sub(r"\s+", "", match.group("unit")).lower()
+            unit_name = count_units.get(normalized_unit)
             if number and unit_name:
                 scaled = Decimal(number) * count_scales[match.group("scale") or ""]
                 tokens.add(f"{unit_name}:{cls._canonical_number(str(scaled))}")
+
+        score_pattern = re.compile(
+            rf"(?P<label>f1)(?:\s*score)?\s*(?:为|达到|=|:)\s*(?P<number>{number_pattern})",
+            re.IGNORECASE,
+        )
+        for match in score_pattern.finditer(text):
+            number = cls._canonical_number(match.group("number"))
+            if number:
+                tokens.add(f"{match.group('label').lower()}_score:{number}")
 
         english_currency_pattern = re.compile(
             r"\$\s*(?P<number>\d[\d,]*(?:\.\d+)?)\s*"

@@ -118,6 +118,7 @@ TRUSTED_CLAIM_HOSTS = {
     "forbes.com",
     "businesswire.com",
     "prnewswire.com",
+    "thewaltdisneycompany.com",
 }
 TRUSTED_CLAIM_SOURCE_HINTS = (
     "official",
@@ -2814,19 +2815,30 @@ def apply_v8_reading_budget(
             *,
             section: str,
             limit: int,
+            minimum: int = 0,
             enforce_diversity: bool = False,
+            shared_source_counts: Optional[Counter[str]] = None,
         ) -> List[Dict[str, Any]]:
             selected: List[Dict[str, Any]] = []
             selected_urls: set[str] = set()
-            selected_sources: Counter[str] = Counter()
+            selected_sources = (
+                shared_source_counts
+                if shared_source_counts is not None
+                else Counter()
+            )
             selected_topics: Counter[str] = Counter()
             supplemental_count = 0
             supplemental_limit = supplemental_limits.get(section, 0)
 
-            def add_candidates(*, enforce_caps: bool) -> None:
+            def add_candidates(
+                *,
+                target: int,
+                enforce_source_cap: bool,
+                enforce_topic_cap: bool,
+            ) -> None:
                 nonlocal supplemental_count
                 for item in candidates:
-                    if len(selected) >= limit:
+                    if len(selected) >= target:
                         return
                     url = str(item.get("canonical_url") or item.get("url") or "")
                     if not url or url in selected_urls:
@@ -2838,10 +2850,9 @@ def apply_v8_reading_budget(
                         continue
                     source = source_key(item)
                     topic = topic_key(item)
-                    if enforce_caps and (
-                        selected_sources[source] >= source_limit
-                        or selected_topics[topic] >= topic_limit
-                    ):
+                    if enforce_source_cap and selected_sources[source] >= source_limit:
+                        continue
+                    if enforce_topic_cap and selected_topics[topic] >= topic_limit:
                         continue
                     selected.append(item)
                     selected_urls.add(url)
@@ -2849,31 +2860,58 @@ def apply_v8_reading_budget(
                     selected_topics[topic] += 1
                     supplemental_count += int(supplemental)
 
-            add_candidates(enforce_caps=enforce_diversity)
+            add_candidates(
+                target=limit,
+                enforce_source_cap=enforce_diversity,
+                enforce_topic_cap=enforce_diversity,
+            )
             if len(selected) < limit:
-                add_candidates(enforce_caps=False)
+                add_candidates(
+                    target=limit,
+                    enforce_source_cap=enforce_diversity,
+                    enforce_topic_cap=False,
+                )
+            if len(selected) < minimum:
+                add_candidates(
+                    target=limit,
+                    enforce_source_cap=False,
+                    enforce_topic_cap=False,
+                )
             return selected
 
+        minimum_news_count = max(
+            0,
+            int(report_config.get("min_visible_news_count", 20) or 0),
+        )
+        minimum_technical_count = max(
+            0,
+            int(report_config.get("min_visible_technical_count", 20) or 0),
+        )
         news_limit = max(
-            int(report_config.get("min_visible_news_count", 20) or 20),
+            minimum_news_count,
             int(report_config.get("news_section_limit", 24) or 24),
         )
         technical_limit = max(
-            int(report_config.get("min_visible_technical_count", 20) or 20),
+            minimum_technical_count,
             int(report_config.get("technical_section_limit", 24) or 24),
         )
+        selected_nonpaper_sources: Counter[str] = Counter()
         selected_nonpaper = (
             select_with_supplemental_limit(
                 [item for item in ordered_nonpaper if report_primary_section(item) == "news"],
                 section="news",
                 limit=news_limit,
+                minimum=minimum_news_count,
                 enforce_diversity=True,
+                shared_source_counts=selected_nonpaper_sources,
             )
             + select_with_supplemental_limit(
                 [item for item in ordered_nonpaper if report_primary_section(item) == "technical"],
                 section="technical",
                 limit=technical_limit,
+                minimum=minimum_technical_count,
                 enforce_diversity=True,
+                shared_source_counts=selected_nonpaper_sources,
             )
         )
         ordered_nonpaper = sort_items(selected_nonpaper)

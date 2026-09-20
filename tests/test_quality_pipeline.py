@@ -409,6 +409,90 @@ class QualityPipelineTests(unittest.TestCase):
         self.assertEqual(dominant_count, 10)
         self.assertLessEqual(max(must_read_source_counts.values()), 2)
 
+    def test_v11_reading_budget_enforces_source_limit_across_news_and_technical(self):
+        def build_item(section, index, host, score):
+            unique_token = chr(0x4E00 + index + (100 if section == "technical" else 0))
+            body = "团队公开了具体模块、输入输出、验证条件、结果和适用边界。" * 10
+            return {
+                "content_type": "project" if section == "technical" else "news",
+                "primary_section": section,
+                "model_used": "codex-automation",
+                "analysis_version": "codex-research-v2",
+                "publish_date": "2026-09-20",
+                "claim_type": "official_claim",
+                "source_excerpt": "原始材料列出了具体模块、验证条件和结果。",
+                "evidence_locator": "官方材料第 2 节",
+                "title_cn": f"测试团队{unique_token}公布完整验证结果",
+                "url": f"https://{host}/{section}/{index}",
+                "summary": body,
+                "analysis_body": body,
+                "score": score,
+                "evidence_quality": 0.8,
+                "information_density": 0.8,
+                "facts": {
+                    "primary_section": section,
+                    "claim_type": "official_claim",
+                    "who": host,
+                    "action": "公布",
+                    "target": f"系统能力{unique_token}",
+                    "method": "模块化接口与分阶段验证",
+                    "metric_result": "二十组测试全部完成",
+                    "evidence": ["原文列出二十组测试及对应结果。"],
+                    "source_excerpt": "原始材料列出了具体模块、验证条件和结果。",
+                    "evidence_locator": "官方材料第 2 节",
+                },
+            }
+
+        candidates = []
+        for section in ("news", "technical"):
+            candidates.extend(
+                build_item(section, index, "dominant.example.com", 100 - index)
+                for index in range(15)
+            )
+            candidates.extend(
+                build_item(
+                    section,
+                    20 + index,
+                    f"{section}-source-{index}.example.com",
+                    20 - index,
+                )
+                for index in range(24)
+            )
+
+        result = apply_v8_reading_budget(
+            {
+                "must_read": candidates,
+                "physical_ai": [],
+                "watch": [],
+                "featured_papers": [],
+                "paper_appendix": [],
+                "research": [],
+                "brief": [],
+            },
+            {
+                "product_mode": "intelligence_v11_editorial_library",
+                "design_version": "v11-editorial-library",
+                "must_read_limit": 6,
+                "news_section_limit": 24,
+                "technical_section_limit": 24,
+                "min_visible_news_count": 20,
+                "min_visible_technical_count": 20,
+                "source_focus_limit": 10,
+                "topic_focus_limit": 30,
+            },
+        )
+
+        visible = [
+            item
+            for item in flatten_report_layers(result)
+            if report_primary_section(item) in {"news", "technical"}
+        ]
+        source_counts = Counter(item["url"].split("/")[2] for item in visible)
+        self.assertEqual(sum(report_primary_section(item) == "news" for item in visible), 24)
+        self.assertEqual(sum(report_primary_section(item) == "technical" for item in visible), 24)
+        self.assertLessEqual(max(source_counts.values()), 10)
+        self.assertEqual(source_counts["dominant.example.com"], 10)
+
     def test_title_gate_rejects_action_with_missing_object_before_comma(self):
         self.assertTrue(
             title_looks_bad(
@@ -6844,6 +6928,29 @@ class QualityPipelineTests(unittest.TestCase):
         self.assertEqual(result["suspicious_claim_count"], 1)
         self.assertEqual(result["memory_card_count"], 1)
         self.assertIn(suspicious["url"], result["failed_item_urls"])
+
+    def test_official_disney_press_release_is_not_a_suspicious_claim(self):
+        item = {
+            "url": (
+                "https://thewaltdisneycompany.com/press-releases/"
+                "the-walt-disney-company-names-karandeep-anand-to-newly-created-role-"
+                "of-chief-technology-officer/"
+            ),
+            "title_cn": "迪士尼任命 Character.AI 负责人出任首席技术官",
+            "summary": "迪士尼官网公布了首席技术官任命。",
+            "content_type": "news",
+            "claim_type": "official_claim",
+            "source_detail": "The Walt Disney Company",
+            "platform": "News",
+            "facts": {
+                "who": "The Walt Disney Company",
+                "action": "任命",
+                "target": "首席技术官",
+                "evidence": ["官方新闻稿公布职位和人选"],
+            },
+        }
+
+        self.assertNotIn("suspicious_claim", item_quality_flags(item))
 
     def test_v4_paper_description_does_not_emit_numeric_placeholder(self):
         generator = ReportGenerator()

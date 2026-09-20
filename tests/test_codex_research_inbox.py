@@ -1810,6 +1810,26 @@ def test_codex_research_v3_accepts_key_numbers_with_evidence_and_public_copy(tmp
     assert collector.fetch_diagnostics["key_number_public_copy_missing_count"] == 0
 
 
+def test_codex_research_v3_recognizes_production_technical_metrics():
+    collector = CodexResearchInboxCollector("missing.json")
+    samples = {
+        "48 支球队、600 名运营人员": {"team_count:48", "person_count:600"},
+        "3MW（3K端差）、5MW（5K端差）、0.5 摄氏度": {
+            "megawatt:3",
+            "megawatt:5",
+            "celsius:0.5",
+        },
+        "2048 像素": {"pixel_count:2048"},
+        "4 张 GPU、8 张 GPU": {"gpu_count:4", "gpu_count:8"},
+        "80 毫米": {"millimeter:80"},
+        "F1 为 0.71": {"f1_score:0.71"},
+        "1 亿词、55 个模型": {"token_count:100000000", "model_count:55"},
+    }
+
+    for text, expected in samples.items():
+        assert expected <= collector._metric_tokens(text)
+
+
 def test_codex_research_v3_does_not_count_hidden_paper_summary_as_public_copy(tmp_path):
     collector = CodexResearchInboxCollector(str(tmp_path / "missing.json"))
     collector.require_key_numbers = True
