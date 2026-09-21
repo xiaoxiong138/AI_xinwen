@@ -14,6 +14,7 @@ from src.editorial_engine import (
     enrich_editorial_fields,
     paper_plain_summary_passes,
     paper_technical_intro_passes,
+    technical_plain_summary_passes,
 )
 
 
@@ -97,6 +98,7 @@ class ReportGenerator:
         "v11-claim-label": "color:#315d4a;font-weight:800",
         "v10-title": "margin:0 0 9px;color:#17212b;font-size:17px;line-height:1.4;font-weight:800",
         "v10-body": "color:#263544;font-size:16px;line-height:1.72;white-space:pre-line",
+        "v11-technical-plain": "margin:3px 0 13px;padding:12px 13px;border-left:4px solid #2f7d6d;background:#f2f8f6;color:#1d2a36;font-size:16px;line-height:1.75;font-weight:650;white-space:pre-line",
         "v10-paper-plain": "margin:2px 0 0;padding:12px 13px 13px;border-left:4px solid #2f7d6d;background:#f2f8f6;color:#1d2a36;font-size:16px;line-height:1.78;font-weight:600;white-space:pre-line",
         "v10-paper-tech": "margin-top:13px;padding:0 2px;color:#526170;font-size:16px;line-height:1.75;white-space:pre-line",
         "v10-evidence": "margin-top:11px;padding:9px 11px;border-left:3px solid #82a99f;background:#f5f8f7;color:#3e514e;font-size:12px;line-height:1.58",
@@ -2730,6 +2732,14 @@ class ReportGenerator:
             "analysis": "分析判断",
             "research_result": "研究结果",
         }.get(claim_type, "")
+        technical_plain = str(
+            card.get("technical_plain_summary")
+            or raw_facts.get("technical_plain_summary")
+            or ""
+        ).strip()
+        card["v11_technical_plain"] = (
+            technical_plain if technical_plain_summary_passes(technical_plain) else ""
+        )
         card["v8_evidence"] = self._v8_trim(card.get("evidence_line"), 150)
         card["v8_brief_line"] = self._v8_trim(card.get("brief_line"), 120)
         card["v8_domain"] = (

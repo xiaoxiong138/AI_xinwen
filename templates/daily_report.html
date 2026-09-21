@@ -1096,6 +1096,17 @@
             line-height: 1.72;
             white-space: pre-line;
         }
+        .v11-technical-plain {
+            margin: 3px 0 13px;
+            padding: 13px 15px 14px;
+            border-left: 4px solid #2f7d6d;
+            background: #f2f8f6;
+            color: #1d2a36;
+            font-size: 16px;
+            line-height: 1.78;
+            font-weight: 650;
+            white-space: pre-line;
+        }
         .v10-paper-plain {
             margin: 2px 0 0;
             padding: 14px 16px 15px;
@@ -1216,7 +1227,7 @@
             .v10-body, .v10-decision-text, .hero-copy, .edition-title { color: #d8e0e4 !important; }
             .sub, .v11-count-label, .v10-decision-evidence, .v11-source-note, .v10-paper-tech, .v10-more-plain, .v10-more-tech, .v10-more-summary { color: #abb8bf !important; }
             .v11-section-intro, .v10-evidence { background: #222c30 !important; color: #cfdbd9 !important; border-color: #5e9488 !important; }
-            .v10-paper-plain { background: #21312d !important; color: #edf5f2 !important; border-color: #68a999 !important; }
+            .v10-paper-plain, .v11-technical-plain { background: #21312d !important; color: #edf5f2 !important; border-color: #68a999 !important; }
             .v10-entry, .v10-more-paper, .v10-decision, .v11-counts { border-color: #39434a !important; }
             a, .v10-nav a, .v10-actions a, .v10-more-title { color: #87b9e5 !important; }
         }
@@ -1351,12 +1362,13 @@
                     <h2>技术方法、方向与架构</h2>
                     <div class="section-note">{{ v10.technical_count }} 条非论文技术内容，覆盖训练、Agent、世界模型、具身智能、推理部署与开源架构</div>
                 </div>
-                <div class="v11-section-intro">从输入输出、模块关系和训练或部署约束展开，重点保留可以核验的实现细节与结果。</div>
+                <div class="v11-section-intro">先用通俗类比建立直觉，再从输入输出、模块关系和训练或部署约束展开，保留可以核验的实现细节与结果。</div>
                 {% for article in v10.technical_items %}
                 <article class="v10-entry" data-v11-item-key="{{ article.v11_item_key }}">
                     <div class="v10-kicker">{{ "%02d"|format(article.v11_position) }} / {{ "%02d"|format(article.v11_total) }} · {{ article.v8_domain }} · {{ article.v8_source }}{% if article.v11_claim_label %} · <span class="v11-claim-label">{{ article.v11_claim_label }}</span>{% endif %}{% if article.v11_date_label %} · {{ article.v11_date_label }}{% endif %}</div>
                     <h3 class="v10-title">{{ article.title_cn }}</h3>
                     {% if article.v12_deck %}<div class="v10-decision-text">{{ article.v12_deck }}</div>{% endif %}
+                    {% if article.v11_technical_plain %}<div class="v10-kicker">先用大白话理解</div><div class="v11-technical-plain">{{ article.v11_technical_plain }}</div>{% endif %}
                     <div class="v10-body">{{ article.v11_body }}</div>
                     {% if article.v8_evidence %}<div class="v10-evidence">{{ article.v8_evidence }}</div>{% endif %}
                     {% if article.v11_source_excerpt or article.v11_evidence_locator %}<div class="v11-source-note">原文依据：{{ article.v11_source_excerpt }}{% if article.v11_evidence_locator %} · {{ article.v11_evidence_locator }}{% endif %}</div>{% endif %}

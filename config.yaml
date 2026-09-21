@@ -109,6 +109,7 @@
     required_schema_version: codex-research-v3
     max_age_minutes: 360
     freshness_reserve_minutes: 360
+    technical_plain_summary_required_after: "2026-09-21T14:00:00+08:00"
     minimum_items: 55
     history_dedupe_days: 7
     history_dedupe_limit: 5000

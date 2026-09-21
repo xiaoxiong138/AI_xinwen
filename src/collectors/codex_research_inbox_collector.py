@@ -20,6 +20,7 @@ from ..editorial_engine import (
     mixed_language_title,
     paper_plain_summary_passes,
     paper_technical_intro_passes,
+    technical_plain_summary_passes,
 )
 from ..relevance import clean_snippet, infer_platform, infer_source_tier, is_ai_web_content
 
@@ -44,6 +45,8 @@ class CodexResearchInboxCollector(BaseCollector):
         "short_source_excerpt_count",
         "structured_fact_missing_count",
         "technical_contract_missing_count",
+        "technical_plain_summary_required_missing_count",
+        "bad_technical_plain_summary_count",
         "paper_contract_missing_count",
         "numeric_context_missing_count",
         "key_number_contract_missing_count",
@@ -74,6 +77,7 @@ class CodexResearchInboxCollector(BaseCollector):
         *,
         max_age_minutes: int = 240,
         freshness_reserve_minutes: int = 0,
+        technical_plain_summary_required_after: str = "",
         minimum_items: int = 20,
         minimum_papers: int = 15,
         minimum_news: int = 20,
@@ -101,6 +105,9 @@ class CodexResearchInboxCollector(BaseCollector):
             int(freshness_reserve_minutes or 0),
         )
         self.freshness_reference_time: datetime | None = None
+        self.technical_plain_summary_required_after = self._parse_datetime(
+            technical_plain_summary_required_after
+        )
         self.minimum_items = max(1, int(minimum_items))
         self.minimum_papers = max(0, int(minimum_papers))
         self.minimum_news = max(0, int(minimum_news))
@@ -232,6 +239,10 @@ class CodexResearchInboxCollector(BaseCollector):
             "structured_fact_missing_count": 0,
             "technical_contract_missing_count": 0,
             "technical_contract_missing_examples": [],
+            "technical_plain_summary_missing_count": 0,
+            "technical_plain_summary_required_missing_count": 0,
+            "bad_technical_plain_summary_count": 0,
+            "bad_technical_plain_summary_examples": [],
             "paper_contract_missing_count": 0,
             "paper_contract_missing_examples": [],
             "numeric_context_missing_count": 0,
@@ -839,7 +850,7 @@ class CodexResearchInboxCollector(BaseCollector):
             value = row.get(key) or facts.get(key)
             if value:
                 facts[key] = clean_snippet(str(value), limit=520)
-        for key in ("paper_plain_summary", "paper_technical_intro"):
+        for key in ("paper_plain_summary", "paper_technical_intro", "technical_plain_summary"):
             value = row.get(key) or facts.get(key)
             if value:
                 facts[key] = cls._clean_editorial_copy(value)
@@ -921,6 +932,30 @@ class CodexResearchInboxCollector(BaseCollector):
             content_type = "paper"
         facts["primary_section"] = primary_section
         public_copy = [summary]
+        technical_plain_summary = str(facts.get("technical_plain_summary") or "").strip()
+        if primary_section == "technical":
+            if technical_plain_summary:
+                public_copy.append(technical_plain_summary)
+                if not technical_plain_summary_passes(technical_plain_summary):
+                    self.fetch_diagnostics["bad_technical_plain_summary_count"] += 1
+                    examples = self.fetch_diagnostics["bad_technical_plain_summary_examples"]
+                    if len(examples) < 10:
+                        examples.append({"title": title_cn, "value": technical_plain_summary})
+                    return None
+            else:
+                self.fetch_diagnostics["technical_plain_summary_missing_count"] += 1
+                generated_at = self._parse_datetime(
+                    self.fetch_diagnostics.get("generated_at")
+                )
+                if (
+                    self.technical_plain_summary_required_after is not None
+                    and generated_at is not None
+                    and generated_at >= self.technical_plain_summary_required_after
+                ):
+                    self.fetch_diagnostics[
+                        "technical_plain_summary_required_missing_count"
+                    ] += 1
+                    return None
         if primary_section == "paper":
             public_copy.extend(
                 [
@@ -934,6 +969,7 @@ class CodexResearchInboxCollector(BaseCollector):
                 ("summary", summary),
                 ("paper_plain_summary", facts.get("paper_plain_summary")),
                 ("paper_technical_intro", facts.get("paper_technical_intro")),
+                ("technical_plain_summary", technical_plain_summary),
             )
             if value and not self._editorial_copy_is_complete(value)
         ]
@@ -1211,7 +1247,9 @@ class CodexResearchInboxCollector(BaseCollector):
                 ]
             )
         else:
-            numeric_public_text = summary
+            numeric_public_text = " ".join(
+                value for value in (summary, technical_plain_summary) if value
+            )
         public_metric_tokens = self._metric_tokens(numeric_public_text)
         numeric_support_text = " ".join(
             [
@@ -1315,8 +1353,14 @@ class CodexResearchInboxCollector(BaseCollector):
                     ),
                 }
             )
+        elif primary_section == "technical" and technical_plain_summary:
+            editorial_source_hashes["technical_plain_summary"] = self._editorial_text_digest(
+                technical_plain_summary
+            )
         facts["editorial_source_hashes"] = editorial_source_hashes
         paragraph_values = {"summary": summary}
+        if primary_section == "technical" and technical_plain_summary:
+            paragraph_values["technical_plain_summary"] = technical_plain_summary
         if primary_section == "paper":
             paragraph_values.update(
                 {
@@ -1752,6 +1796,12 @@ class CodexResearchInboxCollector(BaseCollector):
             for item in items
             if item.get("primary_section") == "paper"
         ])
+        technical_plain_summary_char_stats = self._integer_stats([
+            len(str((item.get("facts") or {}).get("technical_plain_summary") or ""))
+            for item in items
+            if item.get("primary_section") == "technical"
+            and (item.get("facts") or {}).get("technical_plain_summary")
+        ])
         attribution_opener_counts: Dict[str, int] = {}
         attribution_opener_examples: Dict[str, List[str]] = {}
         for item in items:
@@ -1829,6 +1879,9 @@ class CodexResearchInboxCollector(BaseCollector):
         self.fetch_diagnostics["accepted_content_type_counts"] = accepted_content_type_counts
         self.fetch_diagnostics["paper_plain_summary_char_stats"] = paper_plain_summary_char_stats
         self.fetch_diagnostics["paper_technical_intro_char_stats"] = paper_technical_intro_char_stats
+        self.fetch_diagnostics["technical_plain_summary_char_stats"] = (
+            technical_plain_summary_char_stats
+        )
         self.fetch_diagnostics["attribution_opener_counts"] = attribution_opener_counts
         self.fetch_diagnostics["attribution_opener_overuse_count"] = len(
             attribution_opener_overuse
@@ -2017,6 +2070,18 @@ def build_codex_research_readiness_summary(
         "technical_category_underfilled": list(
             diagnostics.get("technical_category_underfilled") or []
         ),
+        "technical_plain_summary_missing_count": int(
+            diagnostics.get("technical_plain_summary_missing_count", 0) or 0
+        ),
+        "technical_plain_summary_required_missing_count": int(
+            diagnostics.get("technical_plain_summary_required_missing_count", 0) or 0
+        ),
+        "bad_technical_plain_summary_count": int(
+            diagnostics.get("bad_technical_plain_summary_count", 0) or 0
+        ),
+        "technical_plain_summary_char_stats": dict(
+            diagnostics.get("technical_plain_summary_char_stats") or {}
+        ),
         "news_format_underfilled": list(diagnostics.get("news_format_underfilled") or []),
         "paper_domain_underfilled": list(diagnostics.get("paper_domain_underfilled") or []),
         "paper_domain_exceeded": list(diagnostics.get("paper_domain_exceeded") or []),
@@ -2070,6 +2135,9 @@ def build_codex_research_inbox_collector(
         max_age_minutes=int(config.get("max_age_minutes", 240) or 240),
         freshness_reserve_minutes=int(
             config.get("freshness_reserve_minutes", 0) or 0
+        ),
+        technical_plain_summary_required_after=str(
+            config.get("technical_plain_summary_required_after") or ""
         ),
         minimum_items=int(config.get("minimum_items", 55) or 55),
         minimum_papers=int(

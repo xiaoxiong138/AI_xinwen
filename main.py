@@ -3692,6 +3692,11 @@ def scan_final_html_quality(
                 expected_fragments["analysis_body"] = (
                     item.get("analysis_body") or item.get("summary")
                 )
+            if report_primary_section(item) == "technical":
+                expected_fragments["technical_plain_summary"] = (
+                    item.get("technical_plain_summary")
+                    or item_facts.get("technical_plain_summary")
+                )
             missing_fragments = []
             for field, value in expected_fragments.items():
                 normalized_value = re.sub(
@@ -3781,6 +3786,11 @@ def scan_final_html_quality(
                         "paper_plain_summary": item.get("paper_plain_summary"),
                         "paper_technical_intro": item.get("paper_technical_intro"),
                     }
+                )
+            elif report_primary_section(item) == "technical":
+                current_values["technical_plain_summary"] = (
+                    item.get("technical_plain_summary")
+                    or facts.get("technical_plain_summary")
                 )
             mismatched_fields = []
             for field, expected_hash in source_hashes.items():

@@ -768,6 +768,29 @@ def paper_plain_summary_passes(text: Any) -> bool:
     return bool(METHOD_PATTERN.search(value))
 
 
+def technical_plain_summary_passes(text: Any) -> bool:
+    """Validate the reader-facing plain-language explanation for technical items."""
+    value = str(text or "").strip()
+    if not 70 <= len(value) <= 180:
+        return False
+    if contains_mojibake(value) or has_bad_public_phrase(value) or has_field_label_leak(value) or has_untranslated_prose(value):
+        return False
+    sentences = [part.strip() for part in re.split(r"[。！？!?]", value) if part.strip()]
+    if not 2 <= len(sentences) <= 3:
+        return False
+    analogy = re.search(
+        r"(?:像|好比|如同|相当于|可以把.{0,28}(?:理解为|看成)|不妨把.{0,28}(?:理解为|看成))",
+        value,
+    )
+    mechanism = re.search(
+        r"(?:先.{0,40}再|输入|输出|分成|接入|路由|缓存|调度|训练|推理|模块|约束|筛选|压缩|并行)",
+        value,
+    )
+    if not analogy or not mechanism:
+        return False
+    return not any(token in value for token in ("像魔法一样", "像人脑一样强大", "打开新世界的大门"))
+
+
 def trusted_codex_research_item(item: Dict[str, Any], facts: Optional[Dict[str, Any]] = None) -> bool:
     """Recognize inbox rows that already passed the strict research collector checks."""
     if str(item.get("model_used") or "") != "codex-automation":
@@ -803,6 +826,11 @@ class EditorialEngine:
     def decorate_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
         content_type = str(result.get("content_type") or "").strip() or "news"
+        primary_section = str(
+            result.get("primary_section")
+            or (result.get("facts") or {}).get("primary_section")
+            or ("paper" if content_type == "paper" else "news")
+        ).strip().lower()
         result["facts_cn"] = normalize_facts_cn(result)
         facts = _facts(result)
         publishability = assess_fact_publishability(result, facts)
@@ -817,6 +845,11 @@ class EditorialEngine:
         result["domain_key"] = domain_key
         result["domain_label"] = DOMAIN_LABELS.get(domain_key, "Products / Business")
         raw_facts = _raw_facts(result)
+        curated_technical_plain = str(
+            raw_facts.get("technical_plain_summary")
+            or result.get("technical_plain_summary")
+            or ""
+        ).strip()
         curated_plain_summary = str(
             raw_facts.get("paper_plain_summary") or result.get("paper_plain_summary") or ""
         ).strip()
@@ -832,6 +865,13 @@ class EditorialEngine:
         if content_type == "paper" and str(result.get("model_used") or "") == "codex-automation":
             result["paper_plain_summary"] = curated_plain_summary
             result["paper_technical_intro"] = curated_technical_intro
+
+        result["technical_plain_summary"] = (
+            curated_technical_plain
+            if primary_section == "technical"
+            and technical_plain_summary_passes(curated_technical_plain)
+            else ""
+        )
 
         title = self.editorial_title(result)
         result["editorial_title"] = title

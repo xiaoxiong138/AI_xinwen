@@ -478,6 +478,55 @@ class V10ReportTests(unittest.TestCase):
         )
         self.assertEqual(metrics["v11_content_fidelity_missing_count"], 0)
 
+    def test_v11_technical_card_highlights_plain_language_analogy(self):
+        generator = ReportGenerator(
+            design_version="v11-editorial-library",
+            report_config={"product_mode": "intelligence_v11_editorial_library"},
+        )
+        item = rich_news(9994)
+        item.update(
+            {
+                "content_type": "project",
+                "primary_section": "technical",
+                "model_used": "codex-automation",
+                "analysis_version": "codex-research-v3",
+            }
+        )
+        item["facts"].update(
+            {
+                "primary_section": "technical",
+                "method": "先按权限路由任务，再调用对应执行模块",
+                "baseline": "所有任务共用一条串行执行链",
+                "limitation": "只在受控工作流中验证",
+                "deployment_context": "企业内部工作流",
+                "technical_plain_summary": (
+                    "它像一座先分诊、再派单的技术中台：请求先进入权限路由层，系统判断身份和任务类型后，"
+                    "再送给对应执行模块。相比所有请求挤在一条串行通道里，这种拆法更容易替换组件，也更容易定位故障。"
+                ),
+            }
+        )
+        item = enrich_editorial_fields(item)
+        layers = {
+            "must_read": [],
+            "physical_ai": [],
+            "watch": [item],
+            "featured_papers": [],
+            "paper_appendix": [],
+            "brief": [],
+        }
+
+        html = generator.generate_html(
+            papers=[],
+            updates=[item],
+            mixed_items=[item],
+            report_summary={"edition_counts": {"news": 0, "technical": 1, "paper": 0}},
+            layered_updates=layers,
+        )
+
+        self.assertIn("先用大白话理解", html)
+        self.assertIn("它像一座先分诊、再派单的技术中台", html)
+        self.assertIn('class="v11-technical-plain"', html)
+
     def test_v11_curated_paper_keeps_approved_paragraph_breaks(self):
         generator = ReportGenerator(
             design_version="v11-editorial-library",

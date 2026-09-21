@@ -14,7 +14,11 @@ from src.collectors.codex_research_inbox_collector import (
 )
 from main import scan_final_html_quality
 from src.database import Database
-from src.editorial_engine import attribution_opener_pattern, enrich_editorial_fields
+from src.editorial_engine import (
+    attribution_opener_pattern,
+    enrich_editorial_fields,
+    technical_plain_summary_passes,
+)
 from src.generator import editorial_item_render_key
 from src.processors.llm_processor import LLMProcessor
 from src.relevance import is_ai_web_content
@@ -43,6 +47,8 @@ def test_codex_research_prompt_preserves_v11_candidate_and_evidence_contract():
         "任意两条相似度达到 0.92",
         "unsupported_summary_numeric_examples",
         "key_number_public_copy_missing_examples",
+        '"technical_plain_summary"',
+        "机制逐项对应的生动类比",
     ):
         assert requirement in prompt
 
@@ -336,6 +342,10 @@ def _row(index: int, content_type: str) -> dict:
             "多机器人协同和不同硬件平台，因此工程价值仍要结合跨平台复现判断。"
         )
     elif primary_section == "technical":
+        row["technical_plain_summary"] = (
+            "它像一座先分诊、再派单的技术中台：任务和上下文先进入适配层，路由模块按权限与状态决定去向，"
+            "最后才交给执行模块处理。相比把所有步骤塞进一条串行流水线，这种拆法更容易替换组件，也更容易定位故障。"
+        )
         row["facts"].update({
             "architecture": "输入适配层、状态路由层和执行模块",
             "input_output": "输入任务与上下文，输出经过权限校验的执行结果",
@@ -344,6 +354,84 @@ def _row(index: int, content_type: str) -> dict:
             "deployment_context": "单机测试环境与受控任务集",
         })
     return row
+
+
+def test_technical_plain_summary_requires_grounded_analogy_and_mechanism():
+    assert technical_plain_summary_passes(_row(1, "project")["technical_plain_summary"])
+    assert not technical_plain_summary_passes(
+        "这项技术像魔法一样强大，可以打开新世界的大门。它让系统变得更智能，也带来更多可能。"
+    )
+
+
+def test_codex_research_rejects_ungrounded_technical_plain_summary(tmp_path):
+    path = tmp_path / "latest.json"
+    technical = _row(2, "project")
+    technical["technical_plain_summary"] = (
+        "这项技术像魔法一样强大，可以打开新世界的大门。"
+        "它让系统变得更智能，也带来更多可能。"
+    )
+    path.write_text(
+        json.dumps(
+            {"generated_at": datetime.now(timezone.utc).isoformat(), "items": [technical]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    collector = CodexResearchInboxCollector(
+        str(path),
+        minimum_items=1,
+        minimum_papers=0,
+        minimum_news=0,
+        minimum_technical=1,
+        technical_category_quotas={},
+    )
+
+    assert collector.collect() == []
+    assert collector.fetch_diagnostics["bad_technical_plain_summary_count"] == 1
+
+
+def test_technical_plain_summary_cutover_keeps_old_packages_and_blocks_new_missing_copy(tmp_path):
+    path = tmp_path / "latest.json"
+    technical = _row(3, "project")
+    technical.pop("technical_plain_summary")
+    cutoff = datetime.now(timezone.utc)
+    collector_kwargs = {
+        "minimum_items": 1,
+        "minimum_papers": 0,
+        "minimum_news": 0,
+        "minimum_technical": 1,
+        "technical_category_quotas": {},
+        "technical_plain_summary_required_after": cutoff.isoformat(),
+    }
+
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": (cutoff - timedelta(minutes=1)).isoformat(),
+                "items": [technical],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    old_collector = CodexResearchInboxCollector(str(path), **collector_kwargs)
+    assert len(old_collector.collect()) == 1
+    assert old_collector.fetch_diagnostics["technical_plain_summary_missing_count"] == 1
+    assert old_collector.fetch_diagnostics["technical_plain_summary_required_missing_count"] == 0
+
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": (cutoff + timedelta(minutes=1)).isoformat(),
+                "items": [technical],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    new_collector = CodexResearchInboxCollector(str(path), **collector_kwargs)
+    assert new_collector.collect() == []
+    assert new_collector.fetch_diagnostics["technical_plain_summary_required_missing_count"] == 1
 
 
 def _balanced_papers() -> list[dict]:
